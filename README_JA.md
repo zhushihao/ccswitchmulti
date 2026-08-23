@@ -4,10 +4,10 @@
 
 ### Claude Code、Claude Desktop、Codex、Gemini CLI、Grok Build、OpenCode、OpenClaw、Hermes Agent のオールインワン管理ツール（Codex マルチモデルルーティング搭載）
 
-[![Version](https://img.shields.io/github/v/release/BigStrongSun/ccswitchmulti?color=blue&label=version)](https://github.com/BigStrongSun/ccswitchmulti/releases)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/BigStrongSun/ccswitchmulti/releases)
+[![Version](https://img.shields.io/github/v/release/zhushihao/ccswitchmulti?color=blue&label=version)](https://github.com/zhushihao/ccswitchmulti/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/zhushihao/ccswitchmulti/releases)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app/)
-[![Downloads](https://img.shields.io/github/downloads/BigStrongSun/ccswitchmulti/total)](https://github.com/BigStrongSun/ccswitchmulti/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/zhushihao/ccswitchmulti/total)](https://github.com/zhushihao/ccswitchmulti/releases/latest)
 
 [English](README.md) | [中文](README_ZH.md) | 日本語 | [Deutsch](README_DE.md) | [Changelog](CHANGELOG.md)
 
@@ -569,7 +569,7 @@ PR を送る前に以下をご確認ください：
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=BigStrongSun/ccswitchmulti&type=Date)](https://www.star-history.com/#BigStrongSun/ccswitchmulti&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=zhushihao/ccswitchmulti&type=Date)](https://www.star-history.com/#zhushihao/ccswitchmulti&Date)
 
 ## ライセンス
 

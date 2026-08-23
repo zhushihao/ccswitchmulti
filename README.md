@@ -4,10 +4,10 @@
 
 ### 面向八类 Agent 工具的 Provider 管理与 Codex 多模型路由工具
 
-[![Version](https://img.shields.io/github/v/release/BigStrongSun/ccswitchmulti?color=blue&label=version)](https://github.com/BigStrongSun/ccswitchmulti/releases)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/BigStrongSun/ccswitchmulti/releases)
+[![Version](https://img.shields.io/github/v/release/zhushihao/ccswitchmulti?color=blue&label=version)](https://github.com/zhushihao/ccswitchmulti/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/zhushihao/ccswitchmulti/releases)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app/)
-[![Downloads](https://img.shields.io/github/downloads/BigStrongSun/ccswitchmulti/total)](https://github.com/BigStrongSun/ccswitchmulti/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/zhushihao/ccswitchmulti/total)](https://github.com/zhushihao/ccswitchmulti/releases/latest)
 
 English | [中文](README_ZH.md) | [日本語](README_JA.md) | [Deutsch](README_DE.md) | [Changelog](CHANGELOG.md)
 
@@ -25,7 +25,7 @@ English | [中文](README_ZH.md) | [日本語](README_JA.md) | [Deutsch](README_
 
 CCSwitchMulti 是面向 Codex 多模型工作流维护的桌面工具。它提供 Provider 数据库、本地代理、MCP/Skills 同步、会话管理、云同步和 Tauri 跨平台结构，同时加入 Codex MultiRouter 工作流，让多个模型来源可以合并到同一个 Codex Provider 后面使用。
 
-使用 `BigStrongSun/ccswitchmulti` 发布版本时，请先阅读本节，因为这里记录的是 CCSwitchMulti 的核心能力、实现边界和使用注意事项。
+使用 `zhushihao/ccswitchmulti` 发布版本时，请先阅读本节，因为这里记录的是 CCSwitchMulti 的核心能力、实现边界和使用注意事项。
 
 ### Codex 多路由配置说明书
 
@@ -96,7 +96,7 @@ Codex MultiRouter 不是简单地把 Codex 切到某一个第三方 Provider。C
 
 ### 使用注意
 
-- 需要 CCSwitchMulti 能力时，请使用 [BigStrongSun/ccswitchmulti](https://github.com/BigStrongSun/ccswitchmulti/releases) 的发布版本。
+- 需要 CCSwitchMulti 能力时，请使用 [zhushihao/ccswitchmulti](https://github.com/zhushihao/ccswitchmulti/releases) 的发布版本。
 - Codex 使用 `OpenAI Multi-Model Router` 时必须保持 CCSwitchMulti 运行，因为 Codex 请求会经过本地 takeover 代理。
 - 修改 router 模型目录、路由规则或 takeover 状态后，需要完整退出并重新打开 Codex Desktop；已经运行的 Codex app-server 可能继续持有旧的模型管理器缓存。
 - 如果诊断显示 catalog 已完整，但 Codex Desktop 模型菜单仍只显示官方模型，请通过 CCSwitchMulti 的模型菜单解锁流程启动 Codex，让 renderer 带 remote debugging 端口运行并接受运行时补丁。
