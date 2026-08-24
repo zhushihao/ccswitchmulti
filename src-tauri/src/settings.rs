@@ -1,12 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-#[cfg(unix)]
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
 use crate::app_config::AppType;
 use crate::error::AppError;
+use crate::services::preset_registry::PresetRegistrySettings;
 use crate::services::skill::{SkillStorageLocation, SyncMethod};
 
 /// 自定义端点配置（历史兼容，实际存储在 provider.meta.custom_endpoints）
@@ -431,6 +430,12 @@ pub struct AppSettings {
     /// 是否开机自启
     #[serde(default)]
     pub launch_on_startup: bool,
+    /// 是否在 CCSwitchMulti 启动后启动 Codex Desktop。
+    ///
+    /// 这是独立于系统开机自启的显式选择：仅开启 `launch_on_startup`
+    /// 绝不会拉起 Codex Desktop。
+    #[serde(default)]
+    pub launch_codex_desktop_with_ccswitch: bool,
     /// 静默启动（程序启动时不显示主窗口，仅托盘运行）
     #[serde(default)]
     pub silent_startup: bool,
@@ -535,6 +540,10 @@ pub struct AppSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webdav_sync: Option<WebDavSyncSettings>,
 
+    // ===== 预设注册表设置（设备级，不跨设备同步）=====
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_registry: Option<PresetRegistrySettings>,
+
     // ===== S3 同步设置 =====
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_sync: Option<S3SyncSettings>,
@@ -589,6 +598,7 @@ impl Default for AppSettings {
             enable_claude_plugin_integration: false,
             skip_claude_onboarding: false,
             launch_on_startup: false,
+            launch_codex_desktop_with_ccswitch: false,
             silent_startup: false,
             enable_local_proxy: false,
             proxy_confirmed: None,
@@ -622,6 +632,7 @@ impl Default for AppSettings {
             skill_sync_method: SyncMethod::default(),
             skill_storage_location: SkillStorageLocation::default(),
             webdav_sync: None,
+            preset_registry: None,
             s3_sync: None,
             webdav_backup: None,
             backup_interval_hours: None,
@@ -704,6 +715,13 @@ impl AppSettings {
             sync.normalize();
             if sync.is_empty() {
                 self.webdav_sync = None;
+            }
+        }
+
+        if let Some(registry) = &mut self.preset_registry {
+            registry.normalize();
+            if registry.is_empty() {
+                self.preset_registry = None;
             }
         }
 
@@ -1227,6 +1245,44 @@ pub fn set_webdav_sync_settings(settings: Option<WebDavSyncSettings>) -> Result<
     })
 }
 
+/// 读取预设注册表设置（设备级，不跨设备同步）。
+pub fn get_preset_registry_settings() -> Option<PresetRegistrySettings> {
+    settings_store().read().ok()?.preset_registry.clone()
+}
+
+/// 保存预设注册表设置。
+pub fn set_preset_registry_settings(
+    settings: Option<PresetRegistrySettings>,
+) -> Result<(), AppError> {
+    mutate_settings(|current| {
+        current.preset_registry = settings;
+    })
+}
+
+/// Mark one device-local registry source as having accepted a signed bundle.
+/// Registry credentials remain in settings and are deliberately not WebDAV
+/// profile data; only the shared compiled bundle is synchronized.
+pub fn mark_preset_registry_source_accepted(
+    source_id: &str,
+    version: &str,
+    checked_at: i64,
+) -> Result<(), AppError> {
+    let source_id = source_id.trim().to_string();
+    let version = version.trim().to_string();
+    mutate_settings(|current| {
+        if let Some(registry) = current.preset_registry.as_mut() {
+            if let Some(source) = registry
+                .sources
+                .iter_mut()
+                .find(|source| source.id == source_id)
+            {
+                source.last_accepted_version = version;
+                source.last_checked_at = checked_at;
+            }
+        }
+    })
+}
+
 /// 仅更新 WebDAV 同步状态，避免覆写 credentials/root/profile 等字段
 pub fn update_webdav_sync_status(status: WebDavSyncStatus) -> Result<(), AppError> {
     mutate_settings(|current| {
@@ -1300,5 +1356,22 @@ mod tests {
         .expect("visible apps");
 
         assert!(!visible.is_visible(&AppType::ClaudeDesktop));
+    }
+
+    #[test]
+    fn codex_desktop_startup_is_opt_in_and_independent_from_auto_launch() {
+        let defaults = AppSettings::default();
+        assert!(!defaults.launch_on_startup);
+        assert!(!defaults.launch_codex_desktop_with_ccswitch);
+
+        let decoded: AppSettings = serde_json::from_value(serde_json::json!({
+            "launchOnStartup": true,
+        }))
+        .expect("legacy settings remain readable");
+        assert!(decoded.launch_on_startup);
+        assert!(
+            !decoded.launch_codex_desktop_with_ccswitch,
+            "enabling CCSwitchMulti auto-launch must not implicitly start Codex Desktop"
+        );
     }
 }

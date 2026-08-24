@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::app_config::{AppType, McpServer};
 use crate::error::AppError;
@@ -75,15 +75,13 @@ impl McpService {
         app: AppType,
         enabled: bool,
     ) -> Result<(), AppError> {
-        let mut servers = state.db.get_all_mcp_servers()?;
-
-        if let Some(server) = servers.get_mut(server_id) {
-            server.apps.set_enabled_for(&app, enabled);
-            state.db.save_mcp_server(server)?;
-
+        if let Some(server) = state
+            .db
+            .update_mcp_server_app_enabled(server_id, &app, enabled)?
+        {
             // 同步到对应应用
             if enabled {
-                Self::sync_server_to_app(state, server, &app)?;
+                Self::sync_server_to_app(state, &server, &app)?;
             } else {
                 Self::remove_server_from_app(state, server_id, &app)?;
             }
@@ -231,22 +229,18 @@ impl McpService {
             return Ok(());
         }
 
-        // Codex keeps every MCP entry in one managed TOML table. Project the
-        // complete DB snapshot so an empty enabled set also removes stale live
-        // entries, including the legacy [mcp.servers] form. Per-entry updates
-        // cannot do that when the DB itself contains no rows to iterate.
+        // Codex keeps every MCP entry in one managed TOML table. Pass the
+        // complete DB ownership set separately from enabled specs so an empty
+        // enabled set removes only stale managed entries while preserving
+        // user-level MCP entries that never belonged to CCSwitchMulti.
         if matches!(app, AppType::Codex) {
-            let mut config = crate::app_config::MultiAppConfig::default();
-            for server in servers.values().filter(|server| server.apps.codex) {
-                config.mcp.codex.servers.insert(
-                    server.id.clone(),
-                    serde_json::json!({
-                        "enabled": true,
-                        "server": server.server,
-                    }),
-                );
-            }
-            return mcp::sync_enabled_to_codex(&config);
+            let owned_ids = servers.keys().cloned().collect::<HashSet<_>>();
+            let enabled = servers
+                .values()
+                .filter(|server| server.apps.codex)
+                .map(|server| (server.id.clone(), server.server.clone()))
+                .collect::<HashMap<_, _>>();
+            return mcp::sync_enabled_to_codex_with_ownership(&owned_ids, &enabled);
         }
 
         for server in servers.values() {

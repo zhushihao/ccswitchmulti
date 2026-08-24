@@ -12,7 +12,12 @@ import {
   buildLocalProxyRequestOverrides,
   formatRequestOverrideObject,
 } from "@/lib/requestOverrides";
-import { providersApi, settingsApi, type AppId } from "@/lib/api";
+import {
+  codexSubagentV2Api,
+  providersApi,
+  settingsApi,
+  type AppId,
+} from "@/lib/api";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import type {
   ProviderCategory,
@@ -23,6 +28,7 @@ import type {
   CodexModelCatalogConfig,
   CodexRoutingConfig,
   CodexChatReasoning,
+  CodexReasoningEffort,
   PromptCacheRoutingMode,
   ClaudeApiKeyField,
 } from "@/types";
@@ -83,6 +89,7 @@ import {
   CodexFormFields,
   type CodexProviderSplitSuggestion,
 } from "./CodexFormFields";
+import { completeCodexReasoningEffortMap } from "./codexReasoningCapability";
 import { GrokBuildProviderForm } from "./GrokBuildProviderForm";
 import { GeminiFormFields } from "./GeminiFormFields";
 import { OmoFormFields } from "./OmoFormFields";
@@ -128,6 +135,7 @@ import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
+import { extractErrorMessage } from "@/utils/errorUtils";
 
 type PresetEntry = {
   id: string;
@@ -166,6 +174,7 @@ const codexCatalogCountFromSettings = (settingsConfig: unknown): number => {
 const codexLocalModelMappingFromInitialData = (
   initialData: ProviderFormProps["initialData"] | undefined,
 ): boolean => {
+  if (!initialData) return true;
   if (typeof initialData?.meta?.codexLocalModelMapping === "boolean") {
     return initialData.meta.codexLocalModelMapping;
   }
@@ -201,9 +210,80 @@ export const normalizeCodexCatalogModelsForSave = (
     );
 
     const baseInstructions = item.baseInstructions?.trim();
+    const rawReasoning = item.reasoning;
+    const reasoning =
+      rawReasoning &&
+      (rawReasoning.supportStatus !== undefined
+        ? rawReasoning.supportStatus === "confirmed_supported"
+        : rawReasoning.supported === true) &&
+      rawReasoning.upstream.format !== "none" &&
+      rawReasoning.upstream.format !== "boolean"
+        ? {
+            ...rawReasoning,
+            upstream: {
+              ...rawReasoning.upstream,
+              effortMap: completeCodexReasoningEffortMap({
+                supportedEfforts: rawReasoning.supportedEfforts,
+                effortMap: rawReasoning.upstream.effortMap,
+              }),
+            },
+          }
+        : rawReasoning;
+    if (
+      reasoning?.defaultEffort &&
+      !reasoning.supportedEfforts.includes(reasoning.defaultEffort)
+    ) {
+      throw new Error(`${model}：默认推理强度必须包含在该模型支持的推理强度中`);
+    }
+    if (
+      reasoning &&
+      !reasoning.disableAllowed &&
+      reasoning.supportedEfforts.includes("none")
+    ) {
+      throw new Error(`${model}：包含“关闭推理”档时，必须允许关闭推理`);
+    }
+    if (
+      reasoning &&
+      // schema v2 用 supportStatus；legacy 数据用 supported。两者取生效值。
+      (reasoning.supportStatus !== undefined
+        ? reasoning.supportStatus === "confirmed_supported"
+        : reasoning.supported === true) &&
+      reasoning.upstream.format !== "none" &&
+      reasoning.upstream.format !== "boolean"
+    ) {
+      for (const effort of reasoning.supportedEfforts) {
+        if (!reasoning.upstream.effortMap?.[effort]) {
+          throw new Error(`${model}：推理强度映射缺少 ${effort} 档`);
+        }
+      }
+      // 与后端 CodexModelReasoningCapability::validate 对齐：
+      // effortMap 每个 target 必须是 supportedEfforts 中的档位。
+      // 此前只校验 key 存在性，孤儿映射（指向已移除档位）会落库后
+      // 被后端拒绝并在投影时静默清空，用户手动声明"消失"。
+      if (reasoning.upstream.effortMap) {
+        for (const [source, target] of Object.entries(
+          reasoning.upstream.effortMap,
+        )) {
+          if (
+            target &&
+            !reasoning.supportedEfforts.includes(target as CodexReasoningEffort)
+          ) {
+            throw new Error(
+              `${model}：${source} 档映射到的 ${target} 不在该模型支持的推理强度中`,
+            );
+          }
+        }
+      }
+    }
+    if (item.codexUltra?.enabled && !item.codexUltra.providerEffort) {
+      throw new Error(
+        `${model}：解锁 Ultra 档后，必须选择对应的供应商推理强度`,
+      );
+    }
 
     normalized.push({
       model,
+      ...(item.enabled === false ? { enabled: false } : {}),
       ...(upstreamModel && upstreamModel !== model ? { upstreamModel } : {}),
       ...(displayName ? { displayName } : {}),
       ...(contextWindow && contextWindow > 0 ? { contextWindow } : {}),
@@ -211,10 +291,34 @@ export const normalizeCodexCatalogModelsForSave = (
       ...(typeof item.supportsParallelToolCalls === "boolean"
         ? { supportsParallelToolCalls: item.supportsParallelToolCalls }
         : {}),
+      ...(typeof item.supportsImage === "boolean"
+        ? { supportsImage: item.supportsImage }
+        : {}),
+      ...(typeof item.textOnly === "boolean"
+        ? { textOnly: item.textOnly }
+        : {}),
       ...(inputModalities && inputModalities.length > 0
         ? { inputModalities }
         : {}),
       ...(baseInstructions ? { baseInstructions } : {}),
+      ...(reasoning ? { reasoning } : {}),
+      ...(item.apiFormat ? { apiFormat: item.apiFormat } : {}),
+      ...(item.codexCache ? { codexCache: { ...item.codexCache } } : {}),
+      ...(typeof item.sortIndex === "number" &&
+      Number.isInteger(item.sortIndex) &&
+      item.sortIndex >= 0
+        ? { sortIndex: item.sortIndex }
+        : {}),
+      ...(item.codexUltra
+        ? {
+            codexUltra: {
+              enabled: item.codexUltra.enabled,
+              ...(item.codexUltra.providerEffort
+                ? { providerEffort: item.codexUltra.providerEffort }
+                : {}),
+            },
+          }
+        : {}),
     });
   }
 
@@ -226,6 +330,7 @@ const normalizeCodexSpawnAgentModelsForSave = (
   catalogModels: CodexCatalogModel[],
 ): string[] => {
   const catalogModelIds = catalogModels
+    .filter((item) => item.enabled !== false)
     .map((item) => item.model.trim())
     .filter(Boolean);
   const availableModels = new Set(catalogModelIds);
@@ -434,6 +539,7 @@ function ProviderFormFull({
   );
   const [activePreset, setActivePreset] = useState<{
     id: string;
+    presetKey?: string;
     category?: ProviderCategory;
     isPartner?: boolean;
     partnerPromotionKey?: string;
@@ -763,7 +869,7 @@ function ProviderFormFull({
 
   useEffect(() => {
     if (appId !== "codex") {
-      setCodexTakeoverEnabled(false);
+      setCodexTakeoverEnabled(true);
       return;
     }
     setCodexTakeoverEnabled(codexLocalModelMappingFromInitialData(initialData));
@@ -821,7 +927,7 @@ function ProviderFormFull({
       resetCodexConfig(template.auth, template.config);
       setCodexChatReasoning({});
       setCodexRouting({ enabled: false, defaultRouteId: "", routes: [] });
-      setCodexTakeoverEnabled(false);
+      setCodexTakeoverEnabled(true);
       setPromptCacheRouting("auto");
     }
   }, [appId, initialData, selectedPresetId, resetCodexConfig, setCodexRouting]);
@@ -895,6 +1001,33 @@ function ProviderFormFull({
     return preset && "providerType" in preset ? preset.providerType : undefined;
   }, [presetEntries, selectedPresetId]);
 
+  const maintainedCodexPreset = useMemo(() => {
+    if (appId !== "codex") return undefined;
+    const selectedPreset = selectedPresetId
+      ? (presetEntries.find((entry) => entry.id === selectedPresetId)
+          ?.preset as CodexProviderPreset | undefined)
+      : undefined;
+    const identity =
+      selectedPreset?.presetKey ?? initialData?.meta?.codexPresetId;
+    if (!identity) return undefined;
+    return identity.startsWith("codex-")
+      ? (presetEntries.find((entry) => entry.id === identity)?.preset as
+          | CodexProviderPreset
+          | undefined)
+      : codexProviderPresets.find(
+          (candidate) => candidate.presetKey === identity,
+        );
+  }, [
+    appId,
+    initialData?.meta?.codexPresetId,
+    presetEntries,
+    selectedPresetId,
+  ]);
+  const codexPresetBaseline = maintainedCodexPreset?.modelCatalog ?? [];
+  const isMaintainedCodexPreset = Boolean(maintainedCodexPreset);
+  const effectiveCodexMenuProjection =
+    isMaintainedCodexPreset || codexTakeoverEnabled;
+
   const {
     templateValues,
     templateValueEntries,
@@ -928,13 +1061,8 @@ function ProviderFormFull({
 
   const {
     useCommonConfig: useCodexCommonConfigFlag,
-    commonConfigSnippet: codexCommonConfigSnippet,
     commonConfigError: codexCommonConfigError,
     handleCommonConfigToggle: handleCodexCommonConfigToggle,
-    handleCommonConfigSnippetChange: handleCodexCommonConfigSnippetChange,
-    isExtracting: isCodexExtracting,
-    handleExtract: handleCodexExtract,
-    clearCommonConfigError: clearCodexCommonConfigError,
   } = useCodexCommonConfig({
     codexConfig,
     onConfigChange: handleCodexConfigChange,
@@ -1551,23 +1679,33 @@ function ProviderFormFull({
         const normalizedCatalogModels = shouldPersistCodexCatalog
           ? normalizeCodexCatalogModelsForSave(codexCatalogModels)
           : [];
+        const enabledCatalogModels = normalizedCatalogModels.filter(
+          (item) => item.enabled !== false,
+        );
         const normalizedSpawnAgentModels =
           normalizedCatalogModels.length > 0
             ? normalizeCodexSpawnAgentModelsForSave(
                 codexSpawnAgentModels,
-                normalizedCatalogModels,
+                enabledCatalogModels,
               )
             : [];
         // The default-model field writes the top-level `model` into the TOML
         // as the user types; only when it was left empty fall back to the
         // first catalog row so "fill mapping only" keeps its old behavior.
+        const currentDefaultModel = extractCodexModelName(
+          normalizedCodexConfig,
+        )?.trim();
+        const defaultModelDisabled = normalizedCatalogModels.some(
+          (item) =>
+            item.enabled === false && item.model === currentDefaultModel,
+        );
         if (
-          normalizedCatalogModels.length > 0 &&
-          !extractCodexModelName(normalizedCodexConfig)
+          enabledCatalogModels.length > 0 &&
+          (!currentDefaultModel || defaultModelDisabled)
         ) {
           normalizedCodexConfig = setCodexModelNameInConfig(
             normalizedCodexConfig,
-            normalizedCatalogModels[0].model,
+            enabledCatalogModels[0].model,
           );
         }
         const configObj = {
@@ -1592,6 +1730,10 @@ function ProviderFormFull({
         }
         settingsConfig = JSON.stringify(configObj);
       } catch (err) {
+        if (err instanceof Error && err.message.includes("reasoning")) {
+          toast.error(`Codex 推理能力配置无效：${err.message}`);
+          return;
+        }
         settingsConfig = values.settingsConfig.trim();
       }
     } else if (appId === "gemini") {
@@ -1632,6 +1774,34 @@ function ProviderFormFull({
       settingsConfig = JSON.stringify(omoConfig);
     } else {
       settingsConfig = values.settingsConfig.trim();
+    }
+
+    // Ordinary ProviderForm saves must surface the same strict Sub-Agent V2
+    // gate before calling the persistence mutation. The backend keeps the
+    // identical gate as the final authority, so this is an early UX check,
+    // not a second capability resolver.
+    if (appId === "codex") {
+      try {
+        const candidate = JSON.parse(settingsConfig) as Record<string, unknown>;
+        const hasSubagentV2 =
+          candidate.codexRouting &&
+          typeof candidate.codexRouting === "object" &&
+          (candidate.codexRouting as Record<string, unknown>).subagentV2 &&
+          typeof (candidate.codexRouting as Record<string, unknown>)
+            .subagentV2 === "object";
+        if (hasSubagentV2) {
+          await codexSubagentV2Api.validateProviderCandidate(candidate);
+        }
+      } catch (error) {
+        const detail = extractErrorMessage(error);
+        const message = detail.includes(
+          "unknown_reasoning_capability_requires_declaration",
+        )
+          ? "Codex 子 Agent 配置未完成：存在已启用且可路由的模型没有声明推理能力，请先在模型目录中配置后再保存。"
+          : `Codex 子 Agent 配置校验失败：${detail || "请检查模型目录和 Sub-Agent 配置。"}`;
+        toast.error(message);
+        return;
+      }
     }
 
     const payload: ProviderFormValues = {
@@ -1774,7 +1944,7 @@ function ProviderFormFull({
       codexChatReasoning:
         appId === "codex" &&
         category !== "official" &&
-        codexTakeoverEnabled &&
+        effectiveCodexMenuProjection &&
         localCodexApiFormat === "openai_chat"
           ? normalizeCodexChatReasoningForSave(codexChatReasoning, {
               providerName: form.getValues("name"),
@@ -1782,9 +1952,15 @@ function ProviderFormFull({
               models: codexCatalogModels,
             })
           : undefined,
+      codexPresetId:
+        appId === "codex"
+          ? selectedPresetId === "custom"
+            ? undefined
+            : (activePreset?.presetKey ?? initialData?.meta?.codexPresetId)
+          : undefined,
       codexLocalModelMapping:
         appId === "codex" && category !== "official"
-          ? codexTakeoverEnabled
+          ? effectiveCodexMenuProjection
           : undefined,
       promptCacheRouting:
         appId === "codex" &&
@@ -1988,8 +2164,8 @@ function ProviderFormFull({
           codexApiFormatFromWireApi(extractCodexWireApi(template.config)) ??
             "openai_responses",
         );
-        // 自定义模板无模型映射，路由默认关闭
-        setCodexTakeoverEnabled(false);
+        // 新建自定义 Provider 默认投射模型目录；目录为空时不会生成无效菜单项。
+        setCodexTakeoverEnabled(true);
       }
       if (shouldScrollDetails) {
         scrollCodexProviderDetailsIntoView();
@@ -2018,6 +2194,10 @@ function ProviderFormFull({
 
     setActivePreset({
       id: value,
+      presetKey:
+        appId === "codex"
+          ? (entry.preset as CodexProviderPreset).presetKey
+          : undefined,
       category: entry.preset.category,
       isPartner: entry.preset.isPartner,
       partnerPromotionKey: entry.preset.partnerPromotionKey,
@@ -2037,8 +2217,8 @@ function ProviderFormFull({
           codexApiFormatFromWireApi(extractCodexWireApi(config)) ??
           "openai_responses",
       );
-      // 路由开关与格式无关，仅按预设是否带模型映射决定
-      setCodexTakeoverEnabled((preset.modelCatalog?.length ?? 0) > 0);
+      // 预设 Provider 默认加入 Codex 模型菜单；空目录在用户获取模型前不会产生菜单项。
+      setCodexTakeoverEnabled(true);
 
       form.reset({
         name: preset.nameKey ? t(preset.nameKey) : preset.name,
@@ -2527,6 +2707,7 @@ function ProviderFormFull({
                   presetProviderType === "xai_oauth" ||
                   initialData?.meta?.providerType === "xai_oauth"
                 }
+                isMaintainedPreset={isMaintainedCodexPreset}
                 isXaiOauthAuthenticated={isXaiOauthAuthenticated}
                 selectedXaiAccountId={selectedXaiAccountId}
                 onXaiAccountSelect={setSelectedXaiAccountId}
@@ -2553,8 +2734,9 @@ function ProviderFormFull({
                 }
                 autoSelect={endpointAutoSelect}
                 onAutoSelectChange={setEndpointAutoSelect}
-                takeoverEnabled={codexTakeoverEnabled}
+                takeoverEnabled={effectiveCodexMenuProjection}
                 onTakeoverEnabledChange={setCodexTakeoverEnabled}
+                allowModelMenuProjectionToggle={!isMaintainedCodexPreset}
                 codexModel={codexModel}
                 onModelChange={handleCodexModelChange}
                 apiFormat={localCodexApiFormat}
@@ -2572,6 +2754,7 @@ function ProviderFormFull({
                 promptCacheRouting={promptCacheRouting}
                 onPromptCacheRoutingChange={setPromptCacheRouting}
                 catalogModels={codexCatalogModels}
+                presetCatalogModels={codexPresetBaseline}
                 onCatalogModelsChange={setCodexCatalogModels}
                 spawnAgentModels={codexSpawnAgentModels}
                 onSpawnAgentModelsChange={setCodexSpawnAgentModels}
@@ -2726,16 +2909,9 @@ function ProviderFormFull({
                 onConfigChange={handleCodexConfigChange}
                 useCommonConfig={useCodexCommonConfigFlag}
                 onCommonConfigToggle={handleCodexCommonConfigToggle}
-                commonConfigSnippet={codexCommonConfigSnippet}
-                onCommonConfigSnippetChange={
-                  handleCodexCommonConfigSnippetChange
-                }
-                onCommonConfigErrorClear={clearCodexCommonConfigError}
                 commonConfigError={codexCommonConfigError}
                 authError={codexAuthError}
                 configError={codexConfigError}
-                onExtract={handleCodexExtract}
-                isExtracting={isCodexExtracting}
               />
               {settingsConfigErrorField}
             </>

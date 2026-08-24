@@ -6,6 +6,13 @@
 //! 支持检测官方 Codex 客户端 (codex_vscode, codex_cli_rs)
 
 use super::{AuthInfo, AuthStrategy, ProviderAdapter};
+use crate::codex_multirouter::compiler::{
+    compile_provider_v2, CodexRoutingCompileError, CompiledCodexModel, CompiledCodexRoute,
+    CompiledCodexRoutingPlan,
+};
+use crate::codex_multirouter::schema::{
+    CodexRouteAuthPolicy, CodexRouteAuthSource, CodexRoutingConfigV2,
+};
 use crate::provider::{
     AuthBinding, AuthBindingSource, CodexCacheConfig, CodexChatReasoningConfig, Provider,
     ProviderMeta,
@@ -14,11 +21,12 @@ use crate::proxy::error::ProxyError;
 use crate::proxy::providers::codex_oauth_auth::{CodexAccountPoolPolicy, NATIVE_CODEX_ACCOUNT_ID};
 use regex::Regex;
 use serde_json::{Map, Value as JsonValue};
-use std::sync::LazyLock;
+use std::{collections::HashMap, sync::LazyLock};
 use toml::Value as TomlValue;
 
 const CODEX_ROUTER_PARENT_PROVIDER_ID: &str = "codexRouterParentProviderId";
 const CODEX_ROUTER_PARENT_PROVIDER_NAME: &str = "codexRouterParentProviderName";
+const CODEX_ROUTER_PLAINTEXT_V2_COLLABORATION: &str = "codexRouterPlaintextV2Collaboration";
 const CODEX_RESOLVED_TARGET_PROVIDER_ID: &str = "codexResolvedTargetProviderId";
 const CODEX_RESOLVED_UPSTREAM_MODEL_OVERRIDE: &str = "codexResolvedUpstreamModelOverride";
 const CODEX_NATIVE_AUTH_PASSTHROUGH: &str = "codexNativeAuthPassthrough";
@@ -41,6 +49,47 @@ pub enum CodexMultiRouterAuthFacade {
     FullyManaged,
     /// 旧配置缺少足够信息，投影层必须保留现有 live 认证门面。
     LegacyPreserved,
+}
+
+/// Read a route's authentication owner across the v1 and v2 schemas.
+///
+/// v1 stored this under `upstream.auth.source`; v2 stores it in the top-level
+/// `authPolicy.source` (with `auth`/`auth_policy` kept for compatibility).
+pub(crate) fn codex_route_auth_source(route: &JsonValue) -> Option<&str> {
+    let upstream_auth = route.get("upstream").and_then(|value| value.get("auth"));
+    [
+        route.get("authPolicy"),
+        route.get("auth_policy"),
+        upstream_auth,
+        route.get("auth"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|auth| {
+        auth.get("source")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|source| !source.is_empty())
+    })
+}
+
+fn codex_route_auth_provider(route: &JsonValue) -> Option<&str> {
+    let upstream_auth = route.get("upstream").and_then(|value| value.get("auth"));
+    [
+        route.get("authPolicy"),
+        route.get("auth_policy"),
+        upstream_auth,
+        route.get("auth"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|auth| {
+        auth.get("authProvider")
+            .or_else(|| auth.get("auth_provider"))
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+    })
 }
 
 /// 根据持久化 Router 配置和账号池策略判断本地认证门面。
@@ -78,9 +127,7 @@ pub fn classify_codex_multirouter_auth_facade(
             continue;
         }
         has_enabled_route = true;
-        let source = route
-            .pointer("/upstream/auth/source")
-            .and_then(JsonValue::as_str);
+        let source = codex_route_auth_source(route);
         match source {
             Some("native_codex_auth") => needs_native_auth = true,
             Some("account_pool") => match pool_policy {
@@ -106,58 +153,15 @@ pub fn classify_codex_multirouter_auth_facade(
     }
 }
 
-/// 判断 MultiRouter 是否需要让官方 V2 协作消息保持明文。
-///
-/// 官方 route 的子 Agent 能由 ChatGPT Codex backend 解密；任一启用的第三方或来源
-/// 不明 route 都可能成为子 Agent，因此 official parent 的协作工具参数必须改为 V2
-/// 明文。禁用 route 不影响当前任务的传输策略。
-pub fn codex_multirouter_needs_plaintext_v2_collaboration(provider: &Provider) -> bool {
-    let Some(routing) = provider.settings_config.get("codexRouting") else {
-        return false;
-    };
-    if routing
-        .get("enabled")
-        .and_then(JsonValue::as_bool)
-        .is_some_and(|enabled| !enabled)
-    {
-        return false;
-    }
-    let Some(routes) = routing
-        .get("routes")
-        .and_then(JsonValue::as_array)
-        .or_else(|| routing.as_array())
-    else {
-        return false;
-    };
-
-    routes.iter().any(|route| {
-        route
-            .get("enabled")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(true)
-            && !codex_route_uses_official_agent_backend(route)
-    })
-}
-
-fn codex_route_uses_official_agent_backend(route: &JsonValue) -> bool {
-    let upstream = route.get("upstream").unwrap_or(route);
-    let auth = upstream
-        .get("auth")
-        .or_else(|| route.get("auth"))
-        .unwrap_or(upstream);
-    auth.get("source")
-        .and_then(JsonValue::as_str)
-        .is_some_and(|source| {
-            matches!(
-                source.to_ascii_lowercase().as_str(),
-                "native_codex_auth" | "managed_codex_oauth" | "managed_account" | "account_pool"
-            )
-        })
-        || auth
-            .get("authProvider")
-            .or_else(|| auth.get("auth_provider"))
-            .and_then(JsonValue::as_str)
-            .is_some_and(|provider| provider.eq_ignore_ascii_case("codex_oauth"))
+/// 判断 route 是否由 ChatGPT Codex 官方 backend 提供原生能力。
+pub(crate) fn codex_route_uses_official_agent_backend(route: &JsonValue) -> bool {
+    codex_route_auth_source(route).is_some_and(|source| {
+        matches!(
+            source.to_ascii_lowercase().as_str(),
+            "native_codex_auth" | "managed_codex_oauth" | "managed_account" | "account_pool"
+        )
+    }) || codex_route_auth_provider(route)
+        .is_some_and(|provider| provider.eq_ignore_ascii_case("codex_oauth"))
 }
 
 /// 官方 Codex 客户端 User-Agent 正则
@@ -347,6 +351,49 @@ pub fn codex_route_supports_responses_compaction(provider: &Provider) -> bool {
     false
 }
 
+/// Whether an official parent in this MultiRouter must emit plaintext V2 agent tasks.
+///
+/// A future child may use any enabled route. If one route is third-party or its
+/// credential ownership is ambiguous, OpenAI-only encrypted task arguments are
+/// not portable. Resolved providers retain the request-local marker so retry-layer
+/// materialization cannot erase this decision.
+pub fn codex_multirouter_needs_plaintext_v2_collaboration(provider: &Provider) -> bool {
+    if provider
+        .settings_config
+        .get(CODEX_ROUTER_PLAINTEXT_V2_COLLABORATION)
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+
+    let Some(routing) = provider.settings_config.get("codexRouting") else {
+        return false;
+    };
+    if routing
+        .get("enabled")
+        .and_then(JsonValue::as_bool)
+        .is_some_and(|enabled| !enabled)
+    {
+        return false;
+    }
+    let Some(routes) = routing
+        .get("routes")
+        .and_then(JsonValue::as_array)
+        .or_else(|| routing.as_array())
+    else {
+        return false;
+    };
+
+    routes.iter().any(|route| {
+        route
+            .get("enabled")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true)
+            && !codex_route_uses_official_agent_backend(route)
+    })
+}
+
 /// Whether this provider should expose the OpenAI provider name to Codex.
 ///
 /// Codex decides remote vs local compaction from the model provider `name`
@@ -458,6 +505,439 @@ pub fn resolve_codex_model_routed_provider(
         .next()
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedCodexRoute {
+    pub route_id: String,
+    pub target_provider_id: String,
+    pub visible_model: String,
+    pub canonical_model: String,
+    pub upstream_model: String,
+    pub api_format: String,
+    pub api_format_source: String,
+    pub auth_owner: String,
+    pub dependency_fingerprint: String,
+    pub matched_by: &'static str,
+    pub effective_provider: Provider,
+}
+
+impl ResolvedCodexRoute {
+    pub fn into_effective_provider(mut self) -> Provider {
+        let settings = self
+            .effective_provider
+            .settings_config
+            .as_object_mut()
+            .expect("effective Codex provider settings must be an object");
+        settings.insert(
+            "codexRoutingDependencyFingerprint".to_string(),
+            JsonValue::String(self.dependency_fingerprint),
+        );
+        if !self.visible_model.is_empty() {
+            settings.insert(
+                "codexResolvedVisibleModel".to_string(),
+                JsonValue::String(self.visible_model),
+            );
+        }
+        if !self.canonical_model.is_empty() {
+            settings.insert(
+                "codexResolvedCanonicalModel".to_string(),
+                JsonValue::String(self.canonical_model),
+            );
+        }
+        if !self.upstream_model.is_empty() {
+            settings.insert(
+                CODEX_RESOLVED_UPSTREAM_MODEL_OVERRIDE.to_string(),
+                JsonValue::String(self.upstream_model),
+            );
+        }
+        settings.insert(
+            CODEX_RESOLVED_TARGET_PROVIDER_ID.to_string(),
+            JsonValue::String(self.target_provider_id),
+        );
+        settings.insert(
+            "codexResolvedRouteId".to_string(),
+            JsonValue::String(self.route_id),
+        );
+        settings.insert(
+            "codexResolvedApiFormat".to_string(),
+            JsonValue::String(self.api_format),
+        );
+        settings.insert(
+            "codexResolvedApiFormatSource".to_string(),
+            JsonValue::String(self.api_format_source),
+        );
+        settings.insert(
+            "codexResolvedAuthOwner".to_string(),
+            JsonValue::String(self.auth_owner),
+        );
+        settings.insert(
+            "codexResolvedMatchedBy".to_string(),
+            JsonValue::String(self.matched_by.to_string()),
+        );
+        self.effective_provider
+    }
+}
+
+/// Resolve a schema-v2 route exclusively from the declarative plan and the latest target
+/// Providers. Legacy plans return `Ok(None)` so callers can keep using the read-only v1 path.
+pub fn resolve_codex_v2_routed_provider(
+    router_provider: &Provider,
+    body: &JsonValue,
+    providers: &HashMap<String, Provider>,
+) -> Result<Option<ResolvedCodexRoute>, CodexRoutingCompileError> {
+    let Some((_plan, compiled)) = compile_codex_v2_runtime_plan(router_provider, providers)? else {
+        return Ok(None);
+    };
+    let request_model = body
+        .get("model")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    let Some(request_model) = request_model else {
+        return Ok(None);
+    };
+    let exact_model = compiled
+        .model_catalog
+        .iter()
+        .find(|model| model.visible_model.eq_ignore_ascii_case(request_model));
+    let (route, matched_by) = if let Some(model) = exact_model {
+        (
+            compiled
+                .routes
+                .iter()
+                .find(|route| route.id == model.route_id)
+                .expect("compiled model route must exist"),
+            "exact",
+        )
+    } else {
+        return Ok(None);
+    };
+
+    build_resolved_codex_v2_route(
+        router_provider,
+        &compiled,
+        route,
+        Some(request_model),
+        matched_by,
+        providers,
+    )
+    .map(Some)
+}
+
+/// Resolve raw OpenAI-compatible endpoints through schema v2 without falling back to legacy
+/// route probes. An explicit route id wins; otherwise only a model already present in the compiled
+/// catalog may select a route. Unknown or model-less requests fail closed.
+pub fn resolve_codex_v2_raw_passthrough_provider(
+    router_provider: &Provider,
+    body: &JsonValue,
+    providers: &HashMap<String, Provider>,
+    explicit_route_id: Option<&str>,
+) -> Result<Option<ResolvedCodexRoute>, CodexRoutingCompileError> {
+    let Some((_plan, compiled)) = compile_codex_v2_runtime_plan(router_provider, providers)? else {
+        return Ok(None);
+    };
+    let request_model = body
+        .get("model")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+
+    let (route, matched_by) = if let Some(route_id) = explicit_route_id {
+        let Some(route) = compiled
+            .routes
+            .iter()
+            .find(|route| route.enabled && route.id.eq_ignore_ascii_case(route_id.trim()))
+        else {
+            return Ok(None);
+        };
+        (route, "explicit_route_id")
+    } else if let Some(request_model) = request_model {
+        let exact = compiled
+            .model_catalog
+            .iter()
+            .find(|model| model.visible_model.eq_ignore_ascii_case(request_model))
+            .and_then(|model| {
+                compiled
+                    .routes
+                    .iter()
+                    .find(|route| route.enabled && route.id == model.route_id)
+            });
+        if let Some(route) = exact {
+            (route, "exact")
+        } else {
+            return Ok(None);
+        }
+    } else {
+        return Ok(None);
+    };
+
+    build_resolved_codex_v2_route(
+        router_provider,
+        &compiled,
+        route,
+        request_model,
+        matched_by,
+        providers,
+    )
+    .map(Some)
+}
+
+fn compile_codex_v2_runtime_plan(
+    router_provider: &Provider,
+    providers: &HashMap<String, Provider>,
+) -> Result<Option<(CodexRoutingConfigV2, CompiledCodexRoutingPlan)>, CodexRoutingCompileError> {
+    compile_provider_v2(router_provider, providers)
+}
+
+fn build_resolved_codex_v2_route(
+    router_provider: &Provider,
+    compiled: &CompiledCodexRoutingPlan,
+    route: &CompiledCodexRoute,
+    request_model: Option<&str>,
+    matched_by: &'static str,
+    providers: &HashMap<String, Provider>,
+) -> Result<ResolvedCodexRoute, CodexRoutingCompileError> {
+    let target_provider =
+        providers
+            .get(&route.target_provider_id)
+            .ok_or_else(|| CodexRoutingCompileError {
+                code: "target_provider_missing".to_string(),
+                message: format!(
+                    "route `{}` target provider `{}` does not exist",
+                    route.id, route.target_provider_id
+                ),
+            })?;
+    let compiled_model = request_model.and_then(|request_model| {
+        compiled.model_catalog.iter().find(|model| {
+            model.route_id == route.id && model.visible_model.eq_ignore_ascii_case(request_model)
+        })
+    });
+    let visible_model = request_model.unwrap_or_default().to_string();
+    let canonical_model = compiled_model
+        .map(|model| model.canonical_model.clone())
+        .unwrap_or_else(|| visible_model.clone());
+    let upstream_model = compiled_model
+        .map(|model| model.upstream_model.clone())
+        .unwrap_or_else(|| visible_model.clone());
+    let mut effective_provider = materialize_codex_v2_provider(
+        router_provider,
+        route,
+        target_provider,
+        &visible_model,
+        &canonical_model,
+        &upstream_model,
+        compiled_model,
+        matched_by,
+    );
+    let protocol = explain_codex_responses_upstream_protocol(&effective_provider);
+    let (api_format, api_format_source) = compiled_model
+        .map(|model| (model.api_format.clone(), model.api_format_source.clone()))
+        .unwrap_or_else(|| {
+            (
+                protocol.protocol.api_format().to_string(),
+                "provider".to_string(),
+            )
+        });
+    // The auth policy may change provider classification, but never owns protocol. Reapply the
+    // compiler's effective model/provider format after auth materialization.
+    let meta = effective_provider
+        .meta
+        .get_or_insert_with(ProviderMeta::default);
+    meta.api_format = Some(api_format.clone());
+
+    Ok(ResolvedCodexRoute {
+        route_id: route.id.clone(),
+        target_provider_id: route.target_provider_id.clone(),
+        visible_model,
+        canonical_model,
+        upstream_model,
+        api_format,
+        api_format_source,
+        auth_owner: codex_v2_auth_owner(&route.auth_policy),
+        dependency_fingerprint: compiled.dependency_fingerprint.clone(),
+        matched_by,
+        effective_provider,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_codex_v2_provider(
+    router_provider: &Provider,
+    route: &CompiledCodexRoute,
+    target_provider: &Provider,
+    request_model: &str,
+    canonical_model: &str,
+    upstream_model: &str,
+    compiled_model: Option<&CompiledCodexModel>,
+    matched_by: &str,
+) -> Provider {
+    let mut materialized = target_provider.clone();
+    materialized.id = format!("{}::route::{}", router_provider.id, route.id);
+    materialized.name = route
+        .label
+        .clone()
+        .unwrap_or_else(|| target_provider.name.clone());
+    let mut settings = target_provider
+        .settings_config
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    settings.insert(
+        CODEX_ROUTER_PARENT_PROVIDER_ID.to_string(),
+        JsonValue::String(router_provider.id.clone()),
+    );
+    settings.insert(
+        CODEX_ROUTER_PARENT_PROVIDER_NAME.to_string(),
+        JsonValue::String(router_provider.name.clone()),
+    );
+    settings.insert(
+        CODEX_RESOLVED_TARGET_PROVIDER_ID.to_string(),
+        JsonValue::String(target_provider.id.clone()),
+    );
+    settings.insert(
+        "codexResolvedRouteId".to_string(),
+        JsonValue::String(route.id.clone()),
+    );
+    settings.insert(
+        "codexResolvedRouteMatched".to_string(),
+        JsonValue::Bool(matched_by != "default"),
+    );
+    if !canonical_model.is_empty() {
+        settings.insert(
+            "codexResolvedCanonicalModel".to_string(),
+            JsonValue::String(canonical_model.to_string()),
+        );
+    }
+    if !upstream_model.is_empty() {
+        settings.insert(
+            "model".to_string(),
+            JsonValue::String(upstream_model.to_string()),
+        );
+        settings.insert(
+            CODEX_RESOLVED_UPSTREAM_MODEL_OVERRIDE.to_string(),
+            JsonValue::String(upstream_model.to_string()),
+        );
+    }
+    if codex_multirouter_needs_plaintext_v2_collaboration(router_provider) {
+        settings.insert(
+            CODEX_ROUTER_PLAINTEXT_V2_COLLABORATION.to_string(),
+            JsonValue::Bool(true),
+        );
+    }
+
+    let mut meta = materialized.meta.clone().unwrap_or_default();
+    if let Some(model) = compiled_model {
+        settings.insert(
+            "apiFormat".to_string(),
+            JsonValue::String(model.api_format.clone()),
+        );
+        let mut capabilities = Map::new();
+        if let Some(context_window) = model.capability_summary.context_window {
+            capabilities.insert("contextWindow".to_string(), JsonValue::from(context_window));
+        }
+        if !model.capability_summary.input_modalities.is_empty() {
+            capabilities.insert(
+                "inputModalities".to_string(),
+                JsonValue::from(model.capability_summary.input_modalities.clone()),
+            );
+        }
+        if let Some(reasoning) = model.capability_summary.reasoning.clone() {
+            capabilities.insert("reasoning".to_string(), reasoning.clone());
+            if let Ok(capability) = serde_json::from_value(reasoning) {
+                meta.codex_chat_reasoning =
+                    Some(codex_chat_reasoning_config_from_capability(capability));
+            }
+        }
+        if let Some(cache) = model.capability_summary.codex_cache.clone() {
+            capabilities.insert("codexCache".to_string(), cache.clone());
+            if let Ok(cache) = serde_json::from_value(cache) {
+                meta.codex_cache = Some(normalize_codex_cache_config(cache));
+            }
+        }
+        if !capabilities.is_empty() {
+            settings.insert(
+                "codexResolvedCapabilities".to_string(),
+                JsonValue::Object(capabilities),
+            );
+        }
+        meta.api_format = Some(model.api_format.clone());
+    }
+
+    apply_codex_v2_auth_policy(&route.auth_policy, &mut settings, &mut meta);
+    materialized.settings_config = JsonValue::Object(settings);
+    materialized.meta = Some(meta);
+
+    // Keep the original visible model available to diagnostics even though the actual outbound
+    // model is pinned by CODEX_RESOLVED_UPSTREAM_MODEL_OVERRIDE.
+    if !request_model.is_empty() {
+        materialized.settings_config["codexResolvedVisibleModel"] =
+            JsonValue::String(request_model.to_string());
+    }
+    materialized
+}
+
+fn apply_codex_v2_auth_policy(
+    policy: &CodexRouteAuthPolicy,
+    settings: &mut Map<String, JsonValue>,
+    meta: &mut ProviderMeta,
+) {
+    match policy.source {
+        CodexRouteAuthSource::ProviderConfig => {}
+        CodexRouteAuthSource::ManagedAccount => {
+            remove_materialized_api_credentials(settings);
+            meta.auth_binding = Some(AuthBinding {
+                source: AuthBindingSource::ManagedAccount,
+                auth_provider: None,
+                account_id: policy.account_id.clone(),
+            });
+        }
+        CodexRouteAuthSource::ManagedCodexOauth => {
+            sanitize_materialized_managed_codex_oauth_settings(settings);
+            settings.remove("auth");
+            meta.provider_type = Some("codex_oauth".to_string());
+            meta.auth_binding = Some(AuthBinding {
+                source: AuthBindingSource::ManagedAccount,
+                auth_provider: Some("codex_oauth".to_string()),
+                account_id: policy.account_id.clone(),
+            });
+        }
+        CodexRouteAuthSource::NativeCodexAuth => {
+            remove_materialized_api_credentials(settings);
+            settings.insert(
+                CODEX_NATIVE_AUTH_PASSTHROUGH.to_string(),
+                JsonValue::Bool(true),
+            );
+            meta.provider_type = None;
+            meta.auth_binding = None;
+        }
+        CodexRouteAuthSource::AccountPool => {
+            remove_materialized_api_credentials(settings);
+            settings.insert(
+                CODEX_ACCOUNT_POOL_ENABLED.to_string(),
+                JsonValue::Bool(true),
+            );
+            meta.provider_type = None;
+            meta.auth_binding = None;
+        }
+    }
+}
+
+fn remove_materialized_api_credentials(settings: &mut Map<String, JsonValue>) {
+    settings.remove("auth");
+    settings.remove("apiKey");
+    settings.remove("api_key");
+}
+
+fn codex_v2_auth_owner(policy: &CodexRouteAuthPolicy) -> String {
+    match policy.source {
+        CodexRouteAuthSource::ProviderConfig => "provider_config",
+        CodexRouteAuthSource::ManagedAccount => "managed_account",
+        CodexRouteAuthSource::ManagedCodexOauth => "managed_codex_oauth",
+        CodexRouteAuthSource::NativeCodexAuth => "native_codex_auth",
+        CodexRouteAuthSource::AccountPool => "account_pool",
+    }
+    .to_string()
+}
+
 /// 解析 Codex router 的唯一命中 route。
 ///
 /// MultiRouter 是按模型分流，不是跨模型的故障转移池：一个请求只可发送给它实际命中的
@@ -535,6 +1015,7 @@ pub fn materialize_codex_routed_provider_from_target(
         "codexResolvedCapabilities",
         CODEX_ROUTER_PARENT_PROVIDER_ID,
         CODEX_ROUTER_PARENT_PROVIDER_NAME,
+        CODEX_ROUTER_PLAINTEXT_V2_COLLABORATION,
         CODEX_RESOLVED_TARGET_PROVIDER_ID,
         CODEX_ACCOUNT_POOL_ENABLED,
         "apiFormat",
@@ -569,16 +1050,40 @@ pub fn materialize_codex_routed_provider_from_target(
         );
     }
 
-    let native_codex_auth = route_provider
+    let route_native_codex_auth = route_provider
         .settings_config
         .get(CODEX_NATIVE_AUTH_PASSTHROUGH)
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    let account_pool = route_provider
+        .and_then(JsonValue::as_bool);
+    // The built-in `codex-official` seed is the Desktop OAuth facade. Older
+    // router plans serialized it as `provider_config` and omitted the native
+    // marker, which incorrectly sent the request through the CCSM-managed
+    // OAuth classifier. Preserve an explicit route choice, but recover the
+    // native Desktop ownership for the empty built-in seed.
+    let route_is_managed_codex_oauth = route_provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.provider_type.as_deref())
+        == Some("codex_oauth");
+    let route_account_pool = route_provider
         .settings_config
         .get(CODEX_ACCOUNT_POOL_ENABLED)
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
+    let legacy_builtin_native = !route_is_managed_codex_oauth
+        && !route_account_pool
+        && is_codex_official_provider(target_provider)
+        && target_provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.provider_type.as_deref())
+            != Some("codex_oauth")
+        && !provider_has_managed_codex_oauth_auth(target_provider);
+    let native_codex_auth = if legacy_builtin_native {
+        true
+    } else {
+        route_native_codex_auth.unwrap_or(false)
+    };
+    let account_pool = route_account_pool;
     let managed_codex_oauth = !native_codex_auth
         && !account_pool
         && should_treat_target_as_managed_codex_oauth(
@@ -808,45 +1313,18 @@ fn resolve_codex_route_candidates<'a>(
     request_model: &str,
 ) -> Vec<&'a JsonValue> {
     if let Some(routing) = provider.settings_config.get("codexRouting") {
-        if let Some(routes) = routing.as_array() {
-            return resolve_codex_legacy_route_candidates(routes, request_model);
-        }
-
-        if routing
-            .get("enabled")
-            .and_then(|value| value.as_bool())
-            .is_some_and(|enabled| !enabled)
-        {
-            return Vec::new();
-        }
-
-        let Some(routes) = routing.get("routes").and_then(|value| value.as_array()) else {
+        let routes = routing
+            .as_array()
+            .or_else(|| routing.get("routes").and_then(|value| value.as_array()));
+        let Some(routes) = routes else {
             return Vec::new();
         };
-
-        let mut selected = Vec::new();
-        if let Some(route) = find_codex_route_by_match_priority(routes, request_model) {
-            selected.push(route);
-        } else if codex_model_is_declared_only_by_disabled_route(routes, request_model) {
+        let Some(primary) =
+            resolve_codex_primary_route_from_settings(&provider.settings_config, request_model)
+        else {
             return Vec::new();
-        } else if let Some(default_route) = routing
-            .get("defaultRouteId")
-            .or_else(|| routing.get("default_route_id"))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .and_then(|default_route_id| {
-                routes.iter().find(|route| {
-                    codex_route_is_enabled(route)
-                        && route
-                            .get("id")
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|id| id.eq_ignore_ascii_case(default_route_id))
-                })
-            })
-        {
-            selected.push(default_route);
-        }
+        };
+        let mut selected = vec![primary];
 
         let primary_id = selected
             .first()
@@ -900,10 +1378,17 @@ pub fn codex_provider_text_only_input(provider: &Provider) -> Option<bool> {
 
 /// 从新旧配置中挑出本次请求应该使用的 route。
 ///
-/// 新配置允许显式关闭路由，并支持 `defaultRouteId` 兜底；旧配置没有开关语义，只要数组
-/// 存在就按旧规则匹配，保证已有本地数据库不会在升级后突然失效。
+/// 新配置允许显式关闭路由；旧配置没有开关语义，只要数组存在就按旧规则匹配。
 fn resolve_codex_route<'a>(provider: &'a Provider, request_model: &str) -> Option<&'a JsonValue> {
-    if let Some(routing) = provider.settings_config.get("codexRouting") {
+    resolve_codex_route_from_settings(&provider.settings_config, request_model)
+}
+
+/// Resolve an exact or prefix route without applying any implicit fallback.
+fn resolve_codex_route_from_settings<'a>(
+    settings: &'a JsonValue,
+    request_model: &str,
+) -> Option<&'a JsonValue> {
+    if let Some(routing) = settings.get("codexRouting") {
         if let Some(routes) = routing.as_array() {
             return find_codex_route_by_match_priority(routes, request_model);
         }
@@ -920,31 +1405,12 @@ fn resolve_codex_route<'a>(provider: &'a Provider, request_model: &str) -> Optio
         if let Some(route) = find_codex_route_by_match_priority(routes, request_model) {
             return Some(route);
         }
-        if codex_model_is_declared_only_by_disabled_route(routes, request_model) {
-            return None;
-        }
-
-        return routing
-            .get("defaultRouteId")
-            .or_else(|| routing.get("default_route_id"))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .and_then(|default_route_id| {
-                routes.iter().find(|route| {
-                    codex_route_is_enabled(route)
-                        && route
-                            .get("id")
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|id| id.eq_ignore_ascii_case(default_route_id))
-                })
-            });
+        return None;
     }
 
-    provider
-        .settings_config
+    settings
         .get("codexModelRoutes")
-        .or_else(|| provider.settings_config.get("modelRoutes"))
+        .or_else(|| settings.get("modelRoutes"))
         .and_then(|value| value.as_array())
         .and_then(|routes| {
             routes
@@ -958,58 +1424,20 @@ fn resolve_codex_route<'a>(provider: &'a Provider, request_model: &str) -> Optio
         })
 }
 
+/// Resolve the route runtime will actually try. Unmatched models fail closed.
+pub(crate) fn resolve_codex_primary_route_from_settings<'a>(
+    settings: &'a JsonValue,
+    request_model: &str,
+) -> Option<&'a JsonValue> {
+    resolve_codex_route_from_settings(settings, request_model)
+}
+
 /// 判断 route 是否启用；字段缺省时按启用处理，减少手写配置的必填项。
 fn codex_route_is_enabled(route: &JsonValue) -> bool {
     route
         .get("enabled")
         .and_then(|value| value.as_bool())
         .unwrap_or(true)
-}
-
-/// 兼容被旧版/损坏保存路径写成 `codexRouting: []` 的 MultiRouter 配置。
-///
-/// 这类数据没有 `enabled/defaultRouteId` 外壳，但数组里的 route 本身仍然完整；
-/// 请求链路必须直接消费它，否则升级后所有模型都会 `route_missed=true`。
-fn resolve_codex_legacy_route_candidates<'a>(
-    routes: &'a [JsonValue],
-    request_model: &str,
-) -> Vec<&'a JsonValue> {
-    let mut selected = Vec::new();
-    if let Some(route) = find_codex_route_by_match_priority(routes, request_model) {
-        selected.push(route);
-    } else if codex_model_is_declared_only_by_disabled_route(routes, request_model) {
-        return Vec::new();
-    }
-
-    let primary_id = selected
-        .first()
-        .and_then(|route| route.get("id"))
-        .and_then(|value| value.as_str())
-        .map(|id| id.to_ascii_lowercase());
-    selected.extend(routes.iter().filter(|route| {
-        if !codex_route_is_enabled(route) {
-            return false;
-        }
-        let route_id = route
-            .get("id")
-            .and_then(|value| value.as_str())
-            .map(|id| id.to_ascii_lowercase());
-        route_id != primary_id
-    }));
-    selected
-}
-
-/// 判断请求模型是否只存在于已停用 route 的精确模型列表中。
-///
-/// Codex Desktop 可能暂存旧 catalog；此时旧 alias 不能被当成未知模型再落到
-/// defaultRouteId，否则第三方模型切换会静默回到已耗尽的官方 route。
-fn codex_model_is_declared_only_by_disabled_route(
-    routes: &[JsonValue],
-    request_model: &str,
-) -> bool {
-    routes.iter().any(|route| {
-        !codex_route_is_enabled(route) && codex_route_has_exact_model_match(route, request_model)
-    })
 }
 
 /// 按全局优先级查找 route：所有精确模型匹配优先于任何前缀匹配。
@@ -1041,17 +1469,35 @@ fn find_codex_route_by_match_priority<'a>(
         routes.iter().find(|route| {
             codex_route_is_enabled(route)
                 && codex_route_has_prefix_model_match(route, request_model)
+                && codex_route_prefix_allows_model(route, request_model)
         })
     })
 }
 
+/// `include` is a strict allowlist. A coarse prefix may only extend a `mode=all`
+/// route or a legacy route without a model selection declaration.
+fn codex_route_prefix_allows_model(route: &JsonValue, request_model: &str) -> bool {
+    let Some(models) = route
+        .pointer("/modelSelection/models")
+        .and_then(JsonValue::as_array)
+    else {
+        return true;
+    };
+    models
+        .iter()
+        .filter_map(JsonValue::as_str)
+        .any(|model| model.trim().eq_ignore_ascii_case(request_model))
+}
+
 /// 判断单条 Codex route 是否匹配请求模型。
 ///
-/// 新 schema 使用 `match.models` / `match.prefixes`；旧 schema 使用顶层 `models` /
-/// `modelPrefixes`。两套字段都按大小写不敏感处理，避免 UI 显示大小写差异导致误路由。
+/// V2 schema 使用 `modelSelection` / `matchPrefixes`；旧 schema 使用 `match.models` /
+/// `match.prefixes` 或顶层 `models` / `modelPrefixes`。所有字段都按大小写不敏感处理，
+/// 避免 UI 显示大小写差异导致误路由。
 pub(crate) fn codex_route_matches_model(route: &JsonValue, request_model: &str) -> bool {
     codex_route_has_exact_model_match(route, request_model)
-        || codex_route_has_prefix_model_match(route, request_model)
+        || (codex_route_has_prefix_model_match(route, request_model)
+            && codex_route_prefix_allows_model(route, request_model))
 }
 
 /// 判断 route 是否精确声明了请求模型。
@@ -1060,6 +1506,10 @@ fn codex_route_has_exact_model_match(route: &JsonValue, request_model: &str) -> 
 
     match_config
         .get("models")
+        .or_else(|| route.get("models"))
+        // V2 `include` selection is an exact-model declaration. Raw settings
+        // consumers still need it while a live V2 plan is being compiled.
+        .or_else(|| route.pointer("/modelSelection/models"))
         .and_then(|value| value.as_array())
         .into_iter()
         .flatten()
@@ -1075,8 +1525,12 @@ fn codex_route_has_prefix_model_match(route: &JsonValue, request_model: &str) ->
 
     match_config
         .get("prefixes")
+        .or_else(|| match_config.get("matchPrefixes"))
+        .or_else(|| match_config.get("match_prefixes"))
         .or_else(|| match_config.get("modelPrefixes"))
         .or_else(|| match_config.get("model_prefixes"))
+        .or_else(|| route.get("matchPrefixes"))
+        .or_else(|| route.get("match_prefixes"))
         .or_else(|| route.get("modelPrefixes"))
         .or_else(|| route.get("model_prefixes"))
         .and_then(|prefixes| prefixes.as_array())
@@ -1123,7 +1577,12 @@ fn build_codex_routed_provider(
         .as_object()
         .cloned()
         .unwrap_or_else(Map::new);
-
+    if codex_multirouter_needs_plaintext_v2_collaboration(provider) {
+        settings.insert(
+            CODEX_ROUTER_PLAINTEXT_V2_COLLABORATION.to_string(),
+            JsonValue::Bool(true),
+        );
+    }
     if let Some(base_url) = upstream
         .get("baseUrl")
         .or_else(|| upstream.get("base_url"))
@@ -1243,7 +1702,7 @@ fn build_codex_routed_provider(
 }
 
 /// 从 route 中读取显式声明的目标 provider id。
-fn codex_route_target_provider_id_from_route(route: &JsonValue) -> Option<&str> {
+pub(crate) fn codex_route_target_provider_id_from_route(route: &JsonValue) -> Option<&str> {
     let upstream = route.get("upstream").unwrap_or(route);
     [
         upstream.get("targetProviderId"),
@@ -1863,20 +2322,169 @@ pub fn resolve_codex_chat_reasoning_config(
     provider: &Provider,
     body: &JsonValue,
 ) -> Option<CodexChatReasoningConfig> {
+    let requested_model = body
+        .get("model")
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string)
+        .or_else(|| codex_provider_upstream_model(provider))
+        .unwrap_or_default();
+    // P1：单一 resolver 入口——用户模型级声明 > 检测候选（TTL）> 能力库 > 内置 > unknown。
+    // 请求路径只读 TTL 缓存，不发起网络请求；检测由 UI/目录层异步触发。
+    // 优先级：用户模型级声明 > 用户 provider 级显式声明（meta）> 检测/能力库/内置 > 推断。
+    let detection =
+        crate::reasoning_capabilities::current_detection(&provider.id, &requested_model);
+    let resolved = crate::reasoning_capabilities::resolve_codex_model_capability(
+        provider,
+        &requested_model,
+        detection.as_ref(),
+    );
     let inferred = infer_codex_chat_reasoning_config(provider, body);
+
+    // 1. 用户模型级声明最高优先级。
+    if resolved.source == crate::reasoning_capabilities::CapabilitySource::UserConfig {
+        let config = codex_chat_reasoning_config_from_capability(resolved.capability.unwrap());
+        // Qwen/vLLM 输出预算安全下限与能力来源正交：能力派生配置同样需要。
+        // 注意：这里只补预算下限，不纠正 thinking_param——能力声明是 thinking
+        // 开关的权威来源，不得被推断覆盖（见 apply_qwen_vllm_safety_defaults）。
+        return Some(match inferred {
+            Some(inferred) => apply_qwen_vllm_safety_defaults(config, &inferred),
+            None => config,
+        });
+    }
+
+    // 2. 用户 provider 级显式声明（meta）次之。
     if let Some(config) = provider
         .meta
         .as_ref()
         .and_then(|meta| meta.codex_chat_reasoning.clone())
     {
-        let config = normalize_codex_chat_reasoning_config(config);
-        if let Some(inferred) = inferred {
-            return Some(merge_qwen_vllm_reasoning_defaults(config, inferred));
-        }
-        return Some(config);
+        let mut config = normalize_codex_chat_reasoning_config(config);
+        // 用户显式声明了厂商参数：声明本身即关闭契约，none 可翻译为上游关闭信号。
+        config.disable_contract = true;
+        return Some(match inferred {
+            Some(inferred) => merge_qwen_vllm_reasoning_defaults(config, inferred),
+            None => config,
+        });
     }
 
+    // 3. 检测/能力库/内置第三优先级。
+    if let Some(capability) = resolved.capability {
+        let config = codex_chat_reasoning_config_from_capability(capability);
+        return Some(match inferred {
+            Some(inferred) => apply_qwen_vllm_safety_defaults(config, &inferred),
+            None => config,
+        });
+    }
+
+    // 4. 平台/模型推断。
     inferred
+}
+
+/// Apply the Provider capability map while keeping the native Responses shape.
+/// Codex uses `max` at the wire boundary for Ultra; third-party Providers may
+/// declare a different accepted value such as `xhigh`.
+pub fn apply_codex_native_responses_reasoning_effort(
+    provider: &Provider,
+    body: &mut JsonValue,
+) -> Result<(), ProxyError> {
+    let Some(requested_effort) = body
+        .pointer("/reasoning/effort")
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string)
+    else {
+        return Ok(());
+    };
+    let Some(config) = resolve_codex_chat_reasoning_config(provider, body) else {
+        return Ok(());
+    };
+    let Some(mapped) =
+        super::transform_codex_chat::map_codex_reasoning_effort(&requested_effort, &config)?
+    else {
+        return Ok(());
+    };
+
+    body["reasoning"]["effort"] = JsonValue::String(mapped.to_string());
+    Ok(())
+}
+
+/// 把 Qwen/vLLM 运行时安全默认（输出预算下限）应用到能力派生配置。
+///
+/// 与 [`merge_qwen_vllm_reasoning_defaults`] 不同：不纠正 `thinking_param`——
+/// 能力声明是 thinking 开关的权威来源，不得被推断覆盖。仅当推断结果明确识别
+/// 为 Qwen/vLLM 时，才抬高缺失或过小的 `min_output_tokens`。
+fn apply_qwen_vllm_safety_defaults(
+    mut config: CodexChatReasoningConfig,
+    inferred: &CodexChatReasoningConfig,
+) -> CodexChatReasoningConfig {
+    if !is_qwen_vllm_reasoning_defaults(inferred) {
+        return config;
+    }
+    if let Some(min) = inferred.min_output_tokens {
+        if config
+            .min_output_tokens
+            .map(|current| current < min)
+            .unwrap_or(true)
+        {
+            config.min_output_tokens = Some(min);
+        }
+    }
+    config
+}
+
+fn codex_chat_reasoning_config_from_capability(
+    capability: super::codex_reasoning::CodexModelReasoningCapability,
+) -> CodexChatReasoningConfig {
+    let resolved = super::codex_reasoning::resolve_subagent_reasoning_capability(Some(&capability));
+    let has_efforts =
+        resolved.support_kind == super::codex_reasoning::ReasoningSupportKind::EffortLevels;
+    let boolean_thinking = capability.upstream.format == "boolean";
+    let supported = capability.effective_support_status()
+        == super::codex_reasoning::ReasoningSupportStatus::ConfirmedSupported;
+    CodexChatReasoningConfig {
+        supports_thinking: Some(supported),
+        supports_effort: Some(has_efforts && !boolean_thinking),
+        thinking_param: Some(if boolean_thinking {
+            capability.upstream.parameter.clone()
+        } else if capability.disable_allowed {
+            "thinking".to_string()
+        } else {
+            "none".to_string()
+        }),
+        effort_param: Some(if has_efforts && !boolean_thinking {
+            capability.upstream.parameter
+        } else {
+            "none".to_string()
+        }),
+        effort_value_mode: Some(encode_codex_capability_effort_mode(
+            &resolved.codex_selectable_efforts,
+            &resolved.effort_map,
+        )),
+        min_output_tokens: None,
+        default_output_tokens: None,
+        output_format: capability.output_format,
+        // 能力声明显式携带关闭契约：disableAllowed=true 时 none 才翻译为关闭信号。
+        disable_contract: capability.disable_allowed,
+    }
+}
+
+fn encode_codex_capability_effort_mode(
+    supported_efforts: &[super::codex_reasoning::CodexReasoningEffort],
+    effort_map: &std::collections::BTreeMap<
+        super::codex_reasoning::CodexReasoningEffort,
+        super::codex_reasoning::CodexReasoningEffort,
+    >,
+) -> String {
+    let allowed = supported_efforts
+        .iter()
+        .map(|effort| effort.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mappings = effort_map
+        .iter()
+        .map(|(source, target)| format!("{}={}", source.as_str(), target.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("capability|{allowed}|{mappings}")
 }
 
 /// 解析 Codex provider 当前请求应采用的缓存能力。
@@ -2067,7 +2675,12 @@ fn merge_qwen_vllm_reasoning_defaults(
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if thinking_param.is_empty() || thinking_param == "thinking" {
+    let inferred_removes_implicit_qwen_toggle =
+        inferred.thinking_param.as_deref() == Some("none") && thinking_param == "enable_thinking";
+    if thinking_param.is_empty()
+        || thinking_param == "thinking"
+        || inferred_removes_implicit_qwen_toggle
+    {
         explicit.thinking_param = inferred.thinking_param;
     }
     if explicit.effort_param.is_none() {
@@ -2108,8 +2721,10 @@ fn merge_qwen_vllm_reasoning_defaults(
 
 /// 判断推断结果是否是 Qwen/vLLM 专用默认值。
 fn is_qwen_vllm_reasoning_defaults(config: &CodexChatReasoningConfig) -> bool {
-    config.thinking_param.as_deref() == Some("enable_thinking")
-        && config.effort_param.as_deref() == Some("none")
+    matches!(
+        config.thinking_param.as_deref(),
+        Some("none" | "enable_thinking")
+    ) && config.effort_param.as_deref() == Some("none")
         && config.min_output_tokens == Some(QWEN_VLLM_MIN_OUTPUT_TOKENS)
         && config.output_format.as_deref() == Some("reasoning_content")
 }
@@ -2160,6 +2775,7 @@ fn infer_codex_chat_reasoning_config(
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         });
     }
 
@@ -2176,6 +2792,7 @@ fn infer_codex_chat_reasoning_config(
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning".to_string()),
+            disable_contract: false,
         });
     }
 
@@ -2189,6 +2806,7 @@ fn infer_codex_chat_reasoning_config(
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         });
     }
 
@@ -2202,6 +2820,7 @@ fn infer_codex_chat_reasoning_config(
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         });
     }
 
@@ -2214,12 +2833,15 @@ fn infer_codex_chat_reasoning_config(
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(false),
-            thinking_param: Some("enable_thinking".to_string()),
+            // Codex 的 `reasoning.effort=none` 是 OpenAI Responses 语义，不能在缺少
+            // provider 明示关闭契约时擅自翻译成 Qwen chat-template 的 false。
+            thinking_param: Some("none".to_string()),
             effort_param: Some("none".to_string()),
             effort_value_mode: None,
             min_output_tokens: Some(QWEN_VLLM_MIN_OUTPUT_TOKENS),
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         });
     }
 
@@ -2233,6 +2855,7 @@ fn infer_codex_chat_reasoning_config(
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         });
     }
 
@@ -2246,6 +2869,7 @@ fn infer_codex_chat_reasoning_config(
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_details".to_string()),
+            disable_contract: false,
         });
     }
 
@@ -2259,6 +2883,7 @@ fn infer_codex_chat_reasoning_config(
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         });
     }
 
@@ -2290,6 +2915,7 @@ fn infer_aggregator_platform_config(
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("auto".to_string()),
+            disable_contract: false,
         });
     }
 
@@ -2306,6 +2932,7 @@ fn infer_aggregator_platform_config(
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         });
     }
 
@@ -2733,6 +3360,29 @@ mod tests {
         CodexAccountPoolEntry, CodexAccountPoolPolicy, NATIVE_CODEX_ACCOUNT_ID,
     };
     use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn capability_effort_mode_keeps_wide_mappings_for_narrow_selectable() {
+        let capability =
+            crate::proxy::providers::codex_reasoning::builtin_reasoning_capability_for_model(
+                "deepseek-v4-flash",
+            )
+            .expect("deepseek builtin");
+        let resolved =
+            crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(Some(
+                &capability,
+            ));
+        let mode = encode_codex_capability_effort_mode(
+            &resolved.codex_selectable_efforts,
+            &resolved.effort_map,
+        );
+        // allowed 收窄为真实档位，mappings 保留 medium/xhigh 上游映射（宽映射兜底）
+        assert_eq!(
+            mode,
+            "capability|low,high,max|low=low,medium=high,high=high,xhigh=high,max=max"
+        );
+    }
 
     fn create_provider(config: serde_json::Value) -> Provider {
         Provider {
@@ -2763,6 +3413,69 @@ mod tests {
             routing["officialAuth"] = official_auth;
         }
         create_provider(json!({ "codexRouting": routing }))
+    }
+
+    #[test]
+    fn codex_route_auth_source_supports_v1_and_v2_shapes() {
+        assert_eq!(
+            codex_route_auth_source(&json!({
+                "upstream": { "auth": { "source": "native_codex_auth" } }
+            })),
+            Some("native_codex_auth")
+        );
+        assert_eq!(
+            codex_route_auth_source(&json!({
+                "authPolicy": { "source": "provider_config" }
+            })),
+            Some("provider_config")
+        );
+        assert_eq!(
+            codex_route_auth_source(&json!({
+                "auth": { "source": "managed_codex_oauth" }
+            })),
+            Some("managed_codex_oauth")
+        );
+        assert_eq!(
+            codex_route_auth_source(&json!({
+                "auth_policy": { "source": "account_pool" }
+            })),
+            Some("account_pool")
+        );
+        assert_eq!(codex_route_auth_source(&json!({})), None);
+        assert_eq!(
+            codex_route_auth_source(&json!({
+                "upstream": {"auth": {}},
+                "authPolicy": {"source": "native_codex_auth"}
+            })),
+            Some("native_codex_auth"),
+            "an empty legacy container must not shadow the v2 declaration"
+        );
+        assert_eq!(
+            codex_route_auth_source(&json!({
+                "upstream": {"auth": {"source": "provider_config"}},
+                "authPolicy": {"source": "native_codex_auth"}
+            })),
+            Some("native_codex_auth"),
+            "the canonical v2 declaration owns auth when stale legacy data coexists"
+        );
+    }
+
+    #[test]
+    fn codex_multirouter_auth_facade_reads_v2_auth_policy() {
+        let provider = multirouter_with_routes(
+            json!([{
+                "id": "official-route",
+                "enabled": true,
+                "targetProviderId": "codex-official",
+                "authPolicy": { "source": "native_codex_auth" }
+            }]),
+            None,
+        );
+
+        assert_eq!(
+            classify_codex_multirouter_auth_facade(&provider, None),
+            CodexMultiRouterAuthFacade::NativeMixed
+        );
     }
 
     #[test]
@@ -2946,69 +3659,6 @@ context_window = 500000
             classify_codex_multirouter_auth_facade(&ambiguous, None),
             CodexMultiRouterAuthFacade::LegacyPreserved
         );
-    }
-
-    #[test]
-    fn codex_multirouter_plaintext_v2_delivery_depends_on_enabled_route_ownership() {
-        let mixed = multirouter_with_routes(
-            json!([
-                {
-                    "id": "official",
-                    "enabled": true,
-                    "upstream": { "auth": { "source": "managed_codex_oauth" } }
-                },
-                {
-                    "id": "third-party",
-                    "enabled": true,
-                    "upstream": { "auth": { "source": "provider_config" } }
-                }
-            ]),
-            None,
-        );
-        assert!(codex_multirouter_needs_plaintext_v2_collaboration(&mixed));
-
-        let official_only = multirouter_with_routes(
-            json!([{
-                "id": "official",
-                "enabled": true,
-                "upstream": { "auth": { "source": "account_pool" } }
-            }]),
-            None,
-        );
-        assert!(!codex_multirouter_needs_plaintext_v2_collaboration(
-            &official_only
-        ));
-
-        let disabled_third_party = multirouter_with_routes(
-            json!([
-                {
-                    "id": "official",
-                    "enabled": true,
-                    "upstream": { "auth": { "source": "native_codex_auth" } }
-                },
-                {
-                    "id": "third-party",
-                    "enabled": false,
-                    "upstream": { "auth": { "source": "provider_config" } }
-                }
-            ]),
-            None,
-        );
-        assert!(!codex_multirouter_needs_plaintext_v2_collaboration(
-            &disabled_third_party
-        ));
-
-        let ambiguous = multirouter_with_routes(
-            json!([{
-                "id": "legacy",
-                "enabled": true,
-                "upstream": { "apiFormat": "openai_responses" }
-            }]),
-            None,
-        );
-        assert!(codex_multirouter_needs_plaintext_v2_collaboration(
-            &ambiguous
-        ));
     }
 
     #[test]
@@ -3314,7 +3964,7 @@ experimental_bearer_token = "PROXY_MANAGED"
     }
 
     #[test]
-    fn test_codex_route_target_provider_infers_empty_official_seed_as_managed_oauth() {
+    fn test_codex_route_target_provider_uses_desktop_oauth_for_empty_official_seed() {
         let adapter = CodexAdapter::new();
         let router = create_provider(json!({
             "codexRouting": {
@@ -3347,21 +3997,59 @@ experimental_bearer_token = "PROXY_MANAGED"
             .expect("official route");
         let materialized = materialize_codex_routed_provider_from_target(&routed, &target);
 
-        assert_eq!(
-            materialized
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.provider_type.as_deref()),
-            Some("codex_oauth")
-        );
+        assert!(materialized
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.provider_type.as_deref())
+            .is_none());
         assert_eq!(
             adapter.extract_base_url(&materialized).unwrap(),
             "https://chatgpt.com/backend-api/codex"
         );
-        assert_eq!(
-            adapter.extract_auth(&materialized).unwrap().strategy,
-            AuthStrategy::CodexOAuth
+        assert!(adapter.extract_auth(&materialized).is_none());
+    }
+
+    #[test]
+    fn test_codex_route_target_provider_uses_desktop_oauth_for_builtin_official_seed() {
+        let router = create_provider(json!({
+            "codexNativeAuthPassthrough": false,
+            "codexRouting": {
+                "enabled": true,
+                "routes": [{
+                    "id": "router-codex-official",
+                    "label": "OpenAI Official",
+                    "targetProviderId": "codex-official",
+                    "match": { "models": ["gpt-5.6"] },
+                    "upstream": {
+                        "apiFormat": "openai_responses",
+                        "auth": { "source": "provider_config" }
+                    }
+                }],
+                "defaultRouteId": "router-codex-official"
+            }
+        }));
+        let mut target = Provider::with_id(
+            "codex-official".to_string(),
+            "OpenAI Official".to_string(),
+            json!({ "auth": {}, "config": "" }),
+            None,
         );
+        target.category = Some("official".to_string());
+
+        let routed = resolve_codex_model_routed_provider(&router, &json!({ "model": "gpt-5.6" }))
+            .expect("official route");
+        let materialized = materialize_codex_routed_provider_from_target(&routed, &target);
+
+        assert_eq!(
+            materialized.settings_config["codexNativeAuthPassthrough"],
+            true
+        );
+        assert!(materialized
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.provider_type.as_deref())
+            .is_none());
+        assert!(CodexAdapter::new().extract_auth(&materialized).is_none());
     }
 
     #[test]
@@ -3540,7 +4228,7 @@ experimental_bearer_token = "PROXY_MANAGED"
 
         assert_eq!(config.supports_thinking, Some(true));
         assert_eq!(config.supports_effort, Some(false));
-        assert_eq!(config.thinking_param.as_deref(), Some("enable_thinking"));
+        assert_eq!(config.thinking_param.as_deref(), Some("none"));
         assert_eq!(config.effort_param.as_deref(), Some("none"));
         assert_eq!(config.min_output_tokens, Some(QWEN_VLLM_MIN_OUTPUT_TOKENS));
         assert_eq!(config.default_output_tokens, None);
@@ -3608,7 +4296,7 @@ experimental_bearer_token = "PROXY_MANAGED"
 
         assert_eq!(config.supports_thinking, Some(true));
         assert_eq!(config.supports_effort, Some(false));
-        assert_eq!(config.thinking_param.as_deref(), Some("enable_thinking"));
+        assert_eq!(config.thinking_param.as_deref(), Some("none"));
         assert_eq!(config.effort_param.as_deref(), Some("none"));
         assert_eq!(config.min_output_tokens, Some(QWEN_VLLM_MIN_OUTPUT_TOKENS));
         assert_eq!(config.default_output_tokens, None);
@@ -3637,6 +4325,7 @@ wire_api = "chat"
                 min_output_tokens: None,
                 default_output_tokens: None,
                 output_format: Some("reasoning_content".to_string()),
+                disable_contract: false,
             }),
             ..Default::default()
         });
@@ -3646,7 +4335,7 @@ wire_api = "chat"
 
         assert_eq!(config.supports_thinking, Some(true));
         assert_eq!(config.supports_effort, Some(false));
-        assert_eq!(config.thinking_param.as_deref(), Some("enable_thinking"));
+        assert_eq!(config.thinking_param.as_deref(), Some("none"));
         assert_eq!(config.effort_param.as_deref(), Some("none"));
         assert_eq!(config.min_output_tokens, Some(QWEN_VLLM_MIN_OUTPUT_TOKENS));
         assert_eq!(config.default_output_tokens, None);
@@ -3675,6 +4364,7 @@ wire_api = "chat"
                 min_output_tokens: Some(QWEN_VLLM_MIN_OUTPUT_TOKENS),
                 default_output_tokens: Some(RETIRED_QWEN_VLLM_DEFAULT_OUTPUT_TOKENS),
                 output_format: Some("reasoning_content".to_string()),
+                disable_contract: false,
             }),
             ..Default::default()
         });
@@ -3682,7 +4372,7 @@ wire_api = "chat"
         let config = resolve_codex_chat_reasoning_config(&provider, &json!({ "model": "qwen3.6" }))
             .expect("qwen vllm reasoning config");
 
-        assert_eq!(config.thinking_param.as_deref(), Some("enable_thinking"));
+        assert_eq!(config.thinking_param.as_deref(), Some("none"));
         assert_eq!(config.min_output_tokens, Some(QWEN_VLLM_MIN_OUTPUT_TOKENS));
         assert_eq!(config.default_output_tokens, None);
     }
@@ -3710,6 +4400,7 @@ wire_api = "chat"
                 min_output_tokens: Some(4096),
                 default_output_tokens: Some(65_536),
                 output_format: Some("reasoning_content".to_string()),
+                disable_contract: false,
             }),
             ..Default::default()
         });
@@ -3717,7 +4408,7 @@ wire_api = "chat"
         let config = resolve_codex_chat_reasoning_config(&provider, &json!({ "model": "qwen3.6" }))
             .expect("qwen vllm reasoning config");
 
-        assert_eq!(config.thinking_param.as_deref(), Some("enable_thinking"));
+        assert_eq!(config.thinking_param.as_deref(), Some("none"));
         assert_eq!(config.min_output_tokens, Some(4096));
         assert_eq!(config.default_output_tokens, Some(65_536));
     }
@@ -3789,7 +4480,7 @@ wire_api = "chat"
     }
 
     #[test]
-    fn test_codex_route_default_route_is_used_when_no_match() {
+    fn test_codex_route_unmatched_model_does_not_use_default_route() {
         let provider = create_provider(json!({
             "codexRouting": {
                 "defaultRouteId": "fallback",
@@ -3815,15 +4506,78 @@ wire_api = "chat"
         let routed = resolve_codex_model_routed_provider(
             &provider,
             &json!({ "model": "deepseek-v4-flash" }),
-        )
-        .expect("default fallback route");
-
-        assert_eq!(routed.id, "test::route::fallback");
-        assert_eq!(routed.name, "Qwen Fallback");
-        assert_eq!(
-            routed.settings_config["base_url"],
-            "https://fallback.example"
         );
+
+        assert!(
+            routed.is_none(),
+            "an unmatched model must fail closed instead of using defaultRouteId"
+        );
+    }
+
+    #[test]
+    fn test_codex_route_unmatched_model_does_not_use_first_enabled_candidate() {
+        let provider = create_provider(json!({
+            "codexRouting": {
+                "enabled": true,
+                "routes": [
+                    {
+                        "id": "disabled-first",
+                        "enabled": false,
+                        "match": { "models": ["disabled"] },
+                        "base_url": "https://disabled.example"
+                    },
+                    {
+                        "id": "first-enabled",
+                        "match": { "models": ["qwen3.6"] },
+                        "base_url": "https://first-enabled.example"
+                    },
+                    {
+                        "id": "second-enabled",
+                        "match": { "models": ["deepseek-v4-flash"] },
+                        "base_url": "https://second-enabled.example"
+                    }
+                ]
+            }
+        }));
+
+        let routed =
+            resolve_codex_model_routed_provider(&provider, &json!({ "model": "unmatched-model" }));
+
+        assert!(
+            routed.is_none(),
+            "an unmatched model must fail closed instead of using the first enabled route"
+        );
+    }
+
+    #[test]
+    fn include_route_prefix_does_not_escape_selection() {
+        let provider = create_provider(json!({
+            "codexRouting": {
+                "enabled": true,
+                "routes": [{
+                    "id": "official",
+                    "enabled": true,
+                    "matchPrefixes": ["gpt"],
+                    "modelSelection": {
+                        "mode": "include",
+                        "models": ["gpt-5.6-sol", "gpt-5.6-luna"]
+                    },
+                    "base_url": "https://official.example"
+                }]
+            }
+        }));
+
+        let excluded =
+            resolve_codex_model_routed_provider(&provider, &json!({ "model": "gpt-5.4" }));
+        assert!(
+            excluded.is_none(),
+            "a coarse prefix must not route a model excluded by include selection"
+        );
+
+        let included =
+            resolve_codex_model_routed_provider(&provider, &json!({ "model": "gpt-5.6-sol" }))
+                .expect("an included model remains routable");
+        assert_eq!(included.id, "test::route::official");
     }
 
     #[test]
@@ -5389,6 +6143,34 @@ wire_api = "responses"
 
     #[test]
     fn test_resolve_codex_chat_reasoning_infers_deepseek_effort_support() {
+        // 使用非内置清单模型（deepseek-chat），验证平台/模型推断分支。
+        // deepseek-v4-pro/flash 在内置清单中，会走能力派生路径（见
+        // test_resolve_codex_chat_reasoning_builtin_deepseek_v4_pro）。
+        let provider = create_provider(json!({
+            "config": r#"
+model_provider = "deepseek"
+model = "deepseek-chat"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+wire_api = "chat"
+"#
+        }));
+
+        let config =
+            resolve_codex_chat_reasoning_config(&provider, &json!({ "model": "deepseek-chat" }))
+                .unwrap();
+
+        assert_eq!(config.supports_thinking, Some(true));
+        assert_eq!(config.supports_effort, Some(true));
+        assert_eq!(config.effort_value_mode.as_deref(), Some("deepseek"));
+    }
+
+    #[test]
+    fn test_resolve_codex_chat_reasoning_builtin_deepseek_v4_pro() {
+        // deepseek-v4-pro 在内置清单中：无用户声明/meta 时，请求配置由内置能力派生，
+        // effort_value_mode 为 capability 形态（精确档位 + 映射），而非通用 deepseek 模式。
         let provider = create_provider(json!({
             "config": r#"
 model_provider = "deepseek"
@@ -5407,7 +6189,17 @@ wire_api = "chat"
 
         assert_eq!(config.supports_thinking, Some(true));
         assert_eq!(config.supports_effort, Some(true));
-        assert_eq!(config.effort_value_mode.as_deref(), Some("deepseek"));
+        assert_eq!(config.effort_param.as_deref(), Some("reasoning_effort"));
+        assert!(
+            config
+                .effort_value_mode
+                .as_deref()
+                .is_some_and(|mode| mode.starts_with("capability|") && mode.contains("max=max")),
+            "builtin deepseek-v4-pro should use capability effort mode, got {:?}",
+            config.effort_value_mode
+        );
+        // 内置声明 disableAllowed=true → 关闭契约成立。
+        assert!(config.disable_contract);
     }
 
     #[test]
@@ -5435,6 +6227,106 @@ wire_api = "chat"
     }
 
     #[test]
+    fn declared_glm_capability_drives_request_mapping_config() {
+        let provider = create_provider(json!({
+            "modelCatalog": {"models": [{
+                "model": "glm-5.2",
+                "reasoning": {
+                    "supported": true,
+                    "supportedEfforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                    "defaultEffort": "max",
+                    "disableAllowed": true,
+                    "upstream": {
+                        "format": "string", "parameter": "reasoning_effort",
+                        "effortMap": {"none":"none","minimal":"none","low":"high","medium":"high","high":"high","xhigh":"max","max":"max"}
+                    },
+                    "outputFormat": "reasoning_content"
+                }
+            }]}
+        }));
+        let config = resolve_codex_chat_reasoning_config(&provider, &json!({"model":"glm-5.2"}))
+            .expect("reasoning config");
+        assert_eq!(config.effort_param.as_deref(), Some("reasoning_effort"));
+        assert!(config
+            .effort_value_mode
+            .as_deref()
+            .is_some_and(|mode| mode.contains("medium=high") && mode.contains("xhigh=max")));
+    }
+
+    #[test]
+    fn native_responses_maps_codex_ultra_to_declared_provider_effort() {
+        let provider = create_provider(json!({
+            "modelCatalog": {"models": [{
+                "model": "qwen3.8",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "medium", "xhigh"],
+                    "defaultEffort": "medium",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "string",
+                        "parameter": "reasoning_effort",
+                        "effortMap": {
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "xhigh",
+                            "xhigh": "xhigh",
+                            "max": "xhigh"
+                        }
+                    },
+                    "codexUltraOrchestration": {"enabled": true},
+                    "outputFormat": "reasoning_text"
+                }
+            }]}
+        }));
+        let mut body = json!({
+            "model": "qwen3.8",
+            "input": "hello",
+            "reasoning": {"effort": "max"}
+        });
+
+        apply_codex_native_responses_reasoning_effort(&provider, &mut body)
+            .expect("declared effort map should apply");
+
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn native_responses_preserves_identity_effort_mapping() {
+        let provider = create_provider(json!({
+            "modelCatalog": {"models": [{
+                "model": "gpt-compatible",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "high", "max"],
+                    "defaultEffort": "high",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "string",
+                        "parameter": "reasoning_effort",
+                        "effortMap": {"low": "low", "high": "high", "max": "max"}
+                    },
+                    "outputFormat": "reasoning_text"
+                }
+            }]}
+        }));
+        let mut body = json!({
+            "model": "gpt-compatible",
+            "input": "hello",
+            "reasoning": {"effort": "high"}
+        });
+
+        apply_codex_native_responses_reasoning_effort(&provider, &mut body)
+            .expect("identity effort map should apply");
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
     fn test_resolve_codex_chat_reasoning_explicit_meta_overrides_inference() {
         let mut provider = create_provider(json!({
             "config": r#"
@@ -5457,6 +6349,7 @@ wire_api = "chat"
                 min_output_tokens: None,
                 default_output_tokens: None,
                 output_format: Some("auto".to_string()),
+                disable_contract: false,
             }),
             ..Default::default()
         });
@@ -5849,5 +6742,434 @@ wire_api = "responses"
             "config": "base_url = \"https://api.x.ai/v1\"\nwire_api = \"responses\""
         }));
         assert!(!provider_needs_responses_namespace_flatten(&plain));
+    }
+
+    fn v2_target_provider(id: &str, api_format: &str, models: serde_json::Value) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            id.to_string(),
+            json!({
+                "base_url": format!("https://{id}.example/v1"),
+                "auth": {"OPENAI_API_KEY": format!("secret-{id}")},
+                "modelCatalog": {"models": models}
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_format: Some(api_format.to_string()),
+            ..Default::default()
+        });
+        provider
+    }
+
+    fn v2_router(routes: serde_json::Value, default_route_id: &str) -> Provider {
+        Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({
+                "codexRouting": {
+                    "schemaVersion": 2,
+                    "enabled": true,
+                    "defaultRouteId": default_route_id,
+                    "routes": routes
+                }
+            }),
+            None,
+        )
+    }
+
+    fn v2_route(
+        id: &str,
+        target_provider_id: &str,
+        selection: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "id": id,
+            "label": id,
+            "enabled": true,
+            "targetProviderId": target_provider_id,
+            "modelSelection": selection,
+            "authPolicy": {"source": "provider_config"}
+        })
+    }
+
+    fn v2_providers(items: impl IntoIterator<Item = Provider>) -> HashMap<String, Provider> {
+        items
+            .into_iter()
+            .map(|provider| (provider.id.clone(), provider))
+            .collect()
+    }
+
+    #[test]
+    fn v2_runtime_uses_latest_provider_protocol_without_route_mutation() {
+        let router = v2_router(
+            json!([v2_route("qwen", "qwen", json!({"mode": "all"}))]),
+            "qwen",
+        );
+        let chat = v2_target_provider("qwen", "openai_chat", json!([{"model": "qwen3.8"}]));
+        let responses =
+            v2_target_provider("qwen", "openai_responses", json!([{"model": "qwen3.8"}]));
+
+        let first = resolve_codex_v2_routed_provider(
+            &router,
+            &json!({"model": "qwen3.8"}),
+            &v2_providers([chat]),
+        )
+        .expect("compile chat")
+        .expect("chat route");
+        let second = resolve_codex_v2_routed_provider(
+            &router,
+            &json!({"model": "qwen3.8"}),
+            &v2_providers([responses]),
+        )
+        .expect("compile responses")
+        .expect("responses route");
+
+        assert!(codex_provider_uses_chat_completions(
+            &first.effective_provider
+        ));
+        assert!(!codex_provider_uses_chat_completions(
+            &second.effective_provider
+        ));
+        assert_eq!(first.api_format_source, "provider");
+        assert_eq!(second.api_format_source, "provider");
+        assert_ne!(first.dependency_fingerprint, second.dependency_fingerprint);
+    }
+
+    #[test]
+    fn v2_runtime_resolves_mixed_model_protocols_from_one_provider() {
+        let router = v2_router(
+            json!([v2_route("mixed", "mixed", json!({"mode": "all"}))]),
+            "mixed",
+        );
+        let target = v2_target_provider(
+            "mixed",
+            "openai_chat",
+            json!([
+                {"model": "chat-model"},
+                {"model": "responses-model", "apiFormat": "openai_responses"}
+            ]),
+        );
+        let providers = v2_providers([target]);
+
+        let chat =
+            resolve_codex_v2_routed_provider(&router, &json!({"model": "chat-model"}), &providers)
+                .expect("compile chat")
+                .expect("chat route");
+        let responses = resolve_codex_v2_routed_provider(
+            &router,
+            &json!({"model": "responses-model"}),
+            &providers,
+        )
+        .expect("compile responses")
+        .expect("responses route");
+
+        assert!(codex_provider_uses_chat_completions(
+            &chat.effective_provider
+        ));
+        assert!(!codex_provider_uses_chat_completions(
+            &responses.effective_provider
+        ));
+        assert_eq!(responses.api_format_source, "provider_model");
+    }
+
+    #[test]
+    fn v2_runtime_resolves_compiled_models_and_fails_closed_otherwise() {
+        let mut prefix = v2_route("prefix", "prefix", json!({"mode": "all"}));
+        prefix["matchPrefixes"] = json!(["qwen"]);
+        let router = v2_router(
+            json!([
+                prefix,
+                v2_route("exact", "exact", json!({"mode": "all"})),
+                v2_route("default", "default", json!({"mode": "all"}))
+            ]),
+            "default",
+        );
+        let providers = v2_providers([
+            v2_target_provider("prefix", "openai_chat", json!([{"model": "qwen-other"}])),
+            v2_target_provider(
+                "exact",
+                "openai_responses",
+                json!([{"model": "qwen-special"}]),
+            ),
+            v2_target_provider(
+                "default",
+                "openai_responses",
+                json!([{"model": "default-model"}]),
+            ),
+        ]);
+
+        let exact = resolve_codex_v2_routed_provider(
+            &router,
+            &json!({"model": "qwen-special"}),
+            &providers,
+        )
+        .expect("compile exact")
+        .expect("exact route");
+        let prefix =
+            resolve_codex_v2_routed_provider(&router, &json!({"model": "qwen-new"}), &providers)
+                .expect("compile prefix");
+        let fallback = resolve_codex_v2_routed_provider(
+            &router,
+            &json!({"model": "unknown-model"}),
+            &providers,
+        )
+        .expect("compile default");
+
+        assert_eq!(exact.route_id, "exact");
+        assert!(
+            prefix.is_none(),
+            "an uncompiled prefix model must fail closed"
+        );
+        assert!(fallback.is_none(), "an unmatched model must fail closed");
+    }
+
+    #[test]
+    fn include_route_prefix_does_not_match_models_outside_selection() {
+        let official = json!({
+            "id": "official",
+            "enabled": true,
+            "targetProviderId": "openai",
+            "modelSelection": {"mode": "all"},
+            "matchPrefixes": ["gpt-"]
+        });
+        let deepseek = json!({
+            "id": "deepseek",
+            "enabled": true,
+            "targetProviderId": "deepseek",
+            "modelSelection": {"mode": "include", "models": ["deepseek-v4-pro"]},
+            "matchPrefixes": ["deepseek-"]
+        });
+        let routes = vec![official, deepseek];
+
+        let excluded = find_codex_route_by_match_priority(&routes, "deepseek-v4-flash");
+        assert!(
+            excluded.is_none(),
+            "an include-excluded model must not match through a prefix"
+        );
+
+        let exact = find_codex_route_by_match_priority(&routes, "deepseek-v4-pro")
+            .expect("V2 include selection should be an exact route match");
+        assert_eq!(exact["id"], "deepseek");
+        assert!(codex_route_matches_model(exact, "deepseek-v4-pro"));
+        assert!(!codex_route_matches_model(exact, "deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn v2_runtime_applies_alias_and_secret_free_auth_policies() {
+        let mut native = v2_route("native", "official", json!({"mode": "all"}));
+        native["aliases"] = json!({"gpt-visible": "gpt-canonical"});
+        native["authPolicy"] = json!({"source": "native_codex_auth"});
+        let mut managed = v2_route("managed", "managed", json!({"mode": "all"}));
+        managed["authPolicy"] = json!({"source": "managed_codex_oauth", "accountId": "account-1"});
+        let mut pool = v2_route("pool", "pool", json!({"mode": "all"}));
+        pool["authPolicy"] = json!({"source": "account_pool"});
+        let router = v2_router(json!([native, managed, pool]), "native");
+        let providers = v2_providers([
+            v2_target_provider(
+                "official",
+                "openai_responses",
+                json!([{"model": "gpt-canonical", "upstreamModel": "gpt-upstream"}]),
+            ),
+            v2_target_provider(
+                "managed",
+                "openai_responses",
+                json!([{"model": "managed-model"}]),
+            ),
+            v2_target_provider("pool", "openai_responses", json!([{"model": "pool-model"}])),
+        ]);
+
+        let native =
+            resolve_codex_v2_routed_provider(&router, &json!({"model": "gpt-visible"}), &providers)
+                .expect("compile native")
+                .expect("native route");
+        let managed = resolve_codex_v2_routed_provider(
+            &router,
+            &json!({"model": "managed-model"}),
+            &providers,
+        )
+        .expect("compile managed")
+        .expect("managed route");
+        let pool =
+            resolve_codex_v2_routed_provider(&router, &json!({"model": "pool-model"}), &providers)
+                .expect("compile pool")
+                .expect("pool route");
+
+        assert_eq!(native.canonical_model, "gpt-canonical");
+        assert_eq!(native.upstream_model, "gpt-upstream");
+        assert_eq!(
+            native
+                .effective_provider
+                .settings_config
+                .get(CODEX_NATIVE_AUTH_PASSTHROUGH)
+                .and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert!(native
+            .effective_provider
+            .settings_config
+            .get("auth")
+            .is_none());
+        assert_eq!(
+            managed
+                .effective_provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.provider_type.as_deref()),
+            Some("codex_oauth")
+        );
+        assert_eq!(
+            managed
+                .effective_provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.account_id.as_deref()),
+            Some("account-1")
+        );
+        assert_eq!(
+            pool.effective_provider
+                .settings_config
+                .get(CODEX_ACCOUNT_POOL_ENABLED)
+                .and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert!(pool
+            .effective_provider
+            .settings_config
+            .get("auth")
+            .is_none());
+    }
+
+    #[test]
+    fn v2_runtime_projects_model_input_reasoning_and_cache_capabilities() {
+        let router = v2_router(
+            json!([v2_route("qwen", "qwen", json!({"mode": "all"}))]),
+            "qwen",
+        );
+        let target = v2_target_provider(
+            "qwen",
+            "openai_chat",
+            json!([{
+                "model": "qwen3.8",
+                "inputModalities": ["text"],
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "high"],
+                    "defaultEffort": "high",
+                    "disableAllowed": false,
+                    "upstream": {"format": "string", "parameter": "reasoning_effort"}
+                },
+                "codexCache": {
+                    "cacheMode": "qwen_context_cache",
+                    "usageFields": ["usage.cached_tokens"]
+                }
+            }]),
+        );
+        let resolved = resolve_codex_v2_routed_provider(
+            &router,
+            &json!({"model": "qwen3.8"}),
+            &v2_providers([target]),
+        )
+        .expect("compile capabilities")
+        .expect("capability route");
+
+        assert_eq!(
+            codex_provider_text_only_input(&resolved.effective_provider),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_codex_chat_reasoning_config(
+                &resolved.effective_provider,
+                &json!({"model": "qwen3.8"})
+            )
+            .and_then(|config| config.supports_effort),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_codex_cache_config(&resolved.effective_provider, &json!({"model": "qwen3.8"}))
+                .cache_mode
+                .as_deref(),
+            Some("qwen_context_cache")
+        );
+    }
+
+    #[test]
+    fn v2_collaboration_policy_distinguishes_official_only_from_mixed_routes() {
+        let mut official = v2_route("official", "official", json!({"mode": "all"}));
+        official["authPolicy"] = json!({"source": "native_codex_auth"});
+        let official_only = v2_router(json!([official.clone()]), "official");
+        assert!(!codex_multirouter_needs_plaintext_v2_collaboration(
+            &official_only
+        ));
+
+        let third_party = v2_route("qwen", "qwen", json!({"mode": "all"}));
+        let mixed = v2_router(json!([official, third_party]), "official");
+        assert!(codex_multirouter_needs_plaintext_v2_collaboration(&mixed));
+    }
+
+    #[test]
+    fn v2_raw_passthrough_without_model_fails_closed() {
+        let mut official = v2_route("official", "official", json!({"mode": "all"}));
+        official["authPolicy"] = json!({"source": "native_codex_auth"});
+        let router = v2_router(
+            json!([official, v2_route("qwen", "qwen", json!({"mode": "all"}))]),
+            "qwen",
+        );
+        let providers = v2_providers([
+            v2_target_provider(
+                "official",
+                "openai_responses",
+                json!([{"model": "gpt-5.6-sol"}]),
+            ),
+            v2_target_provider("qwen", "openai_chat", json!([{"model": "qwen3.8"}])),
+        ]);
+
+        let resolved =
+            resolve_codex_v2_raw_passthrough_provider(&router, &json!({}), &providers, None)
+                .expect("compile raw route");
+
+        assert!(
+            resolved.is_none(),
+            "a model-less raw request needs an explicit route and must fail closed otherwise"
+        );
+    }
+
+    #[test]
+    fn v2_raw_passthrough_explicit_route_id_uses_that_latest_provider() {
+        let router = v2_router(
+            json!([
+                v2_route("official", "official", json!({"mode": "all"})),
+                v2_route("qwen", "qwen", json!({"mode": "all"}))
+            ]),
+            "official",
+        );
+        let providers = v2_providers([
+            v2_target_provider(
+                "official",
+                "openai_responses",
+                json!([{"model": "gpt-5.6-sol"}]),
+            ),
+            v2_target_provider("qwen", "openai_chat", json!([{"model": "qwen3.8"}])),
+        ]);
+
+        let resolved = resolve_codex_v2_raw_passthrough_provider(
+            &router,
+            &json!({}),
+            &providers,
+            Some("qwen"),
+        )
+        .expect("compile explicit raw route")
+        .expect("qwen raw route");
+
+        assert_eq!(resolved.route_id, "qwen");
+        assert_eq!(resolved.api_format, "openai_chat");
+        assert_eq!(resolved.matched_by, "explicit_route_id");
+        assert_eq!(
+            resolved.effective_provider.settings_config["base_url"],
+            "https://qwen.example/v1"
+        );
     }
 }

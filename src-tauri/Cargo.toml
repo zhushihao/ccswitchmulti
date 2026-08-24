@@ -1,6 +1,6 @@
 [package]
 name = "cc-switch"
-version = "3.19.1-2"
+version = "3.19.2-17"
 description = "All-in-One Assistant for Claude Code, Codex & Gemini CLI"
 authors = ["Jason Young"]
 license = "MIT"
@@ -25,6 +25,10 @@ path = "src/main.rs"
 name = "codex-history-repairer"
 path = "src/bin/codex-history-repairer.rs"
 required-features = ["history-repairer"]
+
+[[bin]]
+name = "ccsm"
+path = "src/bin/ccsm.rs"
 
 [features]
 default = []
@@ -77,6 +81,7 @@ rustls = "0.23"
 webpki-roots = "0.26"
 rustls-native-certs = "0.8"
 regex = "1.10"
+semver = "1"
 rquickjs = { version = "0.8", features = ["array-buffer", "classes"] }
 thiserror = "2.0"
 anyhow = "1.0"
@@ -93,15 +98,21 @@ rust_decimal = "1.33"
 uuid = { version = "1.11", features = ["v4"] }
 sha2 = "0.10"
 hmac = "0.12"
+ed25519-dalek = "2"
 json5 = "0.4"
 json-five = "0.3.1"
 sys-locale = "0.3"
+unicode-normalization = "0.1"
+unicode-casefold = "0.2"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "2.0.1", features = ["v2_16"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
@@ -111,6 +122,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
     "Win32_UI_Controls",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

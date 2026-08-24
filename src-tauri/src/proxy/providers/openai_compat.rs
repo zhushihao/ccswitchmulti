@@ -12,7 +12,6 @@ use crate::proxy::{
     },
     sse::{append_utf8_safe, strip_sse_field, take_sse_block},
 };
-use base64::Engine as _;
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
@@ -141,22 +140,32 @@ pub(crate) fn normalize_codex_oauth_responses_request(
     body.remove("temperature");
     body.remove("top_p");
 
-    Value::Object(body)
+    // ChatGPT's Codex backend no longer accepts the legacy top-level
+    // `prompt_cache_retention` field for newer models (for example
+    // gpt-5.6-luna). The field can arrive from the Codex client during a
+    // model switch or compaction even when the provider/model catalog does
+    // not declare it. Keep the native official boundary defensive here;
+    // `prompt_cache_options` is intentionally preserved for the newer wire
+    // shape.
+    body.remove("prompt_cache_retention");
+
+    let mut normalized = Value::Object(body);
+    super::transform_codex_chat::normalize_replayed_item_ids_for_openai(&mut normalized);
+    normalized
 }
 
-/// 让混合 MultiRouter 的 V2 协作消息使用明文 function argument。
+/// Remove the private encrypted marker from non-reserved `agents.*` V2 messages.
 ///
-/// Codex 在三个协作工具的 `message` schema 上设置 Responses 私有 `encrypted: true`，
-/// official backend 因此返回密文参数。移除该单一标记后仍是原生 V2 function call，
-/// 但 Codex 会把 message 渲染成第三方上游也能读取的明文 `agent_message`。
-pub(crate) fn make_codex_v2_collaboration_messages_plaintext(body: &mut Value) -> usize {
+/// Reserved `collaboration.*` tools are deliberately excluded: newer OpenAI
+/// backends validate those schemas exactly and reject any proxy-side mutation.
+pub(crate) fn make_codex_v2_agents_messages_plaintext(body: &mut Value) -> usize {
     let Some(object) = body.as_object_mut() else {
         return 0;
     };
     let mut changed = object
         .get_mut("tools")
         .and_then(Value::as_array_mut)
-        .map_or(0, |tools| make_collaboration_tool_messages_plaintext(tools));
+        .map_or(0, |tools| make_agents_tool_messages_plaintext(tools, false));
 
     if let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) {
         for item in input {
@@ -164,24 +173,44 @@ pub(crate) fn make_codex_v2_collaboration_messages_plaintext(body: &mut Value) -
                 continue;
             }
             if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
-                changed += make_collaboration_tool_messages_plaintext(tools);
+                changed += make_agents_tool_messages_plaintext(tools, false);
             }
         }
     }
     changed
 }
 
-fn make_collaboration_tool_messages_plaintext(tools: &mut [Value]) -> usize {
+fn make_agents_tool_messages_plaintext(tools: &mut [Value], inside_agents: bool) -> usize {
     let mut changed = 0;
     for tool in tools {
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            let namespace_is_agents = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case("agents"));
+            if namespace_is_agents {
+                let children_key = if tool.get("tools").is_some() {
+                    "tools"
+                } else {
+                    "children"
+                };
+                changed += tool
+                    .get_mut(children_key)
+                    .and_then(Value::as_array_mut)
+                    .map_or(0, |children| {
+                        make_agents_tool_messages_plaintext(children, true)
+                    });
+            }
+            continue;
+        }
         if tool.get("type").and_then(Value::as_str) != Some("function") {
             continue;
         }
-        if tool
+        let explicit_agents = tool
             .get("namespace")
             .and_then(Value::as_str)
-            .is_some_and(|namespace| !namespace.eq_ignore_ascii_case("collaboration"))
-        {
+            .is_some_and(|namespace| namespace.eq_ignore_ascii_case("agents"));
+        if !inside_agents && !explicit_agents {
             continue;
         }
         if !tool
@@ -239,6 +268,125 @@ pub(crate) fn normalize_codex_responses_passthrough_request_for_transport(
     normalize_codex_responses_control_messages(&mut body);
 
     Value::Object(body)
+}
+
+/// 归一化第三方原生 Responses 上游的 reasoning input item。
+///
+/// 参数:
+/// - `request_body`: Codex Responses 请求体（已按 transport 归一化）。
+///   返回:
+/// - 所有 `type=reasoning` input item 都符合第三方 Responses schema 的请求体。
+///   副作用:
+/// - 无。函数只转换传入 JSON 值。
+///   边界:
+/// - 只用于第三方原生 Responses 透传路径；official OAuth backend 依赖
+///   `summary` / `encrypted_content` 回放 reasoning，绝不能套用本归一化。
+/// - DeepSeek 等第三方 Responses 实现要求 reasoning 历史以 `content` 中的
+///   `reasoning_text` part 回传，不接受 official backend 私有的 `summary` /
+///   `encrypted_content` 回放字段。Codex 历史里的 reasoning 大多只存 summary +
+///   官方密文（无 content），原样透传会被上游 400 拒绝
+///   （reasoning_text must be passed back to the API）。
+/// - 可读文本优先级：`content`（字符串或带 text 的 parts）> `summary`；
+///   两者都无可读文本（只剩不透明密文）时直接丢弃该 item——密文对任何第三方
+///   都不可用，保留只会招致拒绝。
+pub(crate) fn normalize_third_party_responses_reasoning_items(request_body: Value) -> Value {
+    let Value::Object(mut body) = request_body else {
+        return request_body;
+    };
+
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return Value::Object(body);
+    };
+
+    let mut normalized_items = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        if let Some(normalized) = normalize_third_party_responses_reasoning_item(item) {
+            normalized_items.push(normalized);
+        }
+    }
+
+    *items = normalized_items;
+    Value::Object(body)
+}
+
+/// 归一化单个 reasoning input item 以适配第三方原生 Responses 上游。
+///
+/// 参数:
+/// - `item`: 一条 Responses input item。
+///   返回:
+/// - `Some(item)`: 归一化后的 item，`content` 保证携带可读 reasoning_text。
+/// - `None`: item 没有任何可读 reasoning 文本（只有不透明密文），应丢弃。
+///   副作用:
+/// - 无。
+fn normalize_third_party_responses_reasoning_item(item: Value) -> Option<Value> {
+    let Value::Object(mut object) = item else {
+        return Some(item);
+    };
+    if object.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return Some(Value::Object(object));
+    }
+
+    let Some(text) = third_party_reasoning_readable_text(&object) else {
+        return None;
+    };
+
+    object.insert(
+        "content".to_string(),
+        Value::Array(vec![json!({ "type": "reasoning_text", "text": text })]),
+    );
+    object.remove("summary");
+    object.remove("encrypted_content");
+    object.remove("internal_chat_message_metadata_passthrough");
+
+    Some(Value::Object(object))
+}
+
+/// 提取 reasoning input item 中可读的 reasoning 文本。
+///
+/// 参数:
+/// - `object`: `type=reasoning` 的 Responses input item。
+///   返回:
+/// - 拼接后的可读文本；只有不透明密文时返回 `None`。
+///   副作用:
+/// - 无。
+///   边界:
+/// - `encrypted_content` 是不透明密文，任何第三方都无法解密，不算可读文本。
+fn third_party_reasoning_readable_text(object: &Map<String, Value>) -> Option<String> {
+    if let Some(text) = third_party_reasoning_field_text(object.get("content")) {
+        return Some(text);
+    }
+    third_party_reasoning_field_text(object.get("summary"))
+}
+
+/// 从 reasoning 的 `content` / `summary` 字段提取文本（字符串或 parts 数组）。
+///
+/// 参数:
+/// - `value`: reasoning item 的 `content` 或 `summary` 字段。
+///   返回:
+/// - 拼接后的非空文本；无可读文本时返回 `None`。
+///   副作用:
+/// - 无。
+fn third_party_reasoning_field_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return (!text.trim().is_empty()).then(|| text.to_string());
+    }
+
+    let parts = value.as_array()?;
+    let text = parts
+        .iter()
+        .filter_map(|part| {
+            part.get("text")
+                .and_then(Value::as_str)
+                .or_else(|| part.get("content").and_then(Value::as_str))
+                .or_else(|| part.as_str())
+        })
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    (!text.is_empty()).then_some(text)
 }
 
 /// 归一化所有 Responses transport 都可安全处理的 input item 字段。
@@ -488,8 +636,25 @@ fn normalize_codex_oauth_input_item(item: Value) -> Value {
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if item_type == "compaction"
+        && object
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|value| !looks_like_openai_codex_encrypted_content(value))
+    {
+        return json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "Earlier conversation was compacted, but its details are not readable by this provider."
+            }]
+        });
+    }
     if item_type == "reasoning" {
         normalize_codex_oauth_reasoning_item(&mut object);
+        normalize_foreign_encrypted_reasoning_item(&mut object);
     } else if item_type == "agent_message" {
         normalize_codex_oauth_agent_message(&mut object);
     } else if codex_oauth_input_item_forbids_content(item_type) {
@@ -497,6 +662,32 @@ fn normalize_codex_oauth_input_item(item: Value) -> Value {
     }
 
     Value::Object(object)
+}
+
+/// Official OpenAI replay can only decrypt its own opaque reasoning payloads.
+/// Third-party Responses providers may return a same-shaped `encrypted_content`
+/// item with a short/UUID-like payload; retaining it poisons the next official
+/// request after a provider switch. Keep plausible Codex ciphertext, but turn
+/// foreign payloads into summary-only reasoning so the conversation remains
+/// portable.
+fn normalize_foreign_encrypted_reasoning_item(object: &mut Map<String, Value>) {
+    let Some(value) = object
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    if looks_like_openai_codex_encrypted_content(value) {
+        return;
+    }
+    object.remove("encrypted_content");
+    object.remove("id");
+    object.remove("status");
+}
+
+fn looks_like_openai_codex_encrypted_content(value: &str) -> bool {
+    value.len() >= 64 && value.starts_with("gAAAAA") && value.is_ascii()
 }
 
 /// Codex Multi-Agent V2 can persist a third-party agent's plaintext reply in an
@@ -522,7 +713,7 @@ fn normalize_codex_oauth_agent_message(object: &mut Map<String, Value>) {
         else {
             continue;
         };
-        if looks_like_codex_encrypted_content(&value) {
+        if super::codex_multi_agent::looks_like_codex_opaque_encrypted_content(&value) {
             continue;
         }
 
@@ -530,23 +721,6 @@ fn normalize_codex_oauth_agent_message(object: &mut Map<String, Value>) {
         part.insert("type".to_string(), Value::String("input_text".to_string()));
         part.insert("text".to_string(), Value::String(value));
     }
-}
-
-fn looks_like_codex_encrypted_content(value: &str) -> bool {
-    if value.len() < 64 || !value.is_ascii() {
-        return false;
-    }
-    [
-        &base64::engine::general_purpose::STANDARD,
-        &base64::engine::general_purpose::URL_SAFE,
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-    ]
-    .into_iter()
-    .any(|engine| {
-        engine
-            .decode(value)
-            .is_ok_and(|decoded| decoded.len() >= 32)
-    })
 }
 
 /// 判断 input item 是否是 Codex 内部控制消息。
@@ -1661,15 +1835,17 @@ fn normalize_error_object(error: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use futures::{stream, StreamExt};
 
     #[test]
-    fn mixed_router_keeps_v2_but_makes_collaboration_messages_plaintext() {
+    fn mixed_router_plaintext_rewrite_targets_only_non_reserved_agents_tools() {
         let mut request = json!({
             "input": [{
                 "type": "additional_tools",
                 "tools": [{
                     "type": "function",
+                    "namespace": "agents",
                     "name": "send_message",
                     "parameters": {
                         "properties": {"message": {"type": "string", "encrypted": true}}
@@ -1678,76 +1854,80 @@ mod tests {
             }],
             "tools": [
                 {
-                    "type": "function",
-                    "name": "spawn_agent",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "task_name": {"type": "string"},
-                            "message": {"type": "string", "encrypted": true},
-                            "private_note": {"type": "string", "encrypted": true}
+                    "type": "namespace",
+                    "name": "agents",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "parameters": {
+                                "properties": {
+                                    "message": {"type": "string", "encrypted": true},
+                                    "private_note": {"type": "string", "encrypted": true}
+                                }
+                            }
+                        },
+                        {
+                            "type": "function",
+                            "name": "followup_task",
+                            "parameters": {
+                                "properties": {"message": {"type": "string", "encrypted": true}}
+                            }
+                        },
+                        {
+                            "type": "function",
+                            "name": "lookup",
+                            "parameters": {
+                                "properties": {"message": {"type": "string", "encrypted": true}}
+                            }
                         }
-                    }
+                    ]
                 },
                 {
-                    "type": "function",
-                    "namespace": "collaboration",
-                    "name": "send_message",
-                    "parameters": {
-                        "properties": {"message": {"type": "string", "encrypted": true}}
-                    }
-                },
-                {
-                    "type": "function",
-                    "name": "followup_task",
-                    "parameters": {
-                        "properties": {"message": {"type": "string", "encrypted": true}}
-                    }
-                },
-                {
-                    "type": "function",
-                    "name": "lookup",
-                    "parameters": {
-                        "properties": {"message": {"type": "string", "encrypted": true}}
-                    }
-                },
-                {
-                    "type": "function",
-                    "namespace": "other",
-                    "name": "spawn_agent",
-                    "parameters": {
-                        "properties": {"message": {"type": "string", "encrypted": true}}
-                    }
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [{
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": {
+                            "properties": {"message": {"type": "string", "encrypted": true}}
+                        }
+                    }]
                 }
             ]
         });
 
-        let changed = make_codex_v2_collaboration_messages_plaintext(&mut request);
+        let changed = make_codex_v2_agents_messages_plaintext(&mut request);
 
-        assert_eq!(changed, 4);
-        for index in 0..3 {
-            assert!(
-                request["tools"][index]["parameters"]["properties"]["message"]
-                    .get("encrypted")
-                    .is_none()
-            );
-        }
-        assert_eq!(
-            request["tools"][0]["parameters"]["properties"]["private_note"]["encrypted"],
-            true
+        assert_eq!(changed, 3);
+        assert!(
+            request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
         );
-        assert_eq!(
-            request["tools"][3]["parameters"]["properties"]["message"]["encrypted"],
-            true
-        );
-        assert_eq!(
-            request["tools"][4]["parameters"]["properties"]["message"]["encrypted"],
-            true
+        assert!(
+            request["tools"][0]["tools"][1]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
         );
         assert!(
             request["input"][0]["tools"][0]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
+        );
+        assert_eq!(
+            request["tools"][0]["tools"][0]["parameters"]["properties"]["private_note"]
+                ["encrypted"],
+            true
+        );
+        assert_eq!(
+            request["tools"][0]["tools"][2]["parameters"]["properties"]["message"]["encrypted"],
+            true
+        );
+        assert_eq!(
+            request["tools"][1]["tools"][0]["parameters"]["properties"]["message"]["encrypted"],
+            true,
+            "reserved collaboration schema must remain byte/schema preserving"
         );
     }
 
@@ -1935,6 +2115,80 @@ mod tests {
                 .filter(|value| value.as_str() == Some("reasoning.encrypted_content"))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn codex_oauth_responses_normalizer_drops_legacy_prompt_cache_retention() {
+        let normalized = normalize_codex_oauth_responses_request(
+            json!({
+                "model": "gpt-5.6-luna",
+                "instructions": "existing instructions",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "hello" }]
+                }],
+                "prompt_cache_retention": "24h",
+                "prompt_cache_options": { "ttl": "30m" }
+            }),
+            false,
+        );
+
+        assert!(normalized.get("prompt_cache_retention").is_none());
+        assert_eq!(normalized["prompt_cache_options"]["ttl"], "30m");
+    }
+
+    #[test]
+    fn codex_oauth_responses_normalizer_rewrites_third_party_web_search_id_for_official_replay() {
+        // A managed Codex OAuth route is materialized with a temporary route ID,
+        // so the later built-in-provider gate does not run. The OAuth boundary
+        // itself must canonicalize replay metadata before ChatGPT validates it.
+        let normalized = normalize_codex_oauth_responses_request(
+            json!({
+                "model": "gpt-5.6-sol",
+                "input": [{
+                    "type": "web_search_call",
+                    "id": "call_00_JYFDjhEPbdA9SmnfBXkC9250",
+                    "status": "completed",
+                    "action": {"type": "search", "queries": ["redacted fixture"]}
+                }]
+            }),
+            false,
+        );
+
+        let id = normalized["input"][0]["id"]
+            .as_str()
+            .expect("web search item ID");
+        assert!(id.starts_with("ws_ccswitch_"), "unexpected ID: {id}");
+        assert_eq!(normalized["input"][0]["type"], "web_search_call");
+        assert_eq!(normalized["input"][0]["status"], "completed");
+        assert_eq!(normalized["input"][0]["action"]["type"], "search");
+    }
+
+    #[test]
+    fn codex_oauth_responses_normalizer_strips_third_party_plain_reasoning_replay_metadata() {
+        // DeepSeek native Responses emits response-only id/status metadata on
+        // reasoning output items. ChatGPT accepts the inline summary but rejects
+        // status and treats an ID as stored server state under store=false.
+        let normalized = normalize_codex_oauth_responses_request(
+            json!({
+                "model": "gpt-5.6-sol",
+                "input": [{
+                    "type": "reasoning",
+                    "id": "0809ed03-b717-4b92-9e58-6cc019b16486",
+                    "status": "completed",
+                    "summary": [{"type": "summary_text", "text": "portable summary"}]
+                }]
+            }),
+            false,
+        );
+
+        assert!(normalized["input"][0].get("id").is_none());
+        assert!(normalized["input"][0].get("status").is_none());
+        assert_eq!(
+            normalized["input"][0]["summary"],
+            json!([{"type": "summary_text", "text": "portable summary"}])
         );
     }
 
@@ -2255,7 +2509,7 @@ mod tests {
                 {
                     "type": "reasoning",
                     "summary": [{ "type": "summary_text", "text": "Need to inspect files." }],
-                    "encrypted_content": "enc_reasoning",
+                    "encrypted_content": "gAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "content": [{ "type": "reasoning_text", "text": "raw hidden reasoning" }]
                 }
             ]
@@ -2266,7 +2520,50 @@ mod tests {
 
         assert!(input[1].get("content").is_none());
         assert_eq!(input[1]["summary"][0]["text"], "Need to inspect files.");
-        assert_eq!(input[1]["encrypted_content"], "enc_reasoning");
+        assert_eq!(
+            input[1]["encrypted_content"],
+            "gAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn codex_oauth_responses_normalizer_drops_foreign_encrypted_reasoning() {
+        let body = json!({
+            "model": "gpt-5.6-luna",
+            "input": [{
+                "type": "reasoning",
+                "id": "7672...fd-0",
+                "summary": [{"type": "summary_text", "text": "DeepSeek summary"}],
+                "encrypted_content": "7672...fd-0"
+            }]
+        });
+
+        let normalized = normalize_codex_oauth_responses_request(body, false);
+        let item = &normalized["input"][0];
+
+        assert!(item.get("encrypted_content").is_none());
+        assert!(item.get("id").is_none());
+        assert_eq!(item["summary"][0]["text"], "DeepSeek summary");
+    }
+
+    #[test]
+    fn codex_oauth_responses_normalizer_projects_foreign_compaction_to_message() {
+        let body = json!({
+            "model": "gpt-5.6-luna",
+            "input": [{
+                "type": "compaction",
+                "encrypted_content": "7672...fd-0"
+            }]
+        });
+
+        let normalized = normalize_codex_oauth_responses_request(body, false);
+        let item = &normalized["input"][0];
+
+        assert_eq!(item["type"], "message");
+        assert!(item.get("encrypted_content").is_none());
+        assert!(item["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| { text.contains("not readable by this provider") }));
     }
 
     #[test]
@@ -2340,6 +2637,151 @@ mod tests {
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"][0]["text"], "continue");
+    }
+
+    #[test]
+    fn third_party_responses_reasoning_summary_only_becomes_reasoning_text_content() {
+        // 从官方模型切到 DeepSeek 后，历史 reasoning 大多只有 summary + 官方密文、
+        // 没有 content；第三方原生 Responses 上游要求回传 reasoning_text，否则 400。
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_02002c5e",
+                    "summary": [{ "type": "summary_text", "text": "Summarizing final handoff details" }],
+                    "encrypted_content": "gAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "internal_chat_message_metadata_passthrough": { "kind": "desktop" }
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                }
+            ]
+        });
+
+        let normalized = normalize_third_party_responses_reasoning_items(body);
+        let input = normalized["input"].as_array().expect("input array");
+
+        assert_eq!(input.len(), 2);
+        let item = &input[0];
+        assert_eq!(item["type"], "reasoning");
+        assert_eq!(
+            item["content"],
+            json!([{ "type": "reasoning_text", "text": "Summarizing final handoff details" }])
+        );
+        assert!(item.get("summary").is_none());
+        assert!(item.get("encrypted_content").is_none());
+        assert!(item
+            .get("internal_chat_message_metadata_passthrough")
+            .is_none());
+        // 非 reasoning item 不受影响
+        assert_eq!(input[1]["role"], "user");
+    }
+
+    #[test]
+    fn third_party_responses_reasoning_content_kept_and_private_fields_stripped() {
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "input": [{
+                "type": "reasoning",
+                "id": "f7edc5f8-06fd-46b6-bb89-e83c270c2b15",
+                "summary": [],
+                "content": [{ "type": "reasoning_text", "text": "We have an interrupted context." }],
+                "encrypted_content": "gAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        });
+
+        let normalized = normalize_third_party_responses_reasoning_items(body);
+        let item = &normalized["input"][0];
+
+        assert_eq!(
+            item["content"],
+            json!([{ "type": "reasoning_text", "text": "We have an interrupted context." }])
+        );
+        assert!(item.get("summary").is_none());
+        assert!(item.get("encrypted_content").is_none());
+        assert_eq!(item["id"], "f7edc5f8-06fd-46b6-bb89-e83c270c2b15");
+    }
+
+    #[test]
+    fn third_party_responses_reasoning_encrypted_only_item_dropped() {
+        // 只有官方密文、没有任何可读文本的 reasoning item 对第三方毫无价值，
+        // 保留只会招致拒绝，直接丢弃。
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_0496949a",
+                    "summary": [],
+                    "encrypted_content": "gAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                }
+            ]
+        });
+
+        let normalized = normalize_third_party_responses_reasoning_items(body);
+        let input = normalized["input"].as_array().expect("input array");
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+    }
+
+    #[test]
+    fn third_party_responses_reasoning_normalization_is_idempotent_and_joins_summary_parts() {
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "input": [{
+                "type": "reasoning",
+                "summary": [
+                    { "type": "summary_text", "text": "First part." },
+                    { "type": "summary_text", "text": "Second part." }
+                ]
+            }]
+        });
+
+        let once = normalize_third_party_responses_reasoning_items(body);
+        let twice = normalize_third_party_responses_reasoning_items(once.clone());
+
+        assert_eq!(once, twice);
+        assert_eq!(
+            once["input"][0]["content"],
+            json!([{ "type": "reasoning_text", "text": "First part.\n\nSecond part." }])
+        );
+    }
+
+    #[test]
+    fn official_oauth_reasoning_keeps_summary_and_encrypted_content() {
+        // official OAuth backend 依赖 summary / encrypted_content 回放 reasoning，
+        // 第三方 reasoning 归一化绝不能影响该路径。
+        let body = json!({
+            "model": "gpt-5.6-luna",
+            "input": [{
+                "type": "reasoning",
+                "id": "rs_02002c5e",
+                "summary": [{ "type": "summary_text", "text": "Summarizing final handoff details" }],
+                "encrypted_content": "gAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        });
+
+        let normalized = normalize_codex_oauth_responses_request(body, false);
+        let item = &normalized["input"][0];
+
+        assert_eq!(
+            item["summary"][0]["text"],
+            "Summarizing final handoff details"
+        );
+        assert_eq!(
+            item["encrypted_content"],
+            "gAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(item.get("content").is_none());
     }
 
     #[test]

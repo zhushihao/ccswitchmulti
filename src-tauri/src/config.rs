@@ -90,6 +90,26 @@ fn path_eq_lexical(left: &Path, right: &Path) -> bool {
     comparable_path_key(left) == comparable_path_key(right)
 }
 
+/// Returns true when `path` is lexically contained within `base`.
+///
+/// Both paths are normalized lexically (without hitting the filesystem), so
+/// this works for non-existent paths. It is **not** a symlink defense: a
+/// symlink inside `base` can still lead a resolved path outside it. Callers
+/// that go on to open the file must canonicalize the existing path and
+/// re-verify containment (see `resolve_cc_switch_catalog_path`).
+/// On Windows the comparison is case-insensitive.
+pub(crate) fn path_is_within(base: &Path, path: &Path) -> bool {
+    let base_key = comparable_path_key(base);
+    let path_key = comparable_path_key(path);
+
+    if path_key == base_key {
+        return true;
+    }
+
+    let prefix = format!("{base_key}/");
+    path_key.starts_with(&prefix)
+}
+
 #[cfg(windows)]
 fn derive_wsl_default_mcp_path(dir: &Path) -> Option<PathBuf> {
     use std::path::Prefix;
@@ -270,19 +290,32 @@ fn sort_json_keys(value: &Value) -> Value {
     }
 }
 
-/// 写入 JSON 配置文件（键按字母排序，确保确定性输出）
-pub fn write_json_file<T: Serialize>(path: &Path, data: &T) -> Result<(), AppError> {
+/// 写入 JSON 配置文件并返回实际写入的字节。
+pub(crate) fn serialize_json_file_contents<T: Serialize>(data: &T) -> Result<Vec<u8>, AppError> {
+    let value = serde_json::to_value(data).map_err(|e| AppError::JsonSerialize { source: e })?;
+    let sorted_value = sort_json_keys(&value);
+    let json = serde_json::to_string_pretty(&sorted_value)
+        .map_err(|e| AppError::JsonSerialize { source: e })?;
+    Ok(json.into_bytes())
+}
+
+pub fn write_json_file_with_contents<T: Serialize>(
+    path: &Path,
+    data: &T,
+) -> Result<Vec<u8>, AppError> {
     // 确保目录存在
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
     }
 
-    let value = serde_json::to_value(data).map_err(|e| AppError::JsonSerialize { source: e })?;
-    let sorted_value = sort_json_keys(&value);
-    let json = serde_json::to_string_pretty(&sorted_value)
-        .map_err(|e| AppError::JsonSerialize { source: e })?;
+    let contents = serialize_json_file_contents(data)?;
+    atomic_write(path, &contents)?;
+    Ok(contents)
+}
 
-    atomic_write(path, json.as_bytes())
+/// 写入 JSON 配置文件（键按字母排序，确保确定性输出）
+pub fn write_json_file<T: Serialize>(path: &Path, data: &T) -> Result<(), AppError> {
+    write_json_file_with_contents(path, data).map(|_| ())
 }
 
 /// 原子写入文本文件（用于 TOML/纯文本）
@@ -291,6 +324,44 @@ pub fn write_text_file(path: &Path, data: &str) -> Result<(), AppError> {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
     }
     atomic_write(path, data.as_bytes())
+}
+
+#[cfg(windows)]
+fn is_retryable_replace_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(1175) | Some(1176) | Some(32) | Some(5)
+    )
+}
+
+#[cfg(windows)]
+fn is_partial_replace_move(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(1177)
+}
+
+#[cfg(windows)]
+enum PartialReplaceRecovery {
+    Completed,
+    Restored(std::io::Error),
+    Unrecoverable(std::io::Error),
+}
+
+#[cfg(windows)]
+fn recover_partial_replace_move(tmp: &Path, path: &Path, backup: &Path) -> PartialReplaceRecovery {
+    match fs::rename(tmp, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(backup);
+            PartialReplaceRecovery::Completed
+        }
+        Err(finish_error) => {
+            if !path.exists() && backup.exists() && fs::rename(backup, path).is_ok() {
+                let _ = fs::remove_file(tmp);
+                PartialReplaceRecovery::Restored(finish_error)
+            } else {
+                PartialReplaceRecovery::Unrecoverable(finish_error)
+            }
+        }
+    }
 }
 
 /// 原子写入：写入临时文件后 rename 替换，避免半写状态
@@ -302,7 +373,6 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
     let parent = path
         .parent()
         .ok_or_else(|| AppError::Config("无效的路径".to_string()))?;
-    let mut tmp = parent.to_path_buf();
     let file_name = path
         .file_name()
         .ok_or_else(|| AppError::Config("无效的文件名".to_string()))?
@@ -312,13 +382,38 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    tmp.push(format!("{file_name}.tmp.{ts}"));
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (tmp, mut file) = (|| -> Result<(PathBuf, fs::File), AppError> {
+        let mut last_collision = None;
+        for _ in 0..16 {
+            let counter = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                "{file_name}.tmp.{}.{ts}.{counter}",
+                std::process::id()
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => return Ok((candidate, file)),
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_collision = Some((candidate, source));
+                }
+                Err(source) => return Err(AppError::io(&candidate, source)),
+            }
+        }
 
-    {
-        let mut f = fs::File::create(&tmp).map_err(|e| AppError::io(&tmp, e))?;
-        f.write_all(data).map_err(|e| AppError::io(&tmp, e))?;
-        f.flush().map_err(|e| AppError::io(&tmp, e))?;
+        let (candidate, source) = last_collision.expect("temporary filename loop must run");
+        Err(AppError::io(&candidate, source))
+    })()?;
+
+    if let Err(source) = file.write_all(data).and_then(|_| file.flush()) {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(AppError::io(&tmp, source));
     }
+    drop(file);
 
     #[cfg(unix)]
     {
@@ -331,22 +426,142 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
 
     #[cfg(windows)]
     {
-        // Windows 上 rename 目标存在会失败，先移除再重命名（尽量接近原子性）
-        if path.exists() {
-            let _ = fs::remove_file(path);
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+        let replaced: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let replacement: Vec<u16> = tmp
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let backup = {
+            let mut path = tmp.as_os_str().to_os_string();
+            path.push(".backup");
+            PathBuf::from(path)
+        };
+        let backup_wide: Vec<u16> = backup
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut completed = false;
+        let mut last_error = None;
+
+        for attempt in 0..5 {
+            // SAFETY: both path buffers are NUL-terminated UTF-16 and remain alive for the
+            // duration of the call. Backup, exclusion, and reserved pointers are intentionally null.
+            let replaced_ok = unsafe {
+                ReplaceFileW(
+                    replaced.as_ptr(),
+                    replacement.as_ptr(),
+                    backup_wide.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            if replaced_ok != 0 {
+                let _ = fs::remove_file(&backup);
+                completed = true;
+                break;
+            }
+
+            let replace_error = std::io::Error::last_os_error();
+            if is_partial_replace_move(&replace_error) {
+                // ReplaceFileW 1177 has already moved the old destination to the backup path
+                // while leaving the replacement at its temporary path. Finish the intended
+                // move when possible; otherwise restore the old destination before returning.
+                match recover_partial_replace_move(&tmp, path, &backup) {
+                    PartialReplaceRecovery::Completed => {
+                        completed = true;
+                        break;
+                    }
+                    PartialReplaceRecovery::Restored(finish_error) => {
+                        return Err(AppError::IoContext {
+                            context: format!(
+                                "原子替换部分完成后已恢复旧文件: {} -> {}",
+                                tmp.display(),
+                                path.display()
+                            ),
+                            source: finish_error,
+                        });
+                    }
+                    PartialReplaceRecovery::Unrecoverable(finish_error) => {
+                        return Err(AppError::IoContext {
+                            context: format!(
+                                "原子替换部分完成且自动恢复失败（保留临时与备份文件）: {} -> {}; backup={}",
+                                tmp.display(),
+                                path.display(),
+                                backup.display()
+                            ),
+                            source: finish_error,
+                        });
+                    }
+                }
+            }
+            if is_retryable_replace_error(&replace_error) {
+                // With an explicit backup path, 1176 also leaves both original names intact,
+                // so the same bounded retry is safe for that documented rename failure.
+                last_error = Some(replace_error);
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                continue;
+            }
+
+            if replace_error.kind() != std::io::ErrorKind::NotFound {
+                last_error = Some(replace_error);
+                break;
+            }
+
+            match fs::rename(&tmp, path) {
+                Ok(()) => {
+                    completed = true;
+                    break;
+                }
+                Err(source)
+                    if matches!(
+                        source.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    last_error = Some(source);
+                    if attempt < 4 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+                Err(source) => {
+                    last_error = Some(source);
+                    break;
+                }
+            }
         }
-        fs::rename(&tmp, path).map_err(|e| AppError::IoContext {
-            context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
-            source: e,
-        })?;
+
+        if !completed {
+            let source = last_error.unwrap_or_else(std::io::Error::last_os_error);
+            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(&backup);
+            return Err(AppError::IoContext {
+                context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
+                source,
+            });
+        }
     }
 
     #[cfg(not(windows))]
     {
-        fs::rename(&tmp, path).map_err(|e| AppError::IoContext {
-            context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
-            source: e,
-        })?;
+        if let Err(source) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(AppError::IoContext {
+                context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
+                source,
+            });
+        }
     }
     Ok(())
 }
@@ -354,6 +569,129 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_preserves_destination_when_windows_replace_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"old contents").unwrap();
+        let held_file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+
+        let result = atomic_write(&path, b"new contents");
+
+        assert!(result.is_err());
+        drop(held_file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"old contents");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retryable_replace_error_recognizes_only_supported_windows_errors() {
+        for code in [1175, 1176, 32, 5] {
+            assert!(is_retryable_replace_error(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(is_partial_replace_move(&std::io::Error::from_raw_os_error(
+            1177
+        )));
+        assert!(!is_retryable_replace_error(
+            &std::io::Error::from_raw_os_error(1177)
+        ));
+        assert!(!is_retryable_replace_error(
+            &std::io::Error::from_raw_os_error(87)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn partial_replace_recovery_finishes_install_when_target_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let tmp = dir.path().join("config.json.tmp");
+        let backup = dir.path().join("config.json.backup");
+        std::fs::write(&tmp, b"new contents").unwrap();
+        std::fs::write(&backup, b"old contents").unwrap();
+
+        assert!(matches!(
+            recover_partial_replace_move(&tmp, &path, &backup),
+            PartialReplaceRecovery::Completed
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new contents");
+        assert!(!tmp.exists());
+        assert!(!backup.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn partial_replace_recovery_restores_old_file_when_new_file_is_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let tmp = dir.path().join("config.json.tmp");
+        let backup = dir.path().join("config.json.backup");
+        std::fs::write(&tmp, b"new contents").unwrap();
+        std::fs::write(&backup, b"old contents").unwrap();
+        let held_tmp = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&tmp)
+            .unwrap();
+
+        assert!(matches!(
+            recover_partial_replace_move(&tmp, &path, &backup),
+            PartialReplaceRecovery::Restored(_)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"old contents");
+        assert!(tmp.exists());
+        assert!(!backup.exists());
+        drop(held_tmp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn partial_replace_recovery_keeps_both_files_when_install_and_restore_are_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let tmp = dir.path().join("config.json.tmp");
+        let backup = dir.path().join("config.json.backup");
+        std::fs::write(&tmp, b"new contents").unwrap();
+        std::fs::write(&backup, b"old contents").unwrap();
+        let held_tmp = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&tmp)
+            .unwrap();
+        let held_backup = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&backup)
+            .unwrap();
+
+        assert!(matches!(
+            recover_partial_replace_move(&tmp, &path, &backup),
+            PartialReplaceRecovery::Unrecoverable(_)
+        ));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"new contents");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old contents");
+        drop(held_tmp);
+        drop(held_backup);
+    }
 
     #[test]
     fn derive_mcp_path_from_override_uses_config_dir_for_custom_path() {

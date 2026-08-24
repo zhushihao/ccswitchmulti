@@ -9,6 +9,7 @@ use super::codex_chat_common::{
     response_function_call_item, response_function_call_item_with_namespace,
     split_leading_think_block,
 };
+use super::codex_terminal::{classify_chat_terminal, ChatTerminalEvidence, TerminalDisposition};
 use super::hosted_tools::{
     image_generation::{self, HostedImageGenerationConfig, IMAGE_GENERATION_FUNCTION_NAME},
     web_search::{self, HostedWebSearchConfig},
@@ -22,7 +23,7 @@ use crate::proxy::{
     },
     tool_media::{
         chat_audio_from_input_audio, chat_file_from_input_file, flush_pending_chat_tool_media,
-        plan_chat_tool_output_media, queue_chat_tool_output_media,
+        normalize_chat_image_detail, plan_chat_tool_output_media, queue_chat_tool_output_media,
         strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_MOVED_MARKER,
     },
 };
@@ -109,31 +110,41 @@ pub(crate) fn response_message_item_id(response_id: &str) -> String {
     format!("msg_{suffix}")
 }
 
-/// Normalize safely rewriteable item IDs created by third-party Responses
-/// implementations before replaying mixed-provider history to an OpenAI official
-/// Responses endpoint. Existing canonical OpenAI IDs remain untouched. Invalid
-/// vendor IDs are mapped deterministically so retries and prompt-cache prefixes
-/// stay stable. Encrypted reasoning is deliberately excluded because its opaque
-/// payload can be bound to the original provider/item identity.
+/// Normalize replay metadata created by third-party Responses implementations
+/// before replaying mixed-provider history to an OpenAI official Responses
+/// endpoint. Plain reasoning is inlined by removing its synthetic ID: OpenAI
+/// otherwise treats any `rs_*` ID as stored server state and rejects it under
+/// `store: false`. Other invalid vendor IDs are mapped deterministically so
+/// retries and prompt-cache prefixes stay stable. Encrypted reasoning is left
+/// untouched because its opaque payload can be bound to the original provider
+/// and item identity.
 pub(crate) fn normalize_replayed_item_ids_for_openai(body: &mut Value) -> usize {
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return 0;
     };
     let mut changed = 0;
     for item in input {
+        let is_plain_reasoning = item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.is_empty());
+        if is_plain_reasoning {
+            if let Some(object) = item.as_object_mut() {
+                let removed_id = object.remove("id").is_some();
+                let removed_status = object.remove("status").is_some();
+                if removed_id || removed_status {
+                    changed += 1;
+                }
+            }
+            continue;
+        }
+
         let Some(required_prefix) =
             item.get("type")
                 .and_then(Value::as_str)
                 .and_then(|item_type| match item_type {
                     "message" => Some("msg_"),
-                    "reasoning"
-                        if !item
-                            .get("encrypted_content")
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| !value.is_empty()) =>
-                    {
-                        Some("rs_")
-                    }
                     "function_call" => Some("fc_"),
                     "custom_tool_call" => Some("ctc_"),
                     "web_search_call" => Some("ws_"),
@@ -240,6 +251,9 @@ pub(crate) struct CodexToolContext {
     namespace_name_to_chat_name: HashMap<(String, String), String>,
     hosted_web_search: Option<HostedWebSearchConfig>,
     hosted_image_generation: Option<HostedImageGenerationConfig>,
+    /// Responses tool types that CCSM cannot project to Chat safely.
+    /// Keep these visible so callers fail loudly instead of silently dropping them.
+    unsupported_response_tools: Vec<String>,
 }
 
 impl CodexToolContext {
@@ -259,6 +273,40 @@ impl CodexToolContext {
             .is_some_and(|spec| matches!(&spec.kind, CodexToolKind::Custom))
     }
 
+    /// Whether a Chat function name is a CCSM-hosted tool projection.
+    ///
+    /// The streaming Responses converter uses this classification to keep
+    /// hosted calls inside the proxy loop instead of exposing them as ordinary
+    /// client-executed function calls.
+    pub(crate) fn is_hosted_tool_chat_name(&self, chat_name: &str) -> bool {
+        self.canonical_hosted_tool_chat_name(chat_name).is_some()
+    }
+
+    /// Normalize common model-emitted aliases to the function name CCSM sent.
+    /// Aliases are accepted only when this request actually declared the
+    /// corresponding hosted tool, so an ordinary user function is unaffected.
+    pub(crate) fn canonical_hosted_tool_chat_name(&self, chat_name: &str) -> Option<&'static str> {
+        let trimmed = chat_name.trim();
+        if self.lookup_chat_name(trimmed).is_some_and(|spec| {
+            matches!(
+                &spec.kind,
+                CodexToolKind::HostedWebSearch | CodexToolKind::HostedImageGeneration
+            )
+        }) {
+            return match trimmed {
+                "web_search" => Some("web_search"),
+                IMAGE_GENERATION_FUNCTION_NAME => Some(IMAGE_GENERATION_FUNCTION_NAME),
+                _ => None,
+            };
+        }
+        if self.hosted_image_generation.is_some()
+            && matches!(trimmed, "image_gen" | "image_generation")
+        {
+            return Some(IMAGE_GENERATION_FUNCTION_NAME);
+        }
+        None
+    }
+
     /// 返回 Codex 原始 hosted `web_search` 的安全配置子集。
     pub(crate) fn hosted_web_search_config(&self) -> Option<&HostedWebSearchConfig> {
         self.hosted_web_search.as_ref()
@@ -267,6 +315,10 @@ impl CodexToolContext {
     /// 返回 Codex 原始 hosted `image_generation` 的安全配置子集。
     pub(crate) fn hosted_image_generation_config(&self) -> Option<&HostedImageGenerationConfig> {
         self.hosted_image_generation.as_ref()
+    }
+
+    pub(crate) fn unsupported_response_tools(&self) -> &[String] {
+        &self.unsupported_response_tools
     }
 
     /// 按 MultiRouter 开关移除已禁用的 hosted tools。
@@ -472,9 +524,14 @@ impl CodexToolContext {
                 Some("web_search") => self.add_hosted_web_search_tool(tool),
                 Some("image_generation") => self.add_hosted_image_generation_tool(tool),
                 Some("namespace") => self.add_namespace_tool(tool),
-                _ => {}
+                Some(tool_type) => self.unsupported_response_tools.push(tool_type.to_string()),
+                None => self
+                    .unsupported_response_tools
+                    .push("<missing type>".to_string()),
             },
-            _ => {}
+            _ => self
+                .unsupported_response_tools
+                .push("<non-object tool>".to_string()),
         }
     }
 }
@@ -489,6 +546,7 @@ pub(crate) fn build_codex_tool_context_from_request(body: &Value) -> CodexToolCo
     }
 
     if let Some(input) = body.get("input") {
+        collect_additional_tools(input, &mut context);
         collect_tool_search_output_tools(input, &mut context);
     }
 
@@ -541,6 +599,15 @@ pub fn responses_to_chat_completions_with_reasoning_text_only_and_cache(
 ) -> Result<Value, ProxyError> {
     let mut result = json!({});
     let tool_context = build_codex_tool_context_from_request(&body);
+    if !tool_context.unsupported_response_tools().is_empty() {
+        let mut types = tool_context.unsupported_response_tools().to_vec();
+        types.sort();
+        types.dedup();
+        return Err(ProxyError::TransformError(format!(
+            "Unsupported Responses tool type(s) for Chat upstream: {}",
+            types.join(", ")
+        )));
+    }
     let text_only_model = text_only_override.unwrap_or(false)
         || body
             .get("model")
@@ -596,7 +663,7 @@ pub fn responses_to_chat_completions_with_reasoning_text_only_and_cache(
         }
     }
 
-    apply_reasoning_options(&mut result, &body, model, reasoning_config);
+    apply_reasoning_options(&mut result, &body, reasoning_config)?;
 
     let tools = tool_context.chat_tools();
     if !tools.is_empty() {
@@ -612,6 +679,7 @@ pub fn responses_to_chat_completions_with_reasoning_text_only_and_cache(
             result[*key] = value.clone();
         }
     }
+
     apply_openai_prompt_cache_options(&mut result, &body, cache_config);
 
     // Strict OpenAI-compatible upstreams (vLLM, enterprise gateways) reject
@@ -635,6 +703,65 @@ pub fn responses_to_chat_completions_with_reasoning_text_only_and_cache(
     super::transform::inject_openai_stream_include_usage(&mut result);
 
     Ok(result)
+}
+
+/// 把 forwarder 侧已决策的 hosted tool 开关同步到已转换的 Chat body。
+///
+/// `responses_to_chat_completions_with_reasoning_text_only_and_cache` 内部会基于
+/// 原始 body 重新构建一份 `CodexToolContext`，因此 forwarder 对
+/// `codex_chat_tool_context` 调用的 `apply_hosted_tool_switches` 不会作用到真正
+/// 发给上游的 Chat body。这里在转换完成后按同一份 context 的开关移除被禁用的
+/// hosted tool 定义，保证「模型可见的工具」与「hosted tool loop 是否接管」一致，
+/// 避免模型调用一个不会被本地执行的 hosted tool 而得到 `unsupported call`。
+pub(crate) fn apply_hosted_tool_switches_to_chat_body(
+    chat_body: &mut Value,
+    context: &CodexToolContext,
+) {
+    let mut removed_any = false;
+    if context.hosted_web_search_config().is_none() {
+        removed_any |= remove_chat_tool_from_body(chat_body, web_search::WEB_SEARCH_FUNCTION_NAME);
+    }
+    if context.hosted_image_generation_config().is_none() {
+        removed_any |=
+            remove_chat_tool_from_body(chat_body, image_generation::IMAGE_GENERATION_FUNCTION_NAME);
+    }
+    if removed_any {
+        drop_orphaned_hosted_tool_choice(chat_body);
+    }
+}
+
+fn remove_chat_tool_from_body(chat_body: &mut Value, name: &str) -> bool {
+    let Some(tools) = chat_body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let before = tools.len();
+    tools.retain(|tool| tool.pointer("/function/name").and_then(Value::as_str) != Some(name));
+    tools.len() != before
+}
+
+/// 若 tool_choice 指向一个已被移除的 hosted tool，则丢弃该 tool_choice，
+/// 避免上游因引用不存在的工具而报错。
+fn drop_orphaned_hosted_tool_choice(chat_body: &mut Value) {
+    let Some(tool_choice) = chat_body
+        .get("tool_choice")
+        .filter(|value| value.is_object())
+    else {
+        return;
+    };
+    let choice_type = tool_choice.get("type").and_then(Value::as_str);
+    let choice_name = tool_choice.get("name").and_then(Value::as_str).or_else(|| {
+        tool_choice
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+    });
+    let references_hosted = matches!(choice_type, Some("web_search" | "image_generation"))
+        || (choice_type == Some("function")
+            && matches!(choice_name, Some("web_search" | "generate_image")));
+    if references_hosted {
+        if let Some(obj) = chat_body.as_object_mut() {
+            obj.remove("tool_choice");
+        }
+    }
 }
 
 /// 按 provider/route 明确声明的能力透传 OpenAI prompt cache 参数。
@@ -762,16 +889,13 @@ fn apply_min_output_tokens(
 fn apply_reasoning_options(
     result: &mut Value,
     body: &Value,
-    model: &str,
     config: Option<&CodexChatReasoningConfig>,
-) {
+) -> Result<(), ProxyError> {
     let Some(config) = config else {
-        if super::transform::supports_reasoning_effort(model) {
-            if let Some(effort) = body.pointer("/reasoning/effort") {
-                result["reasoning_effort"] = effort.clone();
-            }
-        }
-        return;
+        // P2：通用 GPT reasoning fallback 已封闭。GPT 模型统一经 resolver 的
+        // official 来源（未知平台）或平台推断（聚合平台）解析；config 为 None
+        // 表示该模型推理能力未知，不得再按模型名猜测档位注入 reasoning_effort。
+        return Ok(());
     };
 
     let supports_effort = config.supports_effort.unwrap_or(false);
@@ -791,23 +915,26 @@ fn apply_reasoning_options(
     }
 
     let Some(reasoning_enabled) = reasoning_requested(body) else {
-        return;
+        return Ok(());
     };
 
     if supports_thinking {
+        // Codex 的 reasoning.effort=none 是 Responses 语义：只有上游存在显式关闭契约
+        // （disable_contract）时才翻译为上游关闭信号；否则省略厂商字段、保留服务端默认。
+        let emit_switch = reasoning_enabled || config.disable_contract;
         match thinking_param.as_str() {
-            "thinking" => {
+            "thinking" if emit_switch => {
                 result["thinking"] = json!({
                     "type": if reasoning_enabled { "enabled" } else { "disabled" }
                 });
             }
-            "enable_thinking" => {
+            "enable_thinking" if emit_switch => {
                 result["enable_thinking"] = json!(reasoning_enabled);
             }
-            "chat_template_kwargs.enable_thinking" => {
+            "chat_template_kwargs.enable_thinking" if emit_switch => {
                 set_chat_template_enable_thinking(result, reasoning_enabled);
             }
-            "reasoning_split" => {
+            "reasoning_split" if emit_switch => {
                 result["reasoning_split"] = json!(reasoning_enabled);
             }
             _ => {}
@@ -833,18 +960,18 @@ fn apply_reasoning_options(
         if effort_param == "reasoning.effort" {
             result["reasoning"] = json!({ "effort": "none" });
         }
-        return;
+        return Ok(());
     }
 
     if !supports_effort {
-        return;
+        return Ok(());
     }
 
     let Some(effort) = body.pointer("/reasoning/effort").and_then(|v| v.as_str()) else {
-        return;
+        return Ok(());
     };
-    let Some(mapped) = map_reasoning_effort(effort, config.effort_value_mode.as_deref()) else {
-        return;
+    let Some(mapped) = map_codex_reasoning_effort(effort, config)? else {
+        return Ok(());
     };
 
     match effort_param.as_str() {
@@ -861,6 +988,46 @@ fn apply_reasoning_options(
         }
         _ => {}
     }
+    Ok(())
+}
+
+pub(crate) fn map_codex_reasoning_effort<'a>(
+    effort: &'a str,
+    config: &'a CodexChatReasoningConfig,
+) -> Result<Option<&'a str>, ProxyError> {
+    if !config.supports_effort.unwrap_or(false) {
+        return Ok(None);
+    }
+    let effort_mode = config.effort_value_mode.as_deref();
+    if effort_mode.is_some_and(|mode| mode.starts_with("capability|")) {
+        return map_capability_reasoning_effort(effort, effort_mode.unwrap()).map(Some);
+    }
+    Ok(map_reasoning_effort(effort, effort_mode))
+}
+
+fn map_capability_reasoning_effort<'a>(
+    effort: &'a str,
+    mode: &'a str,
+) -> Result<&'a str, ProxyError> {
+    let mut sections = mode.splitn(3, '|');
+    let _kind = sections.next();
+    let allowed = sections.next().unwrap_or_default();
+    let mappings = sections.next().unwrap_or_default();
+    // 宽映射兜底：medium/xhigh 等映射档位直接命中，返回上游档位（如 high）。
+    // 先查映射再校验 allowed，避免 Codex 端仍发送映射档位时被 fail closed。
+    if let Some(target) = mappings
+        .split(',')
+        .filter_map(|mapping| mapping.split_once('='))
+        .find_map(|(source, target)| (source == effort).then_some(target))
+    {
+        return Ok(target);
+    }
+    if !allowed.split(',').any(|candidate| candidate == effort) {
+        return Err(ProxyError::TransformError(format!(
+            "reasoning effort `{effort}` is not supported; allowed=[{allowed}]"
+        )));
+    }
+    Ok(effort)
 }
 
 /// 写入 vLLM/HF chat template 常用的嵌套 thinking 开关，同时保留已有 kwargs。
@@ -973,16 +1140,29 @@ fn instruction_text(value: &Value) -> String {
     }
 }
 
+/// 转换 Responses input 为 Chat messages 期间累积的 pending 状态。
+///
+/// 四个字段对应原先散落的四个 `&mut` 参数，收敛后
+/// `append_responses_item_as_chat_message` 不再超过 7 个参数。
+struct PendingChatItems {
+    tool_calls: Vec<Value>,
+    media: Vec<Value>,
+    reasoning: Option<String>,
+    last_assistant_index: Option<usize>,
+}
+
 fn append_responses_input_as_chat_messages(
     input: &Value,
     messages: &mut Vec<Value>,
     tool_context: &CodexToolContext,
     text_only_model: bool,
 ) -> Result<(), ProxyError> {
-    let mut pending_tool_calls = Vec::new();
-    let mut pending_media = Vec::new();
-    let mut pending_reasoning: Option<String> = None;
-    let mut last_assistant_index: Option<usize> = None;
+    let mut pending = PendingChatItems {
+        tool_calls: Vec::new(),
+        media: Vec::new(),
+        reasoning: None,
+        last_assistant_index: None,
+    };
 
     match input {
         Value::String(text) => {
@@ -996,10 +1176,7 @@ fn append_responses_input_as_chat_messages(
                 append_responses_item_as_chat_message(
                     item,
                     messages,
-                    &mut pending_tool_calls,
-                    &mut pending_media,
-                    &mut pending_reasoning,
-                    &mut last_assistant_index,
+                    &mut pending,
                     tool_context,
                     text_only_model,
                 )?;
@@ -1009,10 +1186,7 @@ fn append_responses_input_as_chat_messages(
             append_responses_item_as_chat_message(
                 input,
                 messages,
-                &mut pending_tool_calls,
-                &mut pending_media,
-                &mut pending_reasoning,
-                &mut last_assistant_index,
+                &mut pending,
                 tool_context,
                 text_only_model,
             )?;
@@ -1023,13 +1197,13 @@ fn append_responses_input_as_chat_messages(
     // If a later assistant tool-call batch was accumulated after an earlier
     // media-bearing result, the synthetic user media belongs before that next
     // assistant turn.
-    flush_pending_chat_tool_media(messages, &mut pending_media);
+    flush_pending_chat_tool_media(messages, &mut pending.media);
     flush_pending_tool_calls(
         messages,
-        &mut pending_tool_calls,
-        &mut pending_media,
-        &mut pending_reasoning,
-        &mut last_assistant_index,
+        &mut pending.tool_calls,
+        &mut pending.media,
+        &mut pending.reasoning,
+        &mut pending.last_assistant_index,
     );
     // 整个 input 处理完毕后仍剩余的 pending reasoning 属于「真正的尾部」思考
     // （其后已没有任何可前向附挂的 message / function_call），回溯附挂到最后一条
@@ -1037,8 +1211,8 @@ fn append_responses_input_as_chat_messages(
     // reasoning 与 trailing reasoning。
     attach_pending_reasoning_to_previous_assistant(
         messages,
-        last_assistant_index,
-        &mut pending_reasoning,
+        pending.last_assistant_index,
+        &mut pending.reasoning,
     );
     backfill_tool_call_reasoning_placeholders(messages);
     Ok(())
@@ -1047,37 +1221,49 @@ fn append_responses_input_as_chat_messages(
 fn append_responses_item_as_chat_message(
     item: &Value,
     messages: &mut Vec<Value>,
-    pending_tool_calls: &mut Vec<Value>,
-    pending_media: &mut Vec<Value>,
-    pending_reasoning: &mut Option<String>,
-    last_assistant_index: &mut Option<usize>,
+    pending: &mut PendingChatItems,
     tool_context: &CodexToolContext,
     text_only_model: bool,
 ) -> Result<(), ProxyError> {
     let item_type = item.get("type").and_then(|v| v.as_str());
     match item_type {
         Some("function_call") => {
-            append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
-            pending_tool_calls.push(responses_function_call_to_chat_tool_call(
-                item,
-                tool_context,
-            ));
+            append_unique_pending_reasoning(
+                &mut pending.reasoning,
+                responses_item_reasoning_text(item),
+            );
+            pending
+                .tool_calls
+                .push(responses_function_call_to_chat_tool_call(
+                    item,
+                    tool_context,
+                ));
         }
         Some("custom_tool_call") => {
-            append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
-            pending_tool_calls.push(responses_custom_tool_call_to_chat_tool_call(item));
+            append_unique_pending_reasoning(
+                &mut pending.reasoning,
+                responses_item_reasoning_text(item),
+            );
+            pending
+                .tool_calls
+                .push(responses_custom_tool_call_to_chat_tool_call(item));
         }
         Some("tool_search_call") => {
-            append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
-            pending_tool_calls.push(responses_tool_search_call_to_chat_tool_call(item));
+            append_unique_pending_reasoning(
+                &mut pending.reasoning,
+                responses_item_reasoning_text(item),
+            );
+            pending
+                .tool_calls
+                .push(responses_tool_search_call_to_chat_tool_call(item));
         }
         Some("function_call_output") => {
             flush_pending_tool_calls(
                 messages,
-                pending_tool_calls,
-                pending_media,
-                pending_reasoning,
-                last_assistant_index,
+                &mut pending.tool_calls,
+                &mut pending.media,
+                &mut pending.reasoning,
+                &mut pending.last_assistant_index,
             );
             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
             let output = if text_only_model {
@@ -1113,7 +1299,7 @@ fn append_responses_item_as_chat_message(
                 .cloned()
                 .and_then(plan_chat_tool_output_media)
             {
-                queue_chat_tool_output_media(pending_media, call_id, media_plan.media_parts);
+                queue_chat_tool_output_media(&mut pending.media, call_id, media_plan.media_parts);
                 media_plan.tool_content
             } else {
                 // Cache-sensitive no-media fallback: keep these expressions
@@ -1133,10 +1319,10 @@ fn append_responses_item_as_chat_message(
         Some("custom_tool_call_output") | Some("tool_search_output") => {
             flush_pending_tool_calls(
                 messages,
-                pending_tool_calls,
-                pending_media,
-                pending_reasoning,
-                last_assistant_index,
+                &mut pending.tool_calls,
+                &mut pending.media,
+                &mut pending.reasoning,
+                &mut pending.last_assistant_index,
             );
             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
             let mut transformed_item = item.clone();
@@ -1164,7 +1350,7 @@ fn append_responses_item_as_chat_message(
                 .unwrap_or(0);
             let output = if replaced > 0 {
                 if !text_only_model {
-                    queue_chat_tool_output_media(pending_media, call_id, media_parts);
+                    queue_chat_tool_output_media(&mut pending.media, call_id, media_parts);
                 }
                 canonical_json_string(&transformed_item)
             } else {
@@ -1185,20 +1371,24 @@ fn append_responses_item_as_chat_message(
             // reasoning_content，思考型模型（kimi 等）多轮对话因此中途"断片"。
             // 真正的尾部剩余由 input 结束时的收尾逻辑、或回合边界消息（user 等）
             // 到达时回溯附挂，见 attach_pending_reasoning_to_previous_assistant。
-            append_pending_reasoning(pending_reasoning, responses_reasoning_item_text(item));
+            append_pending_reasoning(&mut pending.reasoning, responses_reasoning_item_text(item));
         }
+        // Responses Lite carries dynamically available tools as a structural
+        // input item. Its `role=developer` describes ownership, not a Chat
+        // message, and the item intentionally has no `content` field.
+        Some("additional_tools") => {}
         Some("input_text" | "input_image" | "input_file" | "input_audio") => {
             flush_pending_tool_calls(
                 messages,
-                pending_tool_calls,
-                pending_media,
-                pending_reasoning,
-                last_assistant_index,
+                &mut pending.tool_calls,
+                &mut pending.media,
+                &mut pending.reasoning,
+                &mut pending.last_assistant_index,
             );
             // `flush_pending_tool_calls` intentionally returns early when
             // there is no new assistant batch. A previous tool result may
             // still have media waiting, so flush it before this new message.
-            flush_pending_chat_tool_media(messages, pending_media);
+            flush_pending_chat_tool_media(messages, &mut pending.media);
             let role = item
                 .get("role")
                 .and_then(|v| v.as_str())
@@ -1214,8 +1404,8 @@ fn append_responses_item_as_chat_message(
             });
             if role == "assistant" {
                 let mut message = message;
-                attach_pending_reasoning_to_assistant(&mut message, pending_reasoning);
-                update_last_assistant_index(messages, &message, last_assistant_index);
+                attach_pending_reasoning_to_assistant(&mut message, &mut pending.reasoning);
+                update_last_assistant_index(messages, &message, &mut pending.last_assistant_index);
                 messages.push(message);
                 return Ok(());
             } else {
@@ -1225,53 +1415,53 @@ fn append_responses_item_as_chat_message(
                 // assistant 消息；无上一条 assistant 可附挂时自然丢弃（等同原行为）。
                 attach_pending_reasoning_to_previous_assistant(
                     messages,
-                    *last_assistant_index,
-                    pending_reasoning,
+                    pending.last_assistant_index,
+                    &mut pending.reasoning,
                 );
             }
-            update_last_assistant_index(messages, &message, last_assistant_index);
+            update_last_assistant_index(messages, &message, &mut pending.last_assistant_index);
             messages.push(message);
         }
         Some("message") | None => {
             if item.get("role").is_some() || item.get("content").is_some() {
                 flush_pending_tool_calls(
                     messages,
-                    pending_tool_calls,
-                    pending_media,
-                    pending_reasoning,
-                    last_assistant_index,
+                    &mut pending.tool_calls,
+                    &mut pending.media,
+                    &mut pending.reasoning,
+                    &mut pending.last_assistant_index,
                 );
-                flush_pending_chat_tool_media(messages, pending_media);
+                flush_pending_chat_tool_media(messages, &mut pending.media);
                 let message = responses_message_item_to_chat_message(
                     item,
-                    pending_reasoning,
+                    &mut pending.reasoning,
                     text_only_model,
                     messages,
-                    *last_assistant_index,
+                    pending.last_assistant_index,
                 );
-                update_last_assistant_index(messages, &message, last_assistant_index);
+                update_last_assistant_index(messages, &message, &mut pending.last_assistant_index);
                 messages.push(message);
-            } else if pending_media.is_empty() {
+            } else if pending.media.is_empty() {
                 // Preserve legacy no-media ordering: inert message-like items
                 // used to close a pending tool-call batch.
                 flush_pending_tool_calls(
                     messages,
-                    pending_tool_calls,
-                    pending_media,
-                    pending_reasoning,
-                    last_assistant_index,
+                    &mut pending.tool_calls,
+                    &mut pending.media,
+                    &mut pending.reasoning,
+                    &mut pending.last_assistant_index,
                 );
             }
         }
         Some("compaction") => {
             flush_pending_tool_calls(
                 messages,
-                pending_tool_calls,
-                pending_media,
-                pending_reasoning,
-                last_assistant_index,
+                &mut pending.tool_calls,
+                &mut pending.media,
+                &mut pending.reasoning,
+                &mut pending.last_assistant_index,
             );
-            flush_pending_chat_tool_media(messages, pending_media);
+            flush_pending_chat_tool_media(messages, &mut pending.media);
 
             let summary = item
                 .get("encrypted_content")
@@ -1290,30 +1480,30 @@ fn append_responses_item_as_chat_message(
             if item.get("role").is_some() || item.get("content").is_some() {
                 flush_pending_tool_calls(
                     messages,
-                    pending_tool_calls,
-                    pending_media,
-                    pending_reasoning,
-                    last_assistant_index,
+                    &mut pending.tool_calls,
+                    &mut pending.media,
+                    &mut pending.reasoning,
+                    &mut pending.last_assistant_index,
                 );
-                flush_pending_chat_tool_media(messages, pending_media);
+                flush_pending_chat_tool_media(messages, &mut pending.media);
                 let message = responses_message_item_to_chat_message(
                     item,
-                    pending_reasoning,
+                    &mut pending.reasoning,
                     text_only_model,
                     messages,
-                    *last_assistant_index,
+                    pending.last_assistant_index,
                 );
-                update_last_assistant_index(messages, &message, last_assistant_index);
+                update_last_assistant_index(messages, &message, &mut pending.last_assistant_index);
                 messages.push(message);
-            } else if pending_media.is_empty() {
+            } else if pending.media.is_empty() {
                 // Preserve legacy no-media ordering without letting an inert
                 // unknown item flush a media-bearing result batch.
                 flush_pending_tool_calls(
                     messages,
-                    pending_tool_calls,
-                    pending_media,
-                    pending_reasoning,
-                    last_assistant_index,
+                    &mut pending.tool_calls,
+                    &mut pending.media,
+                    &mut pending.reasoning,
+                    &mut pending.last_assistant_index,
                 );
             }
         }
@@ -1337,6 +1527,28 @@ fn flush_pending_tool_calls(
     // new assistant tool-call turn. Consecutive outputs do not enter here
     // because `pending_tool_calls` is empty after the first output.
     flush_pending_chat_tool_media(messages, pending_media);
+
+    // A Responses turn may emit a commentary `message` item followed by one
+    // or more tool-call items. Chat Completions represents that as one
+    // assistant message containing both `content` and `tool_calls`. Keeping
+    // the items as two consecutive assistant messages teaches chat models
+    // that a text-only progress update is a complete turn, so they can stop
+    // before emitting the tool call on the next sample.
+    if let Some(previous) = messages.last_mut().filter(|message| {
+        message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message.get("tool_calls").is_none()
+    }) {
+        if let Some(previous_obj) = previous.as_object_mut() {
+            previous_obj.insert(
+                "tool_calls".to_string(),
+                Value::Array(std::mem::take(pending_tool_calls)),
+            );
+            attach_unique_pending_reasoning_to_assistant(previous, pending_reasoning);
+            *last_assistant_index = Some(messages.len() - 1);
+            return;
+        }
+    }
+
     let mut message = json!({
         "role": "assistant",
         "content": null,
@@ -1356,10 +1568,13 @@ fn responses_message_item_to_chat_message(
 ) -> Value {
     let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
     let chat_role = responses_role_to_chat_role(role);
-    let content = item
+    let mut content = item
         .get("content")
         .map(|value| responses_content_to_chat_content(chat_role, value, text_only_model))
         .unwrap_or(Value::Null);
+    if chat_role != "assistant" && content.is_null() {
+        content = Value::String(String::new());
+    }
 
     let mut message = json!({
         "role": chat_role,
@@ -1469,6 +1684,30 @@ fn attach_pending_reasoning_to_assistant(
     }
 }
 
+fn attach_unique_pending_reasoning_to_assistant(
+    message: &mut Value,
+    pending_reasoning: &mut Option<String>,
+) {
+    let Some(reasoning) = pending_reasoning.take() else {
+        return;
+    };
+    let reasoning = reasoning.trim();
+    if reasoning.is_empty() {
+        return;
+    }
+
+    let Some(obj) = message.as_object_mut() else {
+        return;
+    };
+    let already_present = obj
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .is_some_and(|existing| existing.contains(reasoning));
+    if !already_present {
+        append_reasoning_content(obj, reasoning);
+    }
+}
+
 /// 在所有 input 处理完毕后，对仍缺 `reasoning_content` 的 assistant tool-call 消息补占位。
 /// 必须作为管线末端的最终兜底执行：真实 reasoning 可能以尾随 `reasoning` item 的形式经
 /// `attach_pending_reasoning_to_previous_assistant` 回填，过早注入占位会被
@@ -1564,7 +1803,24 @@ fn codex_chat_model_is_text_only(model: &str) -> bool {
 }
 
 fn responses_reasoning_item_text(item: &Value) -> Option<String> {
-    extract_reasoning_summary_text(item)
+    responses_reasoning_raw_content_text(item).or_else(|| extract_reasoning_summary_text(item))
+}
+
+fn responses_reasoning_raw_content_text(item: &Value) -> Option<String> {
+    let parts = item.get("content")?.as_array()?;
+    let text = parts
+        .iter()
+        .filter(|part| {
+            matches!(
+                part.get("type").and_then(|value| value.as_str()),
+                Some("reasoning_text" | "text")
+            )
+        })
+        .filter_map(|part| part.get("text").and_then(|value| value.as_str()))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn responses_content_to_chat_content(_role: &str, content: &Value, text_only_model: bool) -> Value {
@@ -1613,11 +1869,20 @@ fn responses_content_to_chat_content(_role: &str, content: &Value, text_only_mod
                     continue;
                 }
                 if let Some(image_url) = part.get("image_url") {
-                    let image_url = if image_url.is_object() {
-                        image_url.clone()
+                    let mut image_url = if let Some(object) = image_url.as_object() {
+                        object.clone()
                     } else {
-                        json!({ "url": image_url.as_str().unwrap_or_default() })
+                        let mut object = serde_json::Map::new();
+                        object.insert(
+                            "url".to_string(),
+                            json!(image_url.as_str().unwrap_or_default()),
+                        );
+                        if let Some(detail) = part.get("detail") {
+                            object.insert("detail".to_string(), detail.clone());
+                        }
+                        object
                     };
+                    normalize_chat_image_detail(&mut image_url);
                     chat_parts.push(json!({
                         "type": "image_url",
                         "image_url": image_url
@@ -1685,6 +1950,29 @@ fn responses_content_to_chat_content(_role: &str, content: &Value, text_only_mod
 
 fn responses_input_file_to_chat_file(part: &Value) -> Option<Value> {
     chat_file_from_input_file(part)
+}
+
+fn collect_additional_tools(value: &Value, context: &mut CodexToolContext) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_additional_tools(item, context);
+            }
+        }
+        Value::Object(obj) => {
+            if obj.get("type").and_then(Value::as_str) == Some("additional_tools") {
+                if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
+                    for tool in tools {
+                        context.add_response_tool(tool);
+                    }
+                }
+            }
+            for child in obj.values() {
+                collect_additional_tools(child, context);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_tool_search_output_tools(value: &Value, context: &mut CodexToolContext) {
@@ -1967,14 +2255,25 @@ pub(crate) fn chat_completion_to_response_with_context(
     {
         output.push(reasoning_item);
     }
-    if let Some(message_item) = chat_message_to_response_output_item(message, &response_id) {
+    let message_item = chat_message_to_response_output_item(message, &response_id);
+    let has_final_message = message_item.is_some();
+    if let Some(message_item) = message_item {
         output.push(message_item);
     }
-    output.extend(chat_tool_calls_to_response_output_items(
-        message,
-        reasoning.as_deref(),
-        tool_context,
-    ));
+    let tool_calls =
+        chat_tool_calls_to_response_output_items(message, reasoning.as_deref(), tool_context);
+    let terminal = classify_chat_terminal(
+        finish_reason,
+        ChatTerminalEvidence {
+            has_final_message,
+            valid_tool_calls: tool_calls.items.len(),
+            dropped_tool_calls: tool_calls.dropped,
+        },
+    );
+    if let TerminalDisposition::Failed { code, message } = &terminal {
+        return Err(ProxyError::TransformError(format!("[{code}] {message}")));
+    }
+    output.extend(tool_calls.items);
     if output
         .iter()
         .all(|item| item.get("type").and_then(|v| v.as_str()) == Some("reasoning"))
@@ -1987,14 +2286,14 @@ pub(crate) fn chat_completion_to_response_with_context(
         "id": response_id,
         "object": "response",
         "created_at": created_at,
-        "status": response_status_from_finish_reason(finish_reason),
+        "status": terminal.status(),
         "model": model,
         "output": output,
         "usage": chat_usage_to_responses_usage(body.get("usage"))
     });
 
-    if finish_reason == Some("length") {
-        response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+    if let TerminalDisposition::Incomplete { reason } = terminal {
+        response["incomplete_details"] = json!({ "reason": reason });
     }
 
     Ok(response)
@@ -2115,12 +2414,18 @@ fn empty_assistant_message_output_item(response_id: &str) -> Value {
     })
 }
 
+struct ChatToolCallItems {
+    items: Vec<Value>,
+    dropped: usize,
+}
+
 fn chat_tool_calls_to_response_output_items(
     message: &Value,
     reasoning: Option<&str>,
     tool_context: &CodexToolContext,
-) -> Vec<Value> {
+) -> ChatToolCallItems {
     let mut output = Vec::new();
+    let mut dropped = 0usize;
 
     if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
         for (index, tool_call) in tool_calls.iter().enumerate() {
@@ -2128,8 +2433,24 @@ fn chat_tool_calls_to_response_output_items(
             // may generate tool calls without providing a valid name)
             let function = tool_call.get("function").unwrap_or(&Value::Null);
             let name = function.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if name.is_empty() {
-                log::warn!("[Codex] Skipping tool call with missing name");
+            // 纯空白名同样对应不到任何已发布工具，与空名同等对待。
+            if name.trim().is_empty() {
+                dropped += 1;
+                // 只记结构信息，不记 arguments 内容（可能包含用户代码）。
+                let call_id_empty = tool_call
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(str::is_empty);
+                let args_bytes = function
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .map(str::len)
+                    .unwrap_or(0);
+                log::warn!(
+                    "[Codex] dropped tool call: index={index} call_id_empty={call_id_empty} \
+                     args_bytes={args_bytes} tools_total={}",
+                    tool_calls.len()
+                );
                 continue;
             }
             output.push(chat_tool_call_to_response_item(
@@ -2139,15 +2460,20 @@ fn chat_tool_calls_to_response_output_items(
                 tool_context,
             ));
         }
-    } else if let Some(function_call) = message.get("function_call") {
-        if let Some(item) =
-            chat_legacy_function_call_to_response_item(function_call, reasoning, tool_context)
-        {
-            output.push(item);
+    } else if let Some(function_call) = message
+        .get("function_call")
+        .filter(|value| value.is_object())
+    {
+        match chat_legacy_function_call_to_response_item(function_call, reasoning, tool_context) {
+            Some(item) => output.push(item),
+            None => dropped += 1,
         }
     }
 
-    output
+    ChatToolCallItems {
+        items: output,
+        dropped,
+    }
 }
 
 fn chat_tool_call_to_response_item(
@@ -2194,9 +2520,18 @@ fn chat_legacy_function_call_to_response_item(
         .unwrap_or("");
 
     // Skip legacy function calls with missing names (defensive: some models
-    // may generate function_call without providing a valid name)
-    if name.is_empty() {
-        log::warn!("[Codex] Skipping legacy function_call with missing name");
+    // may generate function_call without providing a valid name)。
+    // 纯空白名同样对应不到任何已发布工具，与空名同等对待。
+    if name.trim().is_empty() {
+        // 只记结构信息，不记 arguments 内容（可能包含用户代码）。
+        let args_bytes = function_call
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .map(str::len)
+            .unwrap_or(0);
+        log::warn!(
+            "[Codex] dropped legacy function_call: call_id={call_id} args_bytes={args_bytes}"
+        );
         return None;
     }
 
@@ -2411,13 +2746,6 @@ pub(crate) fn response_id_from_chat_id(id: Option<&str>) -> String {
     }
 }
 
-pub(crate) fn response_status_from_finish_reason(finish_reason: Option<&str>) -> &'static str {
-    match finish_reason {
-        Some("length") => "incomplete",
-        _ => "completed",
-    }
-}
-
 /// 把 Chat Completions 上游的错误体规整成 OpenAI Responses API 风格的错误对象。
 ///
 /// 兼容三类输入：
@@ -2495,6 +2823,25 @@ pub fn chat_error_to_response_error(body: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_effort_mapping_narrow_display_wide_remap() {
+        let mode = "capability|low,high,max|low=low,medium=high,high=high,xhigh=high,max=max";
+        // 映射档位兜底：medium/xhigh 命中 effort_map 映射，转发到上游 high
+        assert_eq!(
+            map_capability_reasoning_effort("medium", mode).unwrap(),
+            "high"
+        );
+        assert_eq!(
+            map_capability_reasoning_effort("xhigh", mode).unwrap(),
+            "high"
+        );
+        // 真实档位 identity 映射
+        assert_eq!(map_capability_reasoning_effort("low", mode).unwrap(), "low");
+        assert_eq!(map_capability_reasoning_effort("max", mode).unwrap(), "max");
+        // 未知档位：无映射且不在 allowed，仍 fail closed
+        assert!(map_capability_reasoning_effort("foo", mode).is_err());
+    }
 
     fn large_test_image_data_url() -> String {
         let bytes = b"CC_SWITCH_TOOL_MEDIA_SENTINEL".repeat(400);
@@ -2788,7 +3135,10 @@ mod tests {
         assert_eq!(result["tool_choice"]["function"]["name"], "get_weather");
         assert_eq!(result["max_completion_tokens"], 100);
         assert!(result.get("max_tokens").is_none());
-        assert_eq!(result["reasoning_effort"], "high");
+        // P2：通用 GPT reasoning fallback 已封闭。无 reasoning config 的简单转换
+        // 不再按模型名猜测档位注入 reasoning_effort；GPT 模型统一经 resolver
+        // 的 official 来源解析（请求路径始终携带 config，不会走到此分支）。
+        assert!(result.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -3315,6 +3665,94 @@ mod tests {
         assert!(context.hosted_image_generation_config().is_none());
     }
 
+    /// 复现 streaming auto 下 hosted tool 泄漏：转换函数内部重建 context，
+    /// forwarder 的 apply_hosted_tool_switches 不会作用到 Chat body。修复后
+    /// apply_hosted_tool_switches_to_chat_body 必须把被禁用的 hosted tool 从
+    /// 真正发给上游的 Chat body 中移除，同时保留普通 client tool。
+    #[test]
+    fn hosted_tool_switches_apply_to_converted_chat_body() {
+        let request = json!({
+            "model": "qwen3.8",
+            "tools": [
+                { "type": "web_search" },
+                { "type": "image_generation" },
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Look up a value.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "id": { "type": "string" } },
+                        "required": ["id"]
+                    }
+                }
+            ],
+            "input": "Use tools.",
+            "tool_choice": "auto"
+        });
+
+        // 模拟 forwarder：先转换，再按 loop 关闭的开关同步 Chat body。
+        let mut chat_body = responses_to_chat_completions_with_reasoning_text_only_and_cache(
+            request.clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 转换后（未同步开关）Chat body 仍会暴露 hosted tool —— 这是 bug 现象。
+        let names_before: Vec<&str> = chat_body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+            .collect();
+        assert!(names_before.contains(&"web_search"));
+        assert!(names_before.contains(&"generate_image"));
+
+        let mut context = build_codex_tool_context_from_request(&request);
+        context.apply_hosted_tool_switches(false, false);
+        apply_hosted_tool_switches_to_chat_body(&mut chat_body, &context);
+
+        let names_after: Vec<&str> = chat_body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+            .collect();
+        assert!(!names_after.contains(&"web_search"));
+        assert!(!names_after.contains(&"generate_image"));
+        assert!(names_after.contains(&"lookup"));
+    }
+
+    /// 当 tool_choice 指向被移除的 hosted tool 时，应丢弃孤儿 tool_choice。
+    #[test]
+    fn hosted_tool_switches_drop_orphaned_tool_choice() {
+        let request = json!({
+            "model": "qwen3.8",
+            "tools": [{ "type": "web_search" }],
+            "input": "Search.",
+            "tool_choice": { "type": "web_search" }
+        });
+
+        let mut chat_body = responses_to_chat_completions_with_reasoning_text_only_and_cache(
+            request.clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut context = build_codex_tool_context_from_request(&request);
+        context.apply_hosted_tool_switches(false, false);
+        apply_hosted_tool_switches_to_chat_body(&mut chat_body, &context);
+
+        assert!(
+            chat_body.get("tools").is_none() || chat_body["tools"].as_array().unwrap().is_empty()
+        );
+        assert!(chat_body.get("tool_choice").is_none());
+    }
+
     #[test]
     fn responses_request_to_chat_leaves_non_hosted_function_tool_unchanged() {
         let input = json!({
@@ -3343,6 +3781,25 @@ mod tests {
             "Look up a value."
         );
         assert_eq!(result["tool_choice"]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn unsupported_responses_tool_type_fails_loudly_instead_of_being_dropped() {
+        let error = responses_to_chat_completions_with_reasoning_text_only_and_cache(
+            json!({
+                "model": "third-party",
+                "input": "use the hosted file index",
+                "tools": [{ "type": "file_search" }]
+            }),
+            None,
+            None,
+            None,
+        )
+        .expect_err("unsupported hosted tools must not disappear silently");
+
+        assert!(
+            matches!(error, ProxyError::TransformError(message) if message.contains("file_search"))
+        );
     }
 
     #[test]
@@ -3422,12 +3879,58 @@ mod tests {
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
 
         assert_eq!(result["thinking"]["type"], "enabled");
         assert_eq!(result["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn responses_request_to_chat_uses_declared_capability_effort_map() {
+        let input = json!({
+            "model": "glm-5.2",
+            "input": "hello",
+            "reasoning": {"effort": "medium"}
+        });
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("capability|none,minimal,low,medium,high,xhigh,max|none=none,minimal=none,low=high,medium=high,high=high,xhigh=max,max=max".to_string()),
+            min_output_tokens: None,
+            default_output_tokens: None,
+            output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
+        };
+        let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+        assert_eq!(result["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn responses_request_to_chat_rejects_effort_hidden_by_capability() {
+        let input = json!({
+            "model": "step-3.5-flash-2603",
+            "input": "hello",
+            "reasoning": {"effort": "medium"}
+        });
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("none".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("capability|low,high|low=low,high=high".to_string()),
+            min_output_tokens: None,
+            default_output_tokens: None,
+            output_format: Some("reasoning".to_string()),
+            disable_contract: false,
+        };
+        let error = responses_to_chat_completions_with_reasoning(input, Some(&config))
+            .expect_err("medium must be rejected");
+        assert!(error.to_string().contains("allowed=[low,high]"));
     }
 
     #[test]
@@ -3443,6 +3946,7 @@ mod tests {
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("auto".to_string()),
+            disable_contract: false,
         };
 
         // max 不在 OpenRouter 枚举内（见 openclaw#77350），必须钳成 xhigh，
@@ -3486,6 +3990,7 @@ mod tests {
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("auto".to_string()),
+            disable_contract: false,
         };
 
         let input = json!({
@@ -3515,6 +4020,7 @@ mod tests {
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: true,
         };
 
         let input = json!({
@@ -3528,6 +4034,67 @@ mod tests {
         assert_eq!(result["thinking"]["type"], "disabled");
         assert!(result.get("reasoning_effort").is_none());
         assert!(result.get("reasoning").is_none());
+    }
+
+    // ===== P0 RED：无关闭契约时 none 不得翻译成厂商关闭信号 =====
+
+    #[test]
+    fn none_without_disable_contract_omits_vendor_disable_signal() {
+        // 推断配置（无显式关闭契约）：Codex 的 reasoning.effort=none 是 Responses
+        // 语义，不得翻译成上游 enable_thinking=false；省略厂商字段、保留服务端默认。
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(false),
+            thinking_param: Some("enable_thinking".to_string()),
+            effort_param: Some("none".to_string()),
+            effort_value_mode: None,
+            min_output_tokens: None,
+            default_output_tokens: None,
+            output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
+        };
+
+        let input = json!({
+            "model": "qwen3-max",
+            "input": "hello",
+            "reasoning": {"effort": "none"}
+        });
+        let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+
+        assert!(
+            result.get("enable_thinking").is_none(),
+            "inferred config must not translate none into enable_thinking=false, got {result}"
+        );
+        assert!(result.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn none_with_explicit_disable_contract_emits_disable_signal() {
+        // 能力派生配置：模型显式声明 disableAllowed=true（等价 thinking 关闭契约），
+        // none 翻译为上游关闭信号。
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some(
+                "capability|low,high,max|low=low,high=high,max=max".to_string(),
+            ),
+            min_output_tokens: None,
+            default_output_tokens: None,
+            output_format: Some("reasoning_content".to_string()),
+            disable_contract: true,
+        };
+
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": "hello",
+            "reasoning": {"effort": "none"}
+        });
+        let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+
+        assert_eq!(result["thinking"]["type"], "disabled");
+        assert!(result.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -3546,6 +4113,7 @@ mod tests {
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3570,6 +4138,7 @@ mod tests {
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3595,6 +4164,7 @@ mod tests {
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3621,6 +4191,7 @@ mod tests {
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: true,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3646,6 +4217,7 @@ mod tests {
             min_output_tokens: None,
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3672,6 +4244,7 @@ mod tests {
             min_output_tokens: Some(1024),
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3710,6 +4283,7 @@ mod tests {
             min_output_tokens: None,
             default_output_tokens: Some(4096),
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3734,6 +4308,7 @@ mod tests {
             min_output_tokens: Some(2048),
             default_output_tokens: Some(32_768),
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3759,6 +4334,7 @@ mod tests {
             min_output_tokens: Some(2048),
             default_output_tokens: None,
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3786,6 +4362,7 @@ mod tests {
             min_output_tokens: Some(2048),
             default_output_tokens: Some(32_768),
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3812,6 +4389,7 @@ mod tests {
             min_output_tokens: Some(2048),
             default_output_tokens: Some(32_768),
             output_format: Some("reasoning_content".to_string()),
+            disable_contract: false,
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
@@ -3920,6 +4498,148 @@ mod tests {
         assert!(head_content.contains("You are Codex."));
         assert!(head_content.contains("Permissions block"));
         assert!(head_content.contains("Collaboration Mode: Default"));
+    }
+
+    #[test]
+    fn responses_lite_additional_tools_preserves_tools_without_creating_a_message() {
+        let input = json!({
+            "model": "qwen3.6",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "function",
+                        "name": "read_workspace_file",
+                        "description": "Read a file from the active workspace.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"]
+                        }
+                    }]
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "You are Codex."}]
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions_with_reasoning_text_only_and_cache(
+            input, None, None, None,
+        )
+        .unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        let tools = result["tools"].as_array().expect("additional tools");
+
+        assert_eq!(
+            messages,
+            &vec![json!({
+                "role": "system",
+                "content": "You are Codex."
+            })]
+        );
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "read_workspace_file");
+    }
+
+    #[test]
+    fn responses_lite_additional_tools_reuses_custom_namespace_and_deduplication_rules() {
+        let input = json!({
+            "model": "qwen3.6",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "input": [{
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Apply a free-form patch."
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "mcp__mail",
+                        "tools": [{
+                            "type": "function",
+                            "name": "search",
+                            "parameters": {"type": "object", "properties": {}}
+                        }]
+                    }
+                ]
+            }]
+        });
+
+        let result = responses_to_chat_completions_with_reasoning_text_only_and_cache(
+            input, None, None, None,
+        )
+        .unwrap();
+        let names = result["tools"]
+            .as_array()
+            .expect("converted tools")
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["lookup", "apply_patch", "mcp__mail__search"]);
+        assert_eq!(
+            result["tools"][1]["function"]["parameters"]["required"][0],
+            "input"
+        );
+    }
+
+    #[test]
+    fn responses_non_assistant_null_content_becomes_a_string_but_assistant_tool_call_stays_null() {
+        let input = json!({
+            "model": "qwen3.6",
+            "input": [
+                {"type": "message", "role": "system"},
+                {"type": "message", "role": "developer", "content": null},
+                {"type": "message", "role": "user"},
+                {"type": "message", "role": "user", "content": null},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions_with_reasoning_text_only_and_cache(
+            input, None, None, None,
+        )
+        .unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert!(messages
+            .iter()
+            .all(|message| { message["role"] == "assistant" || message["content"].is_string() }));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .map(|message| message["content"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some(""), Some("")]
+        );
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("synthetic assistant tool-call message");
+        assert!(assistant["content"].is_null());
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
     }
 
     #[test]
@@ -4290,6 +5010,57 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_to_chat_normalizes_original_detail_from_view_image_output() {
+        let input = json!({
+            "model": "qwen3.8",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_image",
+                    "name": "view_image",
+                    "arguments": "{\"path\":\"slide.png\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_image",
+                    "output": [{
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AAAA",
+                        "detail": "original"
+                    }]
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[2]["content"][1]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn responses_request_to_chat_normalizes_original_detail_inside_image_url_object() {
+        let input = json!({
+            "model": "qwen3.8",
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": {
+                        "url": "data:image/png;base64,AAAA",
+                        "detail": "original"
+                    }
+                }]
+            }]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["content"][0]["image_url"]["detail"], "high");
+    }
+
+    #[test]
     fn responses_request_to_chat_converts_all_structured_custom_tool_modalities() {
         let input = json!({
             "model": "vision-model",
@@ -4391,6 +5162,41 @@ mod tests {
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(messages[0]["reasoning_content"], "Need to read a file.");
+        assert_eq!(messages[1]["role"], "tool");
+    }
+
+    #[test]
+    fn responses_request_to_chat_replays_raw_reasoning_content_with_tool_call() {
+        let input = json!({
+            "model": "qwen3.8",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "Need to inspect the workspace."}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Readme content"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            messages[0]["reasoning_content"],
+            "Need to inspect the workspace."
+        );
         assert_eq!(messages[1]["role"], "tool");
     }
 
@@ -4500,6 +5306,54 @@ mod tests {
         assert_eq!(messages[1]["reasoning_content"], "second thought");
         assert_eq!(messages[2]["role"], "user");
         assert!(messages[2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_coalesces_commentary_and_following_tool_call() {
+        // One Responses model turn can contain a commentary message and a
+        // function call as separate output items. Chat Completions must see
+        // them as one assistant message; otherwise a chat model can imitate
+        // the commentary-only message and finish before producing the call.
+        let input = json!({
+            "model": "qwen3.8",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "need to update the file"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "Part 1 written. Appending sections 4-5."
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "apply_patch",
+                    "arguments": "{\"patch\":\"next section\"}",
+                    "reasoning_content": "need to update the file"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Success"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(
+            messages[0]["content"],
+            "Part 1 written. Appending sections 4-5."
+        );
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[0]["reasoning_content"], "need to update the file");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
     }
 
     #[test]
@@ -5378,7 +6232,29 @@ mod tests {
     }
 
     #[test]
-    fn openai_request_normalizes_replayed_plain_reasoning_and_tool_call_ids() {
+    fn openai_request_inlines_synthetic_plain_reasoning_without_id() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "id": "rs_resp_chatcmpl-b4d3bcf7f34003ac",
+                "type": "reasoning",
+                "summary": [{
+                    "type": "summary_text",
+                    "text": "plain Qwen reasoning survives the provider switch"
+                }]
+            }]
+        });
+
+        assert_eq!(normalize_replayed_item_ids_for_openai(&mut body), 1);
+        assert!(body["input"][0].get("id").is_none());
+        assert_eq!(
+            body["input"][0]["summary"][0]["text"],
+            "plain Qwen reasoning survives the provider switch"
+        );
+    }
+
+    #[test]
+    fn openai_request_inlines_plain_reasoning_and_normalizes_tool_call_ids() {
         let mut body = json!({
             "model": "gpt-5.6-sol",
             "input": [
@@ -5407,9 +6283,7 @@ mod tests {
         });
 
         assert_eq!(normalize_replayed_item_ids_for_openai(&mut body), 3);
-        assert!(body["input"][0]["id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("rs_")));
+        assert!(body["input"][0].get("id").is_none());
         assert!(body["input"][1]["id"]
             .as_str()
             .is_some_and(|id| id.starts_with("fc_")));
@@ -5667,6 +6541,318 @@ mod tests {
             result["output"][0]["input"],
             "*** Begin Patch\n*** End Patch"
         );
+    }
+
+    /// #4341（非流式路径）：丢弃后一个工具调用都不剩时，必须如实报错，
+    /// 而不是返回一个 Codex 会当成正常完成的空壳回合。
+    #[test]
+    fn chat_response_with_only_unnamed_tool_call_is_an_error() {
+        let chat = json!({
+            "id": "chatcmpl_drop",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "kimi-k3",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "让我继续处理这个文件",
+                    "tool_calls": [{
+                        "id": "call_bad",
+                        "type": "function",
+                        "function": {"arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let err = chat_completion_to_response_with_context(chat, &CodexToolContext::default())
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::TransformError(_)));
+        assert!(err.to_string().contains("without a function name"));
+    }
+
+    /// 只要还剩下一个合法工具调用，Codex 本来就会继续，行为保持不变。
+    #[test]
+    fn chat_response_keeps_valid_tool_call_beside_unnamed_one() {
+        let chat = json!({
+            "id": "chatcmpl_mixed",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "kimi-k3",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call_bad", "type": "function", "function": {"arguments": "{}"}},
+                        {
+                            "id": "call_good",
+                            "type": "function",
+                            "function": {"name": "exec_command", "arguments": "{\"cmd\":\"ls\"}"}
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let result =
+            chat_completion_to_response_with_context(chat, &CodexToolContext::default()).unwrap();
+        let output = result["output"].as_array().unwrap();
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["name"], "exec_command");
+        assert_eq!(output[0]["call_id"], "call_good");
+        assert_eq!(result["status"], "completed");
+    }
+
+    /// legacy `function_call` 形态同样受判据保护。
+    #[test]
+    fn chat_response_with_unnamed_legacy_function_call_is_an_error() {
+        let chat = json!({
+            "id": "chatcmpl_legacy",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "kimi-k3",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "function_call": {"id": "call_legacy", "arguments": "{}"}
+                },
+                "finish_reason": "function_call"
+            }]
+        });
+
+        let err = chat_completion_to_response_with_context(chat, &CodexToolContext::default())
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::TransformError(_)));
+    }
+
+    #[test]
+    fn chat_response_with_null_legacy_function_call_is_ignored() {
+        // OpenAI-compatible servers, including vLLM, may serialize the
+        // optional legacy field as `function_call: null` on every response.
+        // That is absence of a call, not an unnamed call.
+        let chat = json!({
+            "id": "chatcmpl_null_legacy",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "qwen3.8",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "OK",
+                    "tool_calls": null,
+                    "function_call": null
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let result =
+            chat_completion_to_response_with_context(chat, &CodexToolContext::default()).unwrap();
+
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["output"][0]["type"], "message");
+        assert_eq!(result["output"][0]["content"][0]["text"], "OK");
+    }
+
+    /// `finish_reason=length` 是截断，不是"上游发了畸形数据"——归因必须保持
+    /// incomplete，不能报成 tool_call_dropped。
+    #[test]
+    fn chat_response_truncated_stays_incomplete_instead_of_error() {
+        let chat = json!({
+            "id": "chatcmpl_trunc",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "kimi-k3",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "我来看看",
+                    "tool_calls": [{
+                        "id": "call_cut",
+                        "type": "function",
+                        "function": {"arguments": "{\"pa"}
+                    }]
+                },
+                "finish_reason": "length"
+            }]
+        });
+
+        let result =
+            chat_completion_to_response_with_context(chat, &CodexToolContext::default()).unwrap();
+        assert_eq!(result["status"], "incomplete");
+        assert_eq!(result["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    /// 纯空白函数名必须与空名同等对待，否则会伪装成"本回合还有工具调用"。
+    #[test]
+    fn chat_response_whitespace_only_tool_name_is_an_error() {
+        let chat = json!({
+            "id": "chatcmpl_ws",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "kimi-k3",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_ws",
+                        "type": "function",
+                        "function": {"name": "   ", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let err = chat_completion_to_response_with_context(chat, &CodexToolContext::default())
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::TransformError(_)));
+    }
+
+    /// 纯文本回合（从未出现工具调用）不受判据影响。
+    #[test]
+    fn chat_response_text_only_still_completes() {
+        let chat = json!({
+            "id": "chatcmpl_text",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "kimi-k3",
+            "choices": [{
+                "message": {"role": "assistant", "content": "完成了"},
+                "finish_reason": "stop"
+            }]
+        });
+
+        let result =
+            chat_completion_to_response_with_context(chat, &CodexToolContext::default()).unwrap();
+        assert_eq!(result["status"], "completed");
+    }
+
+    #[test]
+    fn chat_response_terminal_missing_finish_reason_is_an_error() {
+        let chat = json!({
+            "id": "chatcmpl_missing_finish",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "message": {"role": "assistant", "content": "partial answer"},
+                "finish_reason": null
+            }]
+        });
+
+        let err = chat_completion_to_response_with_context(chat, &CodexToolContext::default())
+            .unwrap_err();
+
+        assert!(matches!(err, ProxyError::TransformError(_)));
+        assert!(err.to_string().contains("finish_reason"));
+    }
+
+    #[test]
+    fn chat_response_terminal_unknown_finish_reason_is_an_error() {
+        let chat = json!({
+            "id": "chatcmpl_unknown_finish",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "message": {"role": "assistant", "content": "answer"},
+                "finish_reason": "vendor_done"
+            }]
+        });
+
+        let err = chat_completion_to_response_with_context(chat, &CodexToolContext::default())
+            .unwrap_err();
+
+        assert!(matches!(err, ProxyError::TransformError(_)));
+        assert!(err.to_string().contains("vendor_done"));
+    }
+
+    #[test]
+    fn chat_response_terminal_content_filter_is_incomplete() {
+        let chat = json!({
+            "id": "chatcmpl_filtered",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "message": {"role": "assistant", "content": "partial"},
+                "finish_reason": "content_filter"
+            }]
+        });
+
+        let result =
+            chat_completion_to_response_with_context(chat, &CodexToolContext::default()).unwrap();
+
+        assert_eq!(result["status"], "incomplete");
+        assert_eq!(result["incomplete_details"]["reason"], "content_filter");
+    }
+
+    #[test]
+    fn chat_response_terminal_empty_tool_calls_is_an_error() {
+        let chat = json!({
+            "id": "chatcmpl_empty_tools",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": []},
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let err = chat_completion_to_response_with_context(chat, &CodexToolContext::default())
+            .unwrap_err();
+
+        assert!(matches!(err, ProxyError::TransformError(_)));
+        assert!(err.to_string().contains("tool_calls"));
+    }
+
+    #[test]
+    fn chat_response_terminal_reasoning_only_stop_is_an_error() {
+        let chat = json!({
+            "id": "chatcmpl_reasoning_only",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "I still need to call a tool."
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let err = chat_completion_to_response_with_context(chat, &CodexToolContext::default())
+            .unwrap_err();
+
+        assert!(matches!(err, ProxyError::TransformError(_)));
+        assert!(err.to_string().contains("final output"));
+    }
+
+    #[test]
+    fn chat_response_terminal_empty_stop_is_an_error() {
+        let chat = json!({
+            "id": "chatcmpl_empty_stop",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "message": {"role": "assistant", "content": null},
+                "finish_reason": "stop"
+            }]
+        });
+
+        let err = chat_completion_to_response_with_context(chat, &CodexToolContext::default())
+            .unwrap_err();
+
+        assert!(matches!(err, ProxyError::TransformError(_)));
+        assert!(err.to_string().contains("final output"));
     }
 
     #[test]

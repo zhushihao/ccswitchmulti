@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -11,7 +17,27 @@ import {
   probeCodexChatForConfig,
   probeCodexResponsesForConfig,
 } from "@/lib/api/model-fetch";
-import type { CodexCatalogModel, CodexRoutingConfig } from "@/types";
+import type {
+  CodexApiFormat,
+  CodexCatalogModel,
+  CodexRoutingConfig,
+} from "@/types";
+import type {
+  CodexModelReasoningResolution,
+  CodexReasoningDiscoveryOutcome,
+} from "@/types/codexSubagentV2";
+
+const reasoningApiMocks = vi.hoisted(() => ({
+  resolve: vi.fn(),
+  trigger: vi.fn(),
+}));
+
+vi.mock("@/lib/api/codexSubagentV2", () => ({
+  codexSubagentV2Api: {
+    resolveModelReasoningCapability: reasoningApiMocks.resolve,
+    triggerModelReasoningDetection: reasoningApiMocks.trigger,
+  },
+}));
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -34,11 +60,63 @@ vi.mock("@/components/ui/form", () => ({
 }));
 
 beforeEach(() => {
+  vi.useRealTimers();
   vi.mocked(fetchModelsForConfig).mockReset();
   vi.mocked(probeCodexChatForConfig).mockReset();
   vi.mocked(probeCodexResponsesForConfig).mockReset();
-  Element.prototype.scrollIntoView = vi.fn();
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+    configurable: true,
+    writable: true,
+    value: vi.fn(),
+  });
+  reasoningApiMocks.resolve.mockReset();
+  reasoningApiMocks.trigger.mockReset();
+  reasoningApiMocks.resolve.mockImplementation(
+    async (_settings, _provider, model) =>
+      createUnknownReasoningResolution(model),
+  );
 });
+
+function createUnknownReasoningResolution(
+  model: string,
+): CodexModelReasoningResolution {
+  return {
+    model,
+    capability: null,
+    source: "unknown",
+    fingerprint: "",
+    resolved: {
+      supportKind: "unknown",
+      confidence: "unverified",
+      codexSelectableEfforts: [],
+      providerAcceptedEfforts: [],
+      providerDefaultEffort: null,
+      disableAllowed: false,
+      effortMap: {},
+    },
+    hasDetectionCandidate: false,
+    detection: null,
+  };
+}
+
+function createDetectedReasoningOutcome(
+  model: string,
+): Extract<CodexReasoningDiscoveryOutcome, { found: unknown }> {
+  return {
+    found: {
+      providerKey: "codex-thirdparty",
+      model,
+      fetchedAt: 1_700_000_000_000,
+      source: "openrouter_api",
+      reasoning: {
+        supportedEfforts: ["low", "high"],
+        defaultEffort: "high",
+        mandatory: false,
+        defaultEnabled: true,
+      },
+    },
+  };
+}
 
 // 构造协议探测的成功返回，供并发池测试精确控制每个模型的完成顺序。
 function createProbeResult(
@@ -58,6 +136,24 @@ function createProbeResult(
     model,
     detail,
   };
+}
+
+function createProbeFailure(model: string, detail = "HTTP 401") {
+  return {
+    ok: false,
+    status: 401,
+    url: "https://api.thirdparty.example/v1/probe",
+    model,
+    detail,
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
 }
 
 function renderRoutingHarness(
@@ -132,6 +228,9 @@ function renderCatalogHarness(
     planAccessKeyId?: string;
     planSecretAccessKey?: string;
     takeoverEnabled?: boolean;
+    allowModelMenuProjectionToggle?: boolean;
+    openAdvancedOptions?: boolean;
+    presetCatalogModels?: CodexCatalogModel[];
     onProviderSplitSuggestionChange?: ReturnType<typeof vi.fn>;
   } = {},
 ) {
@@ -172,9 +271,13 @@ function renderCatalogHarness(
         onAutoSelectChange={vi.fn()}
         takeoverEnabled={options.takeoverEnabled ?? true}
         onTakeoverEnabledChange={vi.fn()}
+        allowModelMenuProjectionToggle={
+          options.allowModelMenuProjectionToggle ?? true
+        }
         apiFormat="openai_chat"
         onApiFormatChange={onApiFormatChange}
         catalogModels={catalog}
+        presetCatalogModels={options.presetCatalogModels}
         onCatalogModelsChange={handleCatalogChange}
         spawnAgentModels={[]}
         onSpawnAgentModelsChange={vi.fn()}
@@ -193,11 +296,117 @@ function renderCatalogHarness(
     );
   }
 
+  const renderResult = render(<Harness />);
+  if (options.openAdvancedOptions ?? true) {
+    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+  }
+
   return {
-    ...render(<Harness />),
+    ...renderResult,
     onCatalogChange,
     onApiFormatChange,
     latestCatalog: () => latestCatalog,
+  };
+}
+
+interface ReadinessIdentityState {
+  baseUrl: string;
+  apiKey: string;
+  selectedAccountId: string | null;
+  customUserAgent: string;
+  headersOverride: string;
+  apiFormat: CodexApiFormat;
+  defaultModel: string;
+  catalog: CodexCatalogModel[];
+}
+
+function renderReadinessIdentityHarness(
+  overrides: Partial<ReadinessIdentityState> = {},
+) {
+  const initial: ReadinessIdentityState = {
+    baseUrl: "https://old.example/v1",
+    apiKey: "sk-old",
+    selectedAccountId: "account-old",
+    customUserAgent: "ccswitch-old",
+    headersOverride: '{"X-Route":"old"}',
+    apiFormat: "openai_chat",
+    defaultModel: "model-a",
+    catalog: [
+      {
+        model: "model-a",
+        upstreamModel: "model-a",
+        inputModalities: ["text"],
+        supportsImage: false,
+      },
+    ],
+    ...overrides,
+  };
+  const onApiFormatChange = vi.fn();
+  let patchIdentity: (patch: Partial<ReadinessIdentityState>) => void = () => {
+    throw new Error("readiness identity harness is not mounted");
+  };
+
+  function Harness() {
+    const [identity, setIdentity] = useState(initial);
+    patchIdentity = (patch) =>
+      setIdentity((current) => ({ ...current, ...patch }));
+
+    return (
+      <CodexFormFields
+        providerId="identity-provider"
+        providerName="Identity Provider"
+        selectedXaiAccountId={identity.selectedAccountId}
+        onXaiAccountSelect={vi.fn()}
+        codexApiKey={identity.apiKey}
+        onApiKeyChange={(apiKey) => patchIdentity({ apiKey })}
+        category="custom"
+        shouldShowApiKeyLink={false}
+        websiteUrl=""
+        shouldShowSpeedTest
+        codexBaseUrl={identity.baseUrl}
+        onBaseUrlChange={(baseUrl) => patchIdentity({ baseUrl })}
+        isFullUrl={false}
+        onFullUrlChange={vi.fn()}
+        isEndpointModalOpen={false}
+        onEndpointModalToggle={vi.fn()}
+        autoSelect={false}
+        onAutoSelectChange={vi.fn()}
+        takeoverEnabled
+        onTakeoverEnabledChange={vi.fn()}
+        codexModel={identity.defaultModel}
+        onModelChange={(defaultModel) => patchIdentity({ defaultModel })}
+        apiFormat={identity.apiFormat}
+        onApiFormatChange={(apiFormat) => {
+          onApiFormatChange(apiFormat);
+          patchIdentity({ apiFormat });
+        }}
+        catalogModels={identity.catalog}
+        onCatalogModelsChange={(catalog) => patchIdentity({ catalog })}
+        spawnAgentModels={[]}
+        onSpawnAgentModelsChange={vi.fn()}
+        codexRouting={{ enabled: false, defaultRouteId: "", routes: [] }}
+        speedTestEndpoints={[]}
+        customUserAgent={identity.customUserAgent}
+        onCustomUserAgentChange={(customUserAgent) =>
+          patchIdentity({ customUserAgent })
+        }
+        localProxyHeadersOverride={identity.headersOverride}
+        onLocalProxyHeadersOverrideChange={(headersOverride) =>
+          patchIdentity({ headersOverride })
+        }
+        localProxyBodyOverride=""
+        onLocalProxyBodyOverrideChange={vi.fn()}
+      />
+    );
+  }
+
+  const renderResult = render(<Harness />);
+  return {
+    ...renderResult,
+    onApiFormatChange,
+    updateIdentity(patch: Partial<ReadinessIdentityState>) {
+      act(() => patchIdentity(patch));
+    },
   };
 }
 
@@ -268,8 +477,11 @@ function renderAutoSplitHarness() {
     );
   }
 
+  const renderResult = render(<Harness />);
+  fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+
   return {
-    ...render(<Harness />),
+    ...renderResult,
     latestRouting: () => latestRouting,
     onCatalogChange,
     onRoutingChange,
@@ -280,6 +492,305 @@ function renderAutoSplitHarness() {
 }
 
 describe("CodexFormFields local model routing", () => {
+  it("keeps the model catalog in normal settings before model reasoning", () => {
+    renderCatalogHarness([{ model: "qwen3.8" }], {
+      openAdvancedOptions: false,
+    });
+
+    expect(screen.getByText("模型目录明细")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "模型推理能力" }),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "配置 qwen3.8 的推理能力" }),
+    );
+    expect(screen.getByLabelText("qwen3.8推理能力来源")).toBeInTheDocument();
+    expect(screen.queryByText(/Codex 推理能力（/)).not.toBeInTheDocument();
+    expect(
+      screen
+        .getByText("模型目录明细")
+        .compareDocumentPosition(
+          screen.getByRole("heading", { name: "模型推理能力" }),
+        ) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("lets users override and restore a preset model's input capability", async () => {
+    const preset: CodexCatalogModel = {
+      model: "deepseek-v4-flash-vision-exp",
+      inputModalities: ["text", "image"],
+      supportsImage: true,
+      textOnly: false,
+    };
+    const { latestCatalog } = renderCatalogHarness([preset], {
+      presetCatalogModels: [preset],
+    });
+
+    expect(
+      screen.getByRole("button", {
+        name: "deepseek-v4-flash-vision-exp 文本与图像",
+      }),
+    ).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "deepseek-v4-flash-vision-exp 仅文本",
+      }),
+    );
+    await waitFor(() => {
+      expect(latestCatalog()[0]).toEqual(
+        expect.objectContaining({
+          inputModalities: ["text"],
+          supportsImage: false,
+          textOnly: true,
+        }),
+      );
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "deepseek-v4-flash-vision-exp 恢复 CCSM 输入能力预设",
+      }),
+    );
+    await waitFor(() => {
+      expect(latestCatalog()[0]).toEqual(
+        expect.objectContaining({
+          inputModalities: ["text", "image"],
+          supportsImage: true,
+          textOnly: false,
+        }),
+      );
+    });
+  });
+
+  it("keeps Ultra independent from automatic reasoning discovery", async () => {
+    reasoningApiMocks.resolve.mockImplementation(
+      async (_settings, _provider, model) => ({
+        model,
+        source: "library",
+        fingerprint: "library-deepseek",
+        capability: {
+          schemaVersion: 2,
+          supportStatus: "confirmed_supported",
+          controlKind: "graded",
+          supportedEfforts: ["low", "high"],
+          defaultEffort: "high",
+          disableAllowed: false,
+          upstream: {
+            format: "string",
+            parameter: "reasoning_effort",
+            effortMap: { low: "low", high: "high", max: "high" },
+          },
+          source: "provider",
+        },
+        resolved: {
+          supportKind: "effort_levels",
+          confidence: "maintained",
+          codexSelectableEfforts: ["low", "high", "max"],
+          providerAcceptedEfforts: ["low", "high"],
+          providerDefaultEffort: "high",
+          disableAllowed: false,
+          effortMap: { low: "low", high: "high", max: "high" },
+        },
+        hasDetectionCandidate: false,
+        detection: null,
+      }),
+    );
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "deepseek-v4-flash" },
+    ]);
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "配置 deepseek-v4-flash 的推理能力",
+      }),
+    );
+
+    expect(
+      await screen.findByText(/自动发现会按当前 Provider、模型和已验证声明/),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "解锁 deepseek-v4-flash 的 Ultra 档",
+      }),
+    );
+    fireEvent.change(
+      screen.getByRole("combobox", {
+        name: "deepseek-v4-flash Ultra 对应的 Provider 推理强度",
+      }),
+      { target: { value: "high" } },
+    );
+
+    await waitFor(() => {
+      expect(latestCatalog()[0]).toEqual(
+        expect.objectContaining({
+          codexUltra: { enabled: true, providerEffort: "high" },
+        }),
+      );
+    });
+    expect(latestCatalog()[0].reasoning).toBeUndefined();
+  });
+
+  it("renders the resolved reasoning card and lets the user declare an unknown model", async () => {
+    renderCatalogHarness([{ model: "qwen3.8" }]);
+    await waitFor(() => expect(reasoningApiMocks.resolve).toHaveBeenCalled());
+    fireEvent.click(
+      screen.getByRole("button", { name: "配置 qwen3.8 的推理能力" }),
+    );
+
+    expect(
+      await screen.findByText("未知（使用服务端默认）"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("使用服务端默认（不发送推理参数）。"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "手动声明" }));
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("qwen3.8推理能力 JSON")).not.toHaveValue("");
+    });
+  });
+
+  it("adopts a detected reasoning snapshot into the catalog declaration", async () => {
+    const detected = createDetectedReasoningOutcome("qwen3.8");
+    reasoningApiMocks.resolve.mockImplementation(
+      async (_settings, _provider, model) => ({
+        ...createUnknownReasoningResolution(model),
+        hasDetectionCandidate: true,
+        detection: detected.found,
+      }),
+    );
+    const { latestCatalog } = renderCatalogHarness([{ model: "qwen3.8" }]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "配置 qwen3.8 的推理能力" }),
+    );
+
+    expect(await screen.findByText("采用检测结果")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "采用检测结果" }));
+
+    await waitFor(() => {
+      expect(latestCatalog()[0].reasoning).toEqual(
+        expect.objectContaining({
+          source: "user",
+          supportedEfforts: ["low", "high"],
+          defaultEffort: "high",
+          disableAllowed: true,
+        }),
+      );
+    });
+  });
+
+  it("re-detects a model through the read-only capability command", async () => {
+    const detected = createDetectedReasoningOutcome("qwen3.8");
+    let redetected = false;
+    reasoningApiMocks.resolve.mockImplementation(
+      async (_settings, _provider, model) =>
+        redetected
+          ? {
+              ...createUnknownReasoningResolution(model),
+              source: "detection",
+              capability: {
+                schemaVersion: 2,
+                supportStatus: "confirmed_supported",
+                controlKind: "graded",
+                supportedEfforts: ["low", "high"],
+                defaultEffort: "high",
+                disableAllowed: true,
+                upstream: {
+                  format: "reasoning_object",
+                  parameter: "reasoning.effort",
+                },
+              },
+              resolved: {
+                supportKind: "effort_levels",
+                confidence: "confirmed",
+                codexSelectableEfforts: ["low", "high"],
+                providerAcceptedEfforts: ["low", "high"],
+                providerDefaultEffort: "high",
+                disableAllowed: true,
+                effortMap: { low: "low", high: "high" },
+              },
+              hasDetectionCandidate: true,
+              detection: detected.found,
+            }
+          : createUnknownReasoningResolution(model),
+    );
+    reasoningApiMocks.trigger.mockImplementationOnce(async () => {
+      redetected = true;
+      return detected;
+    });
+    renderCatalogHarness([{ model: "qwen3.8" }]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "配置 qwen3.8 的推理能力" }),
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "重新检测" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重新检测" }));
+
+    await waitFor(() => {
+      expect(reasoningApiMocks.trigger).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "codex-thirdparty",
+          settingsConfig: { base_url: "https://api.thirdparty.example/v1" },
+        }),
+        "qwen3.8",
+      );
+    });
+    expect(await screen.findByText("支持推理")).toBeInTheDocument();
+  });
+
+  it("keeps built-in reasoning read-only until an explicit override and restores the preset", async () => {
+    const builtinReasoning: NonNullable<CodexCatalogModel["reasoning"]> = {
+      supported: true as const,
+      supportedEfforts: ["low", "high", "max"],
+      defaultEffort: "high" as const,
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object" as const,
+        parameter: "reasoning.effort" as const,
+      },
+      source: "builtin" as const,
+    };
+    const { latestCatalog } = renderCatalogHarness(
+      [{ model: "deepseek-v4-pro", reasoning: builtinReasoning }],
+      {
+        presetCatalogModels: [
+          { model: "deepseek-v4-pro", reasoning: builtinReasoning },
+        ],
+      },
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "配置 deepseek-v4-pro 的推理能力",
+      }),
+    );
+    const textarea = screen.getByLabelText("deepseek-v4-pro推理能力 JSON");
+    expect(textarea).toHaveAttribute("readonly");
+    expect(screen.getByText("能力来源：CCSM 受维护声明")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "创建高级覆盖" }));
+    await waitFor(() => {
+      expect(latestCatalog()[0].reasoning?.source).toBe("user");
+    });
+    expect(
+      screen.getByLabelText("deepseek-v4-pro推理能力 JSON"),
+    ).not.toHaveAttribute("readonly");
+    expect(
+      screen.getByText("能力来源：用户声明（已覆盖维护值）"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "恢复内置默认" }));
+    await waitFor(() => {
+      expect(latestCatalog()[0].reasoning).toEqual(builtinReasoning);
+    });
+    expect(
+      screen.getByLabelText("deepseek-v4-pro推理能力 JSON"),
+    ).toHaveAttribute("readonly");
+  });
   it("classifies fetched relay models into Responses and Chat groups", () => {
     expect(
       splitFetchedModelsByLikelyCodexProtocol([
@@ -323,9 +834,7 @@ describe("CodexFormFields local model routing", () => {
       onProviderSplitSuggestionChange,
     } = renderAutoSplitHarness();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
 
     expect(await screen.findByText("检测到混合协议模型")).toBeInTheDocument();
     expect(screen.getByText("Relay-responses")).toBeInTheDocument();
@@ -365,9 +874,7 @@ describe("CodexFormFields local model routing", () => {
       onProviderSplitSuggestionChange,
     } = renderAutoSplitHarness();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
 
     expect(await screen.findByText("检测到混合协议模型")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "暂不拆分" }));
@@ -421,9 +928,7 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "测试 Chat / Responses" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
     expect(screen.getByText("确认测试 Chat / Responses")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
@@ -444,6 +949,111 @@ describe("CodexFormFields local model routing", () => {
       false,
       "",
     );
+  });
+
+  it("invalidates successful readiness for every routing and catalog identity input", async () => {
+    vi.mocked(probeCodexResponsesForConfig).mockImplementation(
+      async (_baseUrl, _apiKey, model) => createProbeResult(model),
+    );
+    vi.mocked(probeCodexChatForConfig).mockImplementation(
+      async (_baseUrl, _apiKey, model) => createProbeResult(model),
+    );
+    const { updateIdentity } = renderReadinessIdentityHarness();
+
+    const validateCurrentIdentity = async () => {
+      fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+      fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+      expect(await screen.findByText("可加入 MultiRouter")).toBeInTheDocument();
+    };
+    const expectInvalidated = async () => {
+      await waitFor(() => {
+        expect(
+          screen.queryByText("可加入 MultiRouter"),
+        ).not.toBeInTheDocument();
+      });
+      expect(screen.getByText("建议先验证连接")).toBeInTheDocument();
+    };
+
+    await validateCurrentIdentity();
+    const identityChanges: Array<Partial<ReadinessIdentityState>> = [
+      { baseUrl: "https://new.example/v1" },
+      { apiKey: "sk-new" },
+      { selectedAccountId: "account-new" },
+      { customUserAgent: "ccswitch-new" },
+      { headersOverride: '{"X-Route":"new"}' },
+      { apiFormat: "openai_responses" },
+      { defaultModel: "model-a-alias" },
+      {
+        catalog: [
+          {
+            model: "model-a",
+            upstreamModel: "model-a",
+            inputModalities: ["text", "image"],
+            supportsImage: true,
+          },
+        ],
+      },
+    ];
+
+    for (const patch of identityChanges) {
+      updateIdentity(patch);
+      await expectInvalidated();
+      await validateCurrentIdentity();
+    }
+  });
+
+  it("ignores an older probe completion after a newer provider identity succeeds", async () => {
+    type ProbeResult = Awaited<ReturnType<typeof probeCodexResponsesForConfig>>;
+    const oldResponses = deferred<ProbeResult>();
+    const oldChat = deferred<ProbeResult>();
+    const newResponses = deferred<ProbeResult>();
+    const newChat = deferred<ProbeResult>();
+
+    vi.mocked(probeCodexResponsesForConfig).mockImplementation(
+      async (baseUrl) =>
+        baseUrl.includes("old") ? oldResponses.promise : newResponses.promise,
+    );
+    vi.mocked(probeCodexChatForConfig).mockImplementation(async (baseUrl) =>
+      baseUrl.includes("old") ? oldChat.promise : newChat.promise,
+    );
+    const { updateIdentity } = renderReadinessIdentityHarness();
+
+    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+    await waitFor(() => {
+      expect(probeCodexResponsesForConfig).toHaveBeenCalledWith(
+        "https://old.example/v1",
+        expect.anything(),
+        "model-a",
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    updateIdentity({ baseUrl: "https://new.example/v1" });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "验证连接" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
+
+    await act(async () => {
+      newResponses.resolve(createProbeResult("model-a", "new responses ok"));
+      newChat.resolve(createProbeResult("model-a", "new chat ok"));
+      await Promise.resolve();
+    });
+    expect(await screen.findByText("可加入 MultiRouter")).toBeInTheDocument();
+
+    await act(async () => {
+      oldResponses.resolve(createProbeFailure("model-a", "old credentials"));
+      oldChat.resolve(createProbeFailure("model-a", "old credentials"));
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("可加入 MultiRouter")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    });
   });
 
   it("shows per-model protocol tags and suggests split providers for mixed probe results", async () => {
@@ -505,9 +1115,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "测试 Chat / Responses" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     await waitFor(() => {
@@ -572,9 +1180,7 @@ describe("CodexFormFields local model routing", () => {
       { shouldShowSpeedTest: true },
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "测试 Chat / Responses" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     await waitFor(() => {
@@ -612,15 +1218,15 @@ describe("CodexFormFields local model routing", () => {
   it("opens the protocol probe confirmation above the full screen provider panel", () => {
     renderCatalogHarness([{ model: "gpt-5.5", upstreamModel: "gpt-5.5" }], {
       shouldShowSpeedTest: true,
+      openAdvancedOptions: false,
     });
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "测试 Chat / Responses" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
 
     expect(
-      screen.getByText("已打开测试确认框；如果没有看到弹窗，请按 Esc 后重试。"),
-    ).toBeInTheDocument();
+      screen.getByText("已打开验证确认框；如果没有看到弹窗，请按 Esc 后重试。"),
+    ).toBeVisible();
     expect(screen.getByRole("dialog")).toHaveClass("z-[200]");
     expect(screen.getByText("确认测试 Chat / Responses")).toBeInTheDocument();
   });
@@ -629,15 +1235,16 @@ describe("CodexFormFields local model routing", () => {
     renderCatalogHarness([], {
       shouldShowSpeedTest: true,
       takeoverEnabled: false,
+      openAdvancedOptions: false,
     });
 
     fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
 
     const fetchButton = screen.getByRole("button", {
-      name: "providerForm.fetchModels",
+      name: "同步模型",
     });
     const probeButton = screen.getByRole("button", {
-      name: "测试 Chat / Responses",
+      name: "验证连接",
     });
 
     expect(fetchButton).toBeVisible();
@@ -665,10 +1272,7 @@ describe("CodexFormFields local model routing", () => {
       takeoverEnabled: false,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
-    fireEvent.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -682,22 +1286,71 @@ describe("CodexFormFields local model routing", () => {
     });
   });
 
+  it("preserves fetched image support and updates existing rows to explicit text-only capabilities", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      {
+        id: "vision-model",
+        ownedBy: null,
+        inputModalities: ["text", "image"],
+        supportsImage: true,
+      },
+      {
+        id: "text-model",
+        ownedBy: null,
+        inputModalities: ["text"],
+        supportsImage: false,
+      },
+    ]);
+    const { latestCatalog } = renderCatalogHarness([
+      {
+        model: "text-model",
+        upstreamModel: "text-model",
+        displayName: "Existing text model",
+        inputModalities: ["text", "image"],
+        supportsImage: true,
+      },
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
+
+    await waitFor(() => {
+      expect(latestCatalog()).toEqual([
+        {
+          model: "text-model",
+          upstreamModel: "text-model",
+          displayName: "Existing text model",
+          contextWindow: "",
+          inputModalities: ["text"],
+          supportsImage: false,
+        },
+        {
+          model: "vision-model",
+          upstreamModel: "vision-model",
+          displayName: "vision-model",
+          contextWindow: "",
+          inputModalities: ["text", "image"],
+          supportsImage: true,
+        },
+      ]);
+    });
+  });
+
   it("points users to fetch models when protocol probing has no catalog", async () => {
     renderCatalogHarness([], { shouldShowSpeedTest: true });
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "测试 Chat / Responses" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     expect(await screen.findByRole("status")).toHaveTextContent(
-      "请先在上方“模型目录与上下文”点击“获取模型列表”，或手动添加模型后再测试。",
+      "请先在“模型与兼容性”同步模型，或在高级设置中手动添加至少一个模型后再验证。",
     );
     const fetchButton = screen.getByRole("button", {
-      name: "providerForm.fetchModels",
+      name: "同步模型",
     });
     expect(fetchButton).toHaveClass("border-blue-500");
-    expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+    await waitFor(() =>
+      expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalled(),
+    );
     expect(probeCodexResponsesForConfig).not.toHaveBeenCalled();
     expect(probeCodexChatForConfig).not.toHaveBeenCalled();
   });
@@ -710,17 +1363,13 @@ describe("CodexFormFields local model routing", () => {
       shouldShowSpeedTest: true,
     });
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "测试 Chat / Responses" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "验证连接" }));
     fireEvent.click(screen.getByRole("button", { name: "确认测试" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "协议测试中断：backend timeout",
     );
-    expect(
-      screen.getByRole("button", { name: "测试 Chat / Responses" }),
-    ).toBeEnabled();
+    expect(screen.getByRole("button", { name: "验证连接" })).toBeEnabled();
   });
 
   it("merges fetched models by upstream model without overwriting a visible alias", async () => {
@@ -735,9 +1384,7 @@ describe("CodexFormFields local model routing", () => {
       },
     ]);
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -765,9 +1412,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
 
     await waitFor(() => {
       expect(fetchModelsForConfig).toHaveBeenCalledWith(
@@ -796,9 +1441,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
 
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
     expect(latestCatalog()).toEqual([
@@ -821,9 +1464,7 @@ describe("CodexFormFields local model routing", () => {
       },
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "同步模型" }));
 
     await waitFor(() => {
       expect(fetchModelsForConfig).toHaveBeenCalledWith(
@@ -871,78 +1512,10 @@ describe("CodexFormFields local model routing", () => {
     });
   });
 
-  it("shows local model routing even when endpoint speed tools are hidden", () => {
-    renderRoutingHarness(
-      { enabled: false, defaultRouteId: "", routes: [] },
-      { shouldShowSpeedTest: false },
-    );
-
-    expect(screen.getByText("Codex 多模型路由")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "添加路由" }),
-    ).toBeInTheDocument();
-  });
-
-  it("adds and edits a route through the dialog without persisting rowId", async () => {
-    const { latestRouting } = renderRoutingHarness();
-
-    fireEvent.click(screen.getByRole("button", { name: "添加路由" }));
-
-    await waitFor(() => {
-      expect(screen.getByRole("dialog")).toBeInTheDocument();
-      expect(latestRouting().routes).toHaveLength(1);
-    });
-
-    fireEvent.change(screen.getByPlaceholderText("路由 ID"), {
-      target: { value: "deepseek" },
-    });
-    fireEvent.change(screen.getByPlaceholderText("路由名称"), {
-      target: { value: "DeepSeek" },
-    });
-    fireEvent.change(
-      screen.getByPlaceholderText("匹配模型，多个用英文逗号分隔"),
-      {
-        target: { value: "deepseek-v4-flash, deepseek-v4-pro" },
-      },
-    );
-    fireEvent.change(
-      screen.getByPlaceholderText("匹配前缀，多个用英文逗号分隔"),
-      {
-        target: { value: "deepseek-" },
-      },
-    );
-    fireEvent.change(screen.getByPlaceholderText("上游 Base URL"), {
-      target: { value: "https://api.deepseek.example" },
-    });
-    fireEvent.change(screen.getByPlaceholderText("路由 API Key"), {
-      target: { value: "sk-route" },
-    });
-    fireEvent.change(screen.getByPlaceholderText("codex模型=上游模型"), {
-      target: { value: "deepseek-v4-flash=deepseek-chat" },
-    });
-
-    await waitFor(() => {
-      expect(latestRouting().routes?.[0]).toMatchObject({
-        id: "deepseek",
-        label: "DeepSeek",
-        match: {
-          models: ["deepseek-v4-flash", "deepseek-v4-pro"],
-          prefixes: ["deepseek-"],
-        },
-        upstream: {
-          baseUrl: "https://api.deepseek.example",
-          apiKey: "sk-route",
-          modelMap: { "deepseek-v4-flash": "deepseek-chat" },
-        },
-      });
-    });
-    expect(latestRouting().routes?.[0]).not.toHaveProperty("rowId");
-  });
-
-  it("removes a route from the list and writes the shortened routing config", async () => {
-    const { latestRouting, container } = renderRoutingHarness({
+  it("hides the legacy route editor while retaining the supplied routing state", () => {
+    const { latestRouting } = renderRoutingHarness({
       enabled: true,
-      defaultRouteId: "",
+      defaultRouteId: "deepseek",
       routes: [
         {
           id: "deepseek",
@@ -959,12 +1532,55 @@ describe("CodexFormFields local model routing", () => {
       ],
     });
 
-    const deleteButton = container.querySelector('button[title="删除"]');
-    expect(deleteButton).not.toBeNull();
-    fireEvent.click(deleteButton!);
-
-    await waitFor(() => {
-      expect(latestRouting().routes).toEqual([]);
+    expect(screen.queryByText("Codex 多模型路由")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "添加路由" }),
+    ).not.toBeInTheDocument();
+    expect(latestRouting()).toMatchObject({
+      enabled: true,
+      defaultRouteId: "deepseek",
+      routes: [{ id: "deepseek" }],
     });
+  });
+
+  it("places the explained custom menu projection control last in advanced options", () => {
+    renderCatalogHarness([], {
+      shouldShowSpeedTest: false,
+      takeoverEnabled: true,
+      openAdvancedOptions: false,
+    });
+
+    expect(
+      screen.queryByText("在 Codex /model 菜单中显示"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+
+    const overrides = screen.getByText("本地代理请求覆盖");
+    const projection = screen.getByText("在 Codex /model 菜单中显示");
+    expect(projection).toBeInTheDocument();
+    expect(
+      overrides.compareDocumentPosition(projection) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/它不控制 Provider、代理或 MultiRouter 是否可用/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/仅当你要使用自己维护的 model_catalog_json 时关闭/),
+    ).toBeInTheDocument();
+  });
+
+  it("does not offer a menu projection opt-out for maintained presets", () => {
+    renderCatalogHarness([], {
+      allowModelMenuProjectionToggle: false,
+      openAdvancedOptions: false,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
+
+    expect(
+      screen.queryByText("在 Codex /model 菜单中显示"),
+    ).not.toBeInTheDocument();
   });
 });

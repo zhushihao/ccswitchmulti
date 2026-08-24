@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 /// 使用量汇总
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +100,7 @@ pub struct ProviderStats {
 #[serde(rename_all = "camelCase")]
 pub struct ModelStats {
     pub model: String,
+    pub provider_name: String,
     pub request_count: u64,
     pub total_tokens: u64,
     pub total_cost: String,
@@ -167,8 +169,16 @@ pub struct LogFilters {
     pub provider_name: Option<String>,
     pub model: Option<String>,
     pub status_code: Option<u16>,
+    pub status_group: Option<LogStatusGroup>,
     pub start_date: Option<i64>,
     pub end_date: Option<i64>,
+}
+
+/// 请求日志状态筛选的非固定码分组。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LogStatusGroup {
+    Other,
 }
 
 /// 分页请求日志响应
@@ -264,13 +274,79 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
     })
 }
 
-/// SQL fragment: resolve provider_name with fallback for session-based entries.
-/// Session logs use placeholder provider_ids (e.g., `_session`, `_<app>_session`)
-/// that don't exist in the providers table — the CASE expression below is the
-/// authoritative mapping from placeholder to readable name.
+/// SQL fragment: resolve the human-readable provider name for a usage row.
+///
+/// A Codex MultiRouter request uses a request-local provider id such as
+/// `codex-multirouter::route::router-codex-official`. That id is deliberately
+/// not persisted in `providers`, so a normal `(provider_id, app_type)` join
+/// falls back to the opaque route id. The correlated route lookup below keeps
+/// the persisted id intact while resolving the route's target Provider name.
+/// Session placeholders remain handled by the CASE fallback.
 fn provider_name_coalesce(log_alias: &str, provider_alias: &str) -> String {
     format!(
-        "COALESCE({provider_alias}.name, CASE {log_alias}.provider_id \
+        "COALESCE({provider_alias}.name, (
+            SELECT COALESCE(
+                target.name,
+                NULLIF(json_extract(route.value, '$.label'), ''),
+                NULLIF(json_extract(route.value, '$.name'), '')
+            )
+            FROM providers parent
+            JOIN json_each(
+                CASE
+                    WHEN json_valid(parent.settings_config) = 0
+                        THEN '[]'
+                    WHEN json_type(parent.settings_config, '$.codexRouting.routes') = 'array'
+                        THEN json_extract(parent.settings_config, '$.codexRouting.routes')
+                    WHEN json_type(parent.settings_config, '$.codexRouting') = 'array'
+                        THEN json_extract(parent.settings_config, '$.codexRouting')
+                    WHEN json_type(parent.settings_config, '$.codexModelRoutes') = 'array'
+                        THEN json_extract(parent.settings_config, '$.codexModelRoutes')
+                    WHEN json_type(parent.settings_config, '$.modelRoutes') = 'array'
+                        THEN json_extract(parent.settings_config, '$.modelRoutes')
+                    ELSE '[]'
+                END
+            ) AS route
+            LEFT JOIN providers target
+                ON target.id = COALESCE(
+                    json_extract(route.value, '$.targetProviderId'),
+                    json_extract(route.value, '$.target_provider_id'),
+                    json_extract(route.value, '$.upstream.targetProviderId'),
+                    json_extract(route.value, '$.upstream.target_provider_id'),
+                    json_extract(route.value, '$.upstream.providerId'),
+                    json_extract(route.value, '$.upstream.provider_id')
+                )
+                AND target.app_type = {log_alias}.app_type
+            WHERE parent.app_type = {log_alias}.app_type
+              AND instr({log_alias}.provider_id, parent.id || '::route::') = 1
+              AND COALESCE(
+                    json_extract(route.value, '$.id'),
+                    json_extract(route.value, '$.routeId'),
+                    json_extract(route.value, '$.route_id')
+                  ) IS NOT NULL
+              AND substr(
+                    {log_alias}.provider_id,
+                    -length(
+                        '::route::' || COALESCE(
+                            json_extract(route.value, '$.id'),
+                            json_extract(route.value, '$.routeId'),
+                            json_extract(route.value, '$.route_id')
+                        )
+                    )
+                  ) = '::route::' || COALESCE(
+                        json_extract(route.value, '$.id'),
+                        json_extract(route.value, '$.routeId'),
+                        json_extract(route.value, '$.route_id')
+                    )
+            ORDER BY length(parent.id) DESC
+            LIMIT 1
+         ), (
+            SELECT parent.name
+            FROM providers parent
+            WHERE parent.app_type = {log_alias}.app_type
+              AND instr({log_alias}.provider_id, parent.id || '::route::') = 1
+            ORDER BY length(parent.id) DESC
+            LIMIT 1
+         ), CASE {log_alias}.provider_id \
          WHEN '_session' THEN 'Claude (Session)' \
          WHEN '_codex_session' THEN 'Codex (Session)' \
          WHEN '_gemini_session' THEN 'Gemini (Session)' \
@@ -362,6 +438,23 @@ fn push_provider_model_filters(
     }
 }
 
+fn push_status_filter(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    log_alias: &str,
+    status_code: Option<u16>,
+    status_group: Option<LogStatusGroup>,
+) {
+    if matches!(status_group, Some(LogStatusGroup::Other)) {
+        conditions.push(format!(
+            "{log_alias}.status_code NOT IN (200, 400, 401, 429, 500)"
+        ));
+    } else if let Some(status) = status_code {
+        conditions.push(format!("{log_alias}.status_code = ?"));
+        params.push(Box::new(status as i64));
+    }
+}
+
 pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
     let data_source = data_source_expr(log_alias);
     let proxy_data_source = data_source_expr("proxy_dedup");
@@ -431,24 +524,17 @@ pub(crate) fn should_skip_session_insert(
 }
 
 fn proxy_request_id_exists(conn: &Connection, request_id: &str) -> Result<bool, AppError> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM proxy_request_logs WHERE request_id = ?1)",
-        params![request_id],
-        |row| row.get::<_, bool>(0),
-    )
-    .map_err(|e| AppError::Database(format!("查询 request_id 失败: {e}")))
+    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM proxy_request_logs WHERE request_id = ?1)")
+        .and_then(|mut stmt| stmt.query_row(params![request_id], |row| row.get::<_, bool>(0)))
+        .map_err(|e| AppError::Database(format!("查询 request_id 失败: {e}")))
 }
 
-pub(crate) fn has_matching_proxy_usage_log(
-    conn: &Connection,
-    key: &DedupKey,
-) -> Result<bool, AppError> {
-    let allow_missing_cache_creation =
-        matches!(key.app_type, "codex" | "gemini" | "opencode") && key.cache_creation_tokens == 0;
-
+// 会话重导每个 token 事件都要跑一次这条查询；SQL 文本静态化让
+// prepare_cached 稳定命中，也省掉每行的 format! 分配。
+static MATCHING_PROXY_USAGE_LOG_SQL: LazyLock<String> = LazyLock::new(|| {
     let l_data_source = data_source_expr("l");
     let app_type_match = dedup_app_type_match_sql("l.app_type", "?1");
-    let sql = format!(
+    format!(
         "SELECT EXISTS (
             SELECT 1
             FROM proxy_request_logs l
@@ -467,24 +553,34 @@ pub(crate) fn has_matching_proxy_usage_log(
                   OR LOWER(?2) = 'unknown'
               )
         )"
-    );
-
-    conn.query_row(
-        &sql,
-        params![
-            key.app_type,
-            key.model,
-            key.input_tokens as i64,
-            key.output_tokens as i64,
-            key.cache_read_tokens as i64,
-            key.cache_creation_tokens as i64,
-            key.created_at,
-            SESSION_PROXY_DEDUP_WINDOW_SECONDS,
-            allow_missing_cache_creation as i64,
-        ],
-        |row| row.get::<_, bool>(0),
     )
-    .map_err(|e| AppError::Database(format!("查询重复代理用量日志失败: {e}")))
+});
+
+pub(crate) fn has_matching_proxy_usage_log(
+    conn: &Connection,
+    key: &DedupKey,
+) -> Result<bool, AppError> {
+    let allow_missing_cache_creation =
+        matches!(key.app_type, "codex" | "gemini" | "opencode") && key.cache_creation_tokens == 0;
+
+    conn.prepare_cached(&MATCHING_PROXY_USAGE_LOG_SQL)
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![
+                    key.app_type,
+                    key.model,
+                    key.input_tokens as i64,
+                    key.output_tokens as i64,
+                    key.cache_read_tokens as i64,
+                    key.cache_creation_tokens as i64,
+                    key.created_at,
+                    SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+                    allow_missing_cache_creation as i64,
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+        })
+        .map_err(|e| AppError::Database(format!("查询重复代理用量日志失败: {e}")))
 }
 
 /// grokbuild 会话导入的接管活动守卫：给定时刻 ±窗口内存在任何 grokbuild
@@ -521,13 +617,9 @@ pub(crate) fn has_recent_grokbuild_proxy_activity(
     .map_err(|e| AppError::Database(format!("查询 Grok 接管活动失败: {e}")))
 }
 
-pub(crate) fn has_suspected_codex_session_duplicate(
-    conn: &Connection,
-    request_id: &str,
-    key: &DedupKey,
-) -> Result<bool, AppError> {
+static SUSPECTED_CODEX_DUPLICATE_SQL: LazyLock<String> = LazyLock::new(|| {
     let data_source = data_source_expr("l");
-    let sql = format!(
+    format!(
         "SELECT EXISTS (
             SELECT 1
             FROM proxy_request_logs l
@@ -540,21 +632,30 @@ pub(crate) fn has_suspected_codex_session_duplicate(
               AND l.cache_read_tokens = ?5
               AND l.created_at BETWEEN ?6 - ?7 AND ?6 + ?7
         )"
-    );
-    conn.query_row(
-        &sql,
-        params![
-            request_id,
-            key.model,
-            key.input_tokens as i64,
-            key.output_tokens as i64,
-            key.cache_read_tokens as i64,
-            key.created_at,
-            SESSION_PROXY_DEDUP_WINDOW_SECONDS,
-        ],
-        |row| row.get::<_, bool>(0),
     )
-    .map_err(|error| AppError::Database(format!("查询疑似重复 Codex 会话用量失败: {error}")))
+});
+
+pub(crate) fn has_suspected_codex_session_duplicate(
+    conn: &Connection,
+    request_id: &str,
+    key: &DedupKey,
+) -> Result<bool, AppError> {
+    conn.prepare_cached(&SUSPECTED_CODEX_DUPLICATE_SQL)
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![
+                    request_id,
+                    key.model,
+                    key.input_tokens as i64,
+                    key.output_tokens as i64,
+                    key.cache_read_tokens as i64,
+                    key.created_at,
+                    SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+        })
+        .map_err(|error| AppError::Database(format!("查询疑似重复 Codex 会话用量失败: {error}")))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2281,11 +2382,7 @@ impl Database {
         } else {
             format!("WHERE {}", detail_conditions.join(" AND "))
         };
-        let detail_join = if provider_name.is_some() {
-            providers_join("l", "p")
-        } else {
-            String::new()
-        };
+        let detail_join = providers_join("l", "p");
 
         let mut rollup_conditions = Vec::new();
         let mut rollup_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -2313,11 +2410,7 @@ impl Database {
         } else {
             format!("WHERE {}", rollup_conditions.join(" AND "))
         };
-        let rollup_join = if provider_name.is_some() {
-            providers_join("r", "p2")
-        } else {
-            String::new()
-        };
+        let rollup_join = providers_join("r", "p2");
 
         // UNION detail logs + rollup data
         //
@@ -2329,32 +2422,37 @@ impl Database {
         let fresh_input_rollup = fresh_input_sql("r");
         let detail_model = effective_model_sql("l");
         let rollup_model = effective_model_sql("r");
+        let detail_provider = provider_name_coalesce("l", "p");
+        let rollup_provider = provider_name_coalesce("r", "p2");
         let sql = format!(
             "SELECT
                 model,
+                provider_name,
                 SUM(request_count) as request_count,
                 SUM(total_tokens) as total_tokens,
                 SUM(total_cost) as total_cost
             FROM (
                 SELECT {detail_model} as model,
+                    {detail_provider} as provider_name,
                     COUNT(*) as request_count,
                     COALESCE(SUM({fresh_input_detail} + l.output_tokens), 0) as total_tokens,
                     COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as total_cost
                 FROM proxy_request_logs l
                 {detail_join}
                 {detail_where}
-                GROUP BY {detail_model}
+                GROUP BY {detail_model}, {detail_provider}
                 UNION ALL
                 SELECT {rollup_model},
+                    {rollup_provider},
                     COALESCE(SUM(r.request_count), 0),
                     COALESCE(SUM({fresh_input_rollup} + r.output_tokens), 0),
                     COALESCE(SUM(CAST(r.total_cost_usd AS REAL)), 0)
                 FROM usage_daily_rollups r
                 {rollup_join}
                 {rollup_where}
-                GROUP BY {rollup_model}
+                GROUP BY {rollup_model}, {rollup_provider}
             )
-            GROUP BY model
+            GROUP BY model, provider_name
             ORDER BY total_cost DESC"
         );
 
@@ -2363,8 +2461,8 @@ impl Database {
         params.extend(rollup_params);
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let row_mapper = |row: &rusqlite::Row| {
-            let request_count: i64 = row.get(1)?;
-            let total_cost: f64 = row.get(3)?;
+            let request_count: i64 = row.get(2)?;
+            let total_cost: f64 = row.get(4)?;
             let avg_cost = if request_count > 0 {
                 total_cost / request_count as f64
             } else {
@@ -2373,8 +2471,9 @@ impl Database {
 
             Ok(ModelStats {
                 model: row.get(0)?,
+                provider_name: row.get(1)?,
                 request_count: request_count as u64,
-                total_tokens: row.get::<_, i64>(2)? as u64,
+                total_tokens: row.get::<_, i64>(3)? as u64,
                 total_cost: format!("{total_cost:.6}"),
                 avg_cost_per_request: format!("{avg_cost:.6}"),
             })
@@ -2418,10 +2517,13 @@ impl Database {
             filters.provider_name.as_deref(),
             filters.model.as_deref(),
         );
-        if let Some(status) = filters.status_code {
-            conditions.push("l.status_code = ?".to_string());
-            params.push(Box::new(status as i64));
-        }
+        push_status_filter(
+            &mut conditions,
+            &mut params,
+            "l",
+            filters.status_code,
+            filters.status_group,
+        );
         if let Some(start) = filters.start_date {
             conditions.push("l.created_at >= ?".to_string());
             params.push(Box::new(start));
@@ -3983,6 +4085,146 @@ mod tests {
     }
 
     #[test]
+    fn test_request_logs_resolve_codex_route_target_name_and_other_statuses() -> Result<(), AppError>
+    {
+        let db = Database::memory()?;
+        let route_provider_id = "codex-multirouter::route::router-codex-official";
+        let nested_route_provider_id =
+            "codex-multirouter::route::router-codex-official::route::router-codex-official";
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config)
+                 VALUES (?1, 'codex', 'OpenAI Official', '{}')",
+                params!["codex-official"],
+            )?;
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config)
+                 VALUES (?1, 'codex', 'New Codex MultiRouter', ?2)",
+                params![
+                    "codex-multirouter",
+                    r#"{"codexRouting":{"routes":[{"id":"router-codex-official","label":"OpenAI Official","targetProviderId":"codex-official"}]}}"#,
+                ],
+            )?;
+
+            for (request_id, status_code) in [
+                ("route-201", 201),
+                ("route-502", 502),
+                ("route-500", 500),
+                ("route-429", 429),
+            ] {
+                insert_usage_log(
+                    &conn,
+                    request_id,
+                    "codex",
+                    route_provider_id,
+                    "gpt-5.5",
+                    "proxy",
+                    1000 + status_code,
+                    10,
+                    5,
+                    0,
+                    0,
+                    status_code,
+                    "0",
+                )?;
+            }
+            insert_usage_log(
+                &conn,
+                "route-nested-204",
+                "codex",
+                nested_route_provider_id,
+                "gpt-5.5",
+                "proxy",
+                1204,
+                10,
+                5,
+                0,
+                0,
+                204,
+                "0",
+            )?;
+            insert_usage_log(
+                &conn,
+                "route-legacy-unknown",
+                "codex",
+                "codex-multirouter::route::router-legacy-removed",
+                "gpt-5.5",
+                "proxy",
+                1300,
+                10,
+                5,
+                0,
+                0,
+                400,
+                "0",
+            )?;
+        }
+
+        let logs = db.get_request_logs(&LogFilters::default(), 0, 20)?;
+        assert_eq!(
+            logs.data
+                .iter()
+                .filter(|log| {
+                    log.provider_id == route_provider_id
+                        || log.provider_id == nested_route_provider_id
+                })
+                .map(|log| log.provider_name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("OpenAI Official"); 5]
+        );
+        assert_eq!(
+            logs.data
+                .iter()
+                .find(|log| log.request_id == "route-legacy-unknown")
+                .and_then(|log| log.provider_name.as_deref()),
+            Some("New Codex MultiRouter")
+        );
+
+        let provider_filtered = db.get_request_logs(
+            &LogFilters {
+                provider_name: Some("OpenAI Official".to_string()),
+                ..Default::default()
+            },
+            0,
+            20,
+        )?;
+        assert_eq!(provider_filtered.total, 5);
+
+        let other = db.get_request_logs(
+            &LogFilters {
+                status_group: Some(LogStatusGroup::Other),
+                ..Default::default()
+            },
+            0,
+            20,
+        )?;
+        let other_ids: Vec<&str> = other
+            .data
+            .iter()
+            .map(|log| log.request_id.as_str())
+            .collect();
+        assert_eq!(other.total, 3);
+        assert!(other_ids.contains(&"route-201"));
+        assert!(other_ids.contains(&"route-502"));
+        assert!(other_ids.contains(&"route-nested-204"));
+
+        let fixed = db.get_request_logs(
+            &LogFilters {
+                status_code: Some(500),
+                ..Default::default()
+            },
+            0,
+            20,
+        )?;
+        assert_eq!(fixed.total, 1);
+        assert_eq!(fixed.data[0].request_id, "route-500");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_backfill_missing_usage_costs_uses_new_gpt_5_5_pricing() -> Result<(), AppError> {
         let db = Database::memory()?;
 
@@ -5165,6 +5407,61 @@ mod tests {
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].model, "claude-3-sonnet");
         assert_eq!(stats[0].request_count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_model_stats_keeps_provider_dimension_for_same_model() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config)
+                 VALUES (?, ?, ?, ?)",
+                params!["provider-a", "claude", "Provider A", "{}"],
+            )?;
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config)
+                 VALUES (?, ?, ?, ?)",
+                params!["provider-b", "claude", "Provider B", "{}"],
+            )?;
+            for (request_id, provider_id, cost) in [
+                ("same-model-a", "provider-a", "0.01"),
+                ("same-model-b", "provider-b", "0.02"),
+            ] {
+                conn.execute(
+                    "INSERT INTO proxy_request_logs (
+                        request_id, provider_id, app_type, model,
+                        input_tokens, output_tokens, total_cost_usd,
+                        latency_ms, status_code, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        request_id,
+                        provider_id,
+                        "claude",
+                        "shared-model",
+                        100,
+                        50,
+                        cost,
+                        100,
+                        200,
+                        1000
+                    ],
+                )?;
+            }
+        }
+
+        let stats = db.get_model_stats(None, None, Some("claude"), None, None)?;
+        assert_eq!(stats.len(), 2);
+        assert_eq!(
+            stats
+                .iter()
+                .map(|stat| stat.provider_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Provider B", "Provider A"]
+        );
+        assert!(stats.iter().all(|stat| stat.model == "shared-model"));
 
         Ok(())
     }

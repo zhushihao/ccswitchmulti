@@ -119,8 +119,10 @@ pub struct CodexRouterLogEvent {
     pub actual_protocol: Option<String>,
     pub responses_to_chat: Option<bool>,
     pub responses_to_messages: Option<bool>,
+    pub tool: Option<String>,
     pub status: Option<String>,
     pub error: Option<String>,
+    pub reason: Option<String>,
     pub line: String,
 }
 
@@ -135,6 +137,7 @@ pub struct CodexRouterLogDiagnostics {
     pub has_recent_request: bool,
     pub latest_request_at: Option<String>,
     pub latest_error: Option<String>,
+    pub latest_hosted_tool_warning: Option<String>,
     pub recent_events: Vec<CodexRouterLogEvent>,
 }
 
@@ -278,16 +281,33 @@ pub async fn diagnose_codex_multirouter(
     } else {
         proxy_config.listen_port
     };
-    let (socket_ok, socket_detail) = codex_probe_tcp(&probe_host, probe_port).await;
-    let (websocket_status, websocket_detail) =
-        codex_probe_websocket_fallback(&probe_host, probe_port).await;
-
     let live_config = codex_live_config_diagnostics(probe_port);
+    let (socket_ok, socket_detail) = codex_probe_tcp(&probe_host, probe_port).await;
+    let (websocket_status, websocket_detail) = if live_config.supports_websockets == Some(false) {
+        codex_websocket_probe_result(Some(false), Err("probe skipped".to_string()))
+    } else {
+        codex_websocket_probe_result(
+            live_config.supports_websockets,
+            Ok(codex_probe_websocket_fallback(&probe_host, probe_port).await),
+        )
+    };
+
     let route_plan = codex_route_plan_diagnostics(&state, provider_id.as_deref())?;
     let router_log = codex_router_log_diagnostics(route_plan.provider_id.as_deref());
     let desktop_runtime = codex_desktop_runtime_diagnostics(&live_config);
 
     let mut checks = Vec::new();
+    if let Some(warning) =
+        codex_legacy_default_route_warning(route_plan.default_route_id.as_deref())
+    {
+        checks.push(codex_check(
+            "default_route_legacy_ignored",
+            "旧版默认路由字段",
+            CodexDiagnosticStatus::Warn,
+            warning,
+            vec!["defaultRouteId 仅作为兼容字段读取".to_string()],
+        ));
+    }
     checks.push(codex_check(
         "proxy_running",
         "本地代理进程",
@@ -531,6 +551,28 @@ pub async fn diagnose_codex_multirouter(
     ));
     checks.push(codex_network_proxy_diagnostic_check());
     checks.push(codex_check(
+        "hosted_tool_not_called",
+        "Hosted tool 调用",
+        if router_log.latest_hosted_tool_warning.is_some() {
+            CodexDiagnosticStatus::Warn
+        } else {
+            CodexDiagnosticStatus::Info
+        },
+        router_log
+            .latest_hosted_tool_warning
+            .clone()
+            .unwrap_or_else(|| {
+                "未观察到“已投影 hosted tool 但上游未发起调用”的近期事件。".to_string()
+            }),
+        vec![
+            format!(
+                "latest_hosted_tool_warning={:?}",
+                router_log.latest_hosted_tool_warning
+            ),
+            "仅在显式 tool_choice 指向 CCSM hosted tool 时记录".to_string(),
+        ],
+    ));
+    checks.push(codex_check(
         "recent_router_error",
         "近期路由错误",
         if router_log.latest_error.is_some() {
@@ -582,6 +624,20 @@ pub async fn diagnose_codex_multirouter(
 ///
 /// CLI/app-server 不是这个 CDP 入口的启动目标；它们通过 live `config.toml`、
 /// `model_catalog_json`、本地 `/v1/models` 和 MultiRouter 转发链路继续受支持。
+
+#[tauri::command]
+pub async fn get_codex_guardian_status(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<crate::codex_guardian::CodexGuardianStatus, String> {
+    let status = state
+        .proxy_service
+        .codex_guardian_status
+        .lock()
+        .await
+        .clone();
+    Ok(status)
+}
+
 #[tauri::command]
 pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult, String> {
     crate::codex_desktop::unlock_codex_model_picker().await
@@ -769,6 +825,31 @@ async fn codex_probe_websocket_fallback(host: &str, port: u16) -> (CodexDiagnost
                 response.status().as_u16()
             ),
         ),
+        Err(err) => (
+            CodexDiagnosticStatus::Fail,
+            format!("本地代理 WebSocket 探针失败：{err}"),
+        ),
+    }
+}
+
+/// 将 WebSocket 探针结果与 live config 的传输策略合并。
+///
+/// HTTP-only provider 不需要探测 WebSocket；即使旧版探针或本地 relay 返回错误，
+/// 也不能把它报告成阻塞项，因为 Codex 应直接走 HTTP Responses。
+fn codex_websocket_probe_result(
+    supports_websockets: Option<bool>,
+    probe: Result<(CodexDiagnosticStatus, String), String>,
+) -> (CodexDiagnosticStatus, String) {
+    if supports_websockets == Some(false) {
+        return (
+            CodexDiagnosticStatus::Pass,
+            "live config 已禁用 Responses WebSocket，已跳过 WebSocket 探针，Codex 应直接走 HTTP Responses。"
+                .to_string(),
+        );
+    }
+
+    match probe {
+        Ok(result) => result,
         Err(err) => (
             CodexDiagnosticStatus::Fail,
             format!("本地代理 WebSocket 探针失败：{err}"),
@@ -1074,6 +1155,8 @@ struct RawWindowsCodexProcess {
 fn query_codex_processes() -> (Vec<CodexAppServerProcessDiagnostics>, Option<String>) {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
         let script = r#"
 Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'codex.exe'" |
   Select-Object ProcessId,Name,ExecutablePath,CommandLine,@{Name='StartedAt';Expression={$_.CreationDate.ToLocalTime().ToString('o')}} |
@@ -1081,6 +1164,7 @@ Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'codex.exe'"
 "#;
         let output = match Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             Ok(output) => output,
@@ -1166,6 +1250,20 @@ fn codex_url_points_to_local_proxy(url: &str, proxy_port: u16) -> bool {
     };
     let is_local_host = matches!(host, "127.0.0.1" | "localhost" | "::1");
     is_local_host && parsed.port_or_known_default() == Some(proxy_port)
+}
+
+/// Explain the compatibility-only status of a legacy default route field.
+///
+/// The current V2 resolver is fail-closed, so retaining this field must never
+/// be presented as an active fallback. Only the route id is echoed; credentials,
+/// endpoints and provider settings are intentionally excluded from diagnostics.
+fn codex_legacy_default_route_warning(default_route_id: Option<&str>) -> Option<String> {
+    let route_id = default_route_id?.trim();
+    (!route_id.is_empty()).then(|| {
+        format!(
+            "default_route_legacy_ignored: 当前版本未命中请求会被拒绝；defaultRouteId 仅作为旧版兼容字段保留（route id `{route_id}`）。"
+        )
+    })
 }
 
 /// 读取当前页面选择的 MultiRouter provider，并汇总 `codexRouting` 规则。
@@ -1394,6 +1492,7 @@ fn codex_router_log_diagnostics(provider_id: Option<&str>) -> CodexRouterLogDiag
                 has_recent_request: false,
                 latest_request_at: None,
                 latest_error: None,
+                latest_hosted_tool_warning: None,
                 recent_events: Vec::new(),
             };
         }
@@ -1441,6 +1540,8 @@ fn codex_router_log_diagnostics_from_text_at(
         .find(|event| codex_router_log_is_request_event(event))
         .map(|event| event.timestamp.clone());
     let latest_error = latest_unresolved_router_error(&recent_events, now, recent_window);
+    let latest_hosted_tool_warning =
+        latest_hosted_tool_not_called_warning(&recent_events, now, recent_window);
     let has_recent_request = recent_events
         .iter()
         .filter(|event| codex_router_log_event_is_recent(event, now, recent_window))
@@ -1455,6 +1556,7 @@ fn codex_router_log_diagnostics_from_text_at(
         has_recent_request,
         latest_request_at,
         latest_error,
+        latest_hosted_tool_warning,
         recent_events,
     }
 }
@@ -1536,6 +1638,26 @@ fn latest_unresolved_router_error(
     None
 }
 
+/// 找出近期“hosted tool 已投影但上游未调用”的诊断事件。
+fn latest_hosted_tool_not_called_warning(
+    events_newest_first: &[CodexRouterLogEvent],
+    now: chrono::NaiveDateTime,
+    window: chrono::Duration,
+) -> Option<String> {
+    events_newest_first
+        .iter()
+        .find(|event| {
+            event.event == "hosted_tool_not_called"
+                && codex_router_log_event_is_recent(event, now, window)
+        })
+        .map(|event| {
+            let tool = event.tool.as_deref().unwrap_or("hosted tool");
+            format!(
+                "上游已收到 {tool} hosted tool，但返回成功响应时没有发起 function call；优先检查该模型或网关的 function calling 支持。"
+            )
+        })
+}
+
 /// 判断日志事件是否代表该 route/provider/model 已恢复成功。
 fn codex_router_log_event_is_success(event: &CodexRouterLogEvent) -> bool {
     if event.event == "response_ready" {
@@ -1610,8 +1732,10 @@ fn codex_parse_router_log_line(line: &str) -> Option<CodexRouterLogEvent> {
         actual_protocol,
         responses_to_chat,
         responses_to_messages,
+        tool: fields.get("tool").cloned(),
         status: fields.get("status").cloned(),
         error,
+        reason: fields.get("reason").cloned(),
         line: line.to_string(),
     })
 }
@@ -1671,6 +1795,38 @@ fn codex_router_log_protocol_from_path(value: &str) -> Option<&'static str> {
 mod codex_router_log_diagnostics_tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn disabled_websocket_transport_does_not_report_probe_failure() {
+        let (status, detail) =
+            codex_websocket_probe_result(Some(false), Err("probe failed".to_string()));
+
+        assert_eq!(status, CodexDiagnosticStatus::Pass);
+        assert!(detail.contains("已禁用"));
+    }
+
+    #[test]
+    fn legacy_default_route_warning_is_secret_free_and_explicitly_fail_closed() {
+        let warning = codex_legacy_default_route_warning(Some("legacy-route"))
+            .expect("legacy default route should produce a warning");
+
+        assert!(warning.starts_with("default_route_legacy_ignored:"));
+        assert!(warning.contains("请求会被拒绝"));
+        assert!(warning.contains("legacy-route"));
+        assert!(!warning.contains("OPENAI_API_KEY"));
+        assert!(!warning.contains("https://"));
+        assert_eq!(codex_legacy_default_route_warning(Some("  ")), None);
+        assert_eq!(codex_legacy_default_route_warning(None), None);
+    }
+
+    #[test]
+    fn enabled_websocket_transport_keeps_probe_failure_visible() {
+        let (status, detail) =
+            codex_websocket_probe_result(Some(true), Err("probe failed".to_string()));
+
+        assert_eq!(status, CodexDiagnosticStatus::Fail);
+        assert!(detail.contains("probe failed"));
+    }
 
     /// 返回测试专用的环境变量锁，避免并行测试互相污染代理变量。
     fn proxy_env_test_lock() -> &'static Mutex<()> {
@@ -1770,6 +1926,49 @@ mod codex_router_log_diagnostics_tests {
             diagnostics.latest_error.as_deref(),
             Some("qwen_gateway_error")
         );
+    }
+
+    #[test]
+    fn hosted_tool_not_called_is_reported_only_inside_recent_window() {
+        let text = concat!(
+            "2026-06-13 00:20:00.000 event=hosted_tool_not_called trace=a model=qwen3.8 provider=codex-openai-router::route::qwen-local tool=web_search status=not_called reason=upstream_returned_success_without_hosted_tool_call streaming=false\n",
+        );
+        let recent_now = chrono::NaiveDateTime::parse_from_str(
+            "2026-06-13 00:24:36.000",
+            "%Y-%m-%d %H:%M:%S%.f",
+        )
+        .expect("valid test time");
+        let recent = codex_router_log_diagnostics_from_text_at(
+            "codex-router.log".to_string(),
+            true,
+            text,
+            Some("codex-openai-router"),
+            recent_now,
+        );
+        assert_eq!(
+            recent.latest_hosted_tool_warning.as_deref(),
+            Some(
+                "上游已收到 web_search hosted tool，但返回成功响应时没有发起 function call；优先检查该模型或网关的 function calling 支持。"
+            )
+        );
+        assert_eq!(
+            recent.recent_events[0].reason.as_deref(),
+            Some("upstream_returned_success_without_hosted_tool_call")
+        );
+
+        let stale_now = chrono::NaiveDateTime::parse_from_str(
+            "2026-06-13 01:00:00.000",
+            "%Y-%m-%d %H:%M:%S%.f",
+        )
+        .expect("valid test time");
+        let stale = codex_router_log_diagnostics_from_text_at(
+            "codex-router.log".to_string(),
+            true,
+            text,
+            Some("codex-openai-router"),
+            stale_now,
+        );
+        assert_eq!(stale.latest_hosted_tool_warning, None);
     }
 
     #[test]
@@ -2182,6 +2381,9 @@ fn codex_next_action(
                 "请求已经进入 MultiRouter，优先展开近期 router 日志定位上游或转换层错误。"
                     .to_string()
             }
+            "hosted_tool_not_called" => {
+                "CCSM 已把 hosted tool 投影给上游；请检查该模型/网关是否支持 OpenAI-compatible function calling，不能由 CCSM 代替模型强行生成调用。".to_string()
+            }
             _ => check.detail.clone(),
         };
     }
@@ -2297,6 +2499,10 @@ pub async fn update_global_proxy_config(
     config: GlobalProxyConfig,
 ) -> Result<(), String> {
     let db = &state.db;
+    let previous_config = db
+        .get_global_proxy_config()
+        .await
+        .map_err(|e| e.to_string())?;
     // 全局开关只控制本地服务是否应运行，不能绕过 per-app takeover 的恢复流程。
     // 如果直接在接管中关掉总开关，Codex/Claude/Gemini 的 live 配置会继续指向
     // 127.0.0.1，但代理服务不再启动，客户端侧表现就是所有模型请求超时。
@@ -2313,9 +2519,23 @@ pub async fn update_global_proxy_config(
         }
     }
 
+    let codex_proxy_policy_changed =
+        previous_config.codex_respect_system_proxy != config.codex_respect_system_proxy;
     db.update_global_proxy_config(config)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    if codex_proxy_policy_changed {
+        if let Err(error) = state
+            .proxy_service
+            .sync_codex_system_proxy_policy_while_takeover_active()
+        {
+            let _ = db.update_global_proxy_config(previous_config).await;
+            return Err(error);
+        }
+    }
+
+    Ok(())
 }
 
 /// 获取指定应用的代理配置

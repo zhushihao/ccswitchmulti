@@ -160,6 +160,10 @@ impl ProxyServer {
         status.running = true;
         status.address = self.config.listen_address.clone();
         status.port = actual_port;
+        status.app = Some("ccswitchmulti".to_string());
+        status.version = Some(env!("CARGO_PKG_VERSION").to_string());
+        status.pid = Some(std::process::id());
+        status.instance_id = Some(uuid::Uuid::new_v4().to_string());
         drop(status);
 
         // 记录启动时间
@@ -668,6 +672,7 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/v1/models")
+                    .header("x-cc-switch-external-openai-api", "1")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -689,6 +694,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri("/v1/images/generations")
+                    .header("x-cc-switch-external-openai-api", "1")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"model":"gpt-image-1","prompt":"ping"}"#))
                     .expect("request"),
@@ -1366,6 +1372,7 @@ base_url = "http://127.0.0.1:15721/v1"
                 Request::builder()
                     .method(Method::POST)
                     .uri("/v1/responses")
+                    .header("x-cc-switch-external-openai-api", "1")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({

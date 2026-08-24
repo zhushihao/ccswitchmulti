@@ -8,7 +8,7 @@ mod live;
 mod usage;
 
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
 
@@ -31,10 +31,12 @@ pub use live::{
 // Internal re-exports (pub(crate))
 pub(crate) use live::sanitize_claude_settings_for_live;
 pub(crate) use live::{
-    build_effective_settings_with_common_config, normalize_provider_common_config_for_storage,
-    provider_exists_in_live_config, strip_common_config_from_live_settings,
-    sync_current_provider_for_app_to_live, write_codex_config_only_with_common_config,
-    write_live_with_common_config,
+    build_effective_settings_with_common_config,
+    build_effective_settings_with_common_config_for_backup,
+    normalize_provider_common_config_for_storage, provider_exists_in_live_config,
+    strip_common_config_from_live_settings, sync_current_provider_for_app_to_live,
+    write_codex_config_only_with_common_config_with_receipt, write_live_with_common_config,
+    write_live_with_common_config_with_receipt,
 };
 
 // Internal re-exports
@@ -43,6 +45,180 @@ use live::{
     remove_opencode_provider_from_live, write_gemini_live,
 };
 use usage::validate_usage_script;
+
+#[cfg(test)]
+static TEST_FORCE_REPAIR_ROLLBACK_MUTATION: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_FORCE_REPAIR_COMPANION_AFTER_SWITCH_MUTATION: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::path::PathBuf, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_FORCE_REPAIR_FINALIZE_MUTATION: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_FORCE_REPAIR_AUTH_AFTER_SWITCH_MUTATION: std::sync::OnceLock<
+    std::sync::Mutex<Option<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_FORCE_REPAIR_FINALIZE_ERROR: std::sync::OnceLock<std::sync::Mutex<bool>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_FORCE_REPAIR_COMPANION_ROLLBACK_MUTATION: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::path::PathBuf, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_FORCE_REPAIR_CURRENT_AFTER_SWITCH_MUTATION: std::sync::OnceLock<
+    std::sync::Mutex<Option<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_FORCE_REPAIR_CONFIG_AFTER_SWITCH_MUTATION: std::sync::OnceLock<
+    std::sync::Mutex<Option<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct CodexSwitchWriterBoundaryMutation {
+    config: Option<String>,
+    auth: Option<String>,
+    companion: Option<(std::path::PathBuf, String)>,
+}
+
+#[cfg(test)]
+static TEST_CODEX_SWITCH_WRITER_BOUNDARY_MUTATION: std::sync::OnceLock<
+    std::sync::Mutex<Option<CodexSwitchWriterBoundaryMutation>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn maybe_mutate_force_repair_live_before_rollback(path: &std::path::Path) {
+    let next = TEST_FORCE_REPAIR_ROLLBACK_MUTATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock force-repair rollback mutation")
+        .take();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated rollback-time user change");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_force_repair_companion_after_switch() {
+    let next = TEST_FORCE_REPAIR_COMPANION_AFTER_SWITCH_MUTATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock force-repair companion after-switch mutation")
+        .take();
+    if let Some((path, contents)) = next {
+        std::fs::write(path, contents)
+            .expect("write simulated companion update before force-repair finish");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_force_repair_before_finalize(path: &std::path::Path) {
+    let next = TEST_FORCE_REPAIR_FINALIZE_MUTATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock force-repair finalize mutation")
+        .take();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated force-repair finalize mutation");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_force_repair_auth_after_switch(path: &std::path::Path) {
+    let next = TEST_FORCE_REPAIR_AUTH_AFTER_SWITCH_MUTATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock force-repair auth after-switch mutation")
+        .take();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated auth after force-repair switch");
+    }
+}
+
+#[cfg(test)]
+fn take_force_repair_finalize_error() -> bool {
+    let queue = TEST_FORCE_REPAIR_FINALIZE_ERROR.get_or_init(|| std::sync::Mutex::new(false));
+    let mut guard = queue.lock().expect("lock force-repair finalize error");
+    let value = *guard;
+    *guard = false;
+    value
+}
+
+#[cfg(test)]
+fn maybe_mutate_force_repair_companion_before_rollback() {
+    let next = TEST_FORCE_REPAIR_COMPANION_ROLLBACK_MUTATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock force-repair companion rollback mutation")
+        .take();
+    if let Some((path, contents)) = next {
+        std::fs::write(path, contents)
+            .expect("write simulated companion update before force-repair rollback");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_force_repair_current_after_switch(state: &AppState) {
+    let next = TEST_FORCE_REPAIR_CURRENT_AFTER_SWITCH_MUTATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock force-repair current after-switch mutation")
+        .take();
+    if let Some(provider_id) = next {
+        state
+            .db
+            .set_current_provider(AppType::Codex.as_str(), &provider_id)
+            .expect("write simulated external DB current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&provider_id))
+            .expect("write simulated external local current provider");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_force_repair_config_after_switch(path: &std::path::Path) {
+    let next = TEST_FORCE_REPAIR_CONFIG_AFTER_SWITCH_MUTATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock force-repair config after-switch mutation")
+        .take();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated external config update");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_switch_after_writers() {
+    let next = TEST_CODEX_SWITCH_WRITER_BOUNDARY_MUTATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock Codex switch writer boundary mutation")
+        .take();
+    let Some(mutation) = next else {
+        return;
+    };
+    if let Some(contents) = mutation.config {
+        std::fs::write(crate::codex_config::get_codex_config_path(), contents)
+            .expect("write simulated external Codex config at writer boundary");
+    }
+    if let Some(contents) = mutation.auth {
+        std::fs::write(crate::codex_config::get_codex_auth_path(), contents)
+            .expect("write simulated external Codex auth at writer boundary");
+    }
+    if let Some((path, contents)) = mutation.companion {
+        std::fs::write(path, contents)
+            .expect("write simulated external Codex companion at writer boundary");
+    }
+}
 
 /// The built-in Codex official provider is safe to select during takeover:
 /// Codex keeps ownership of its ChatGPT login and the proxy only forwards the
@@ -109,6 +285,141 @@ pub fn reapply_current_codex_official_live(state: &AppState) -> Result<bool, App
 /// Provider business logic service
 pub struct ProviderService;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentV2ProjectionStatus {
+    Applied,
+    NotRequired,
+    PendingRetry,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentV2ProjectionWarning {
+    pub code: &'static str,
+    pub message: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentV2ProjectionOutcome {
+    pub status: CodexSubagentV2ProjectionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<CodexSubagentV2ProjectionWarning>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentV2RoleFilesStatus {
+    Verified,
+    NotRequired,
+    PendingRetry,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentV2ActivationBoundary {
+    RestartCodexAndStartNewSession,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentV2WriteVerification {
+    pub database_persisted: bool,
+    pub role_files_status: CodexSubagentV2RoleFilesStatus,
+    pub role_files: Vec<crate::codex_config::CodexSubagentRoleFileVerification>,
+    pub activation: CodexSubagentV2ActivationBoundary,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentV2MutationResult {
+    #[serde(flatten)]
+    pub provider: Provider,
+    pub projection: CodexSubagentV2ProjectionOutcome,
+    pub verification: CodexSubagentV2WriteVerification,
+}
+
+const CODEX_LIVE_PROJECTION_RETRY_CODE: &str = "codex_live_projection_pending_retry";
+const CODEX_LIVE_PROJECTION_RETRY_MESSAGE: &str = "数据库已保存，Codex live 投影待重试。";
+const CODEX_CURRENT_PROVIDER_LOOKUP_RETRY_CODE: &str =
+    "codex_current_provider_lookup_pending_retry";
+const CODEX_CURRENT_PROVIDER_LOOKUP_RETRY_MESSAGE: &str =
+    "数据库已保存，暂时无法确认当前 Codex Provider，live 投影待重试。";
+
+fn codex_subagent_v2_projection_warning(
+    code: &'static str,
+    message: &'static str,
+) -> CodexSubagentV2ProjectionWarning {
+    CodexSubagentV2ProjectionWarning { code, message }
+}
+
+fn codex_subagent_v2_write_verification(
+    state: &AppState,
+    settings: &Value,
+    projection_status: CodexSubagentV2ProjectionStatus,
+) -> CodexSubagentV2WriteVerification {
+    let (role_files_status, role_files) = match projection_status {
+        CodexSubagentV2ProjectionStatus::NotRequired => {
+            (CodexSubagentV2RoleFilesStatus::NotRequired, Vec::new())
+        }
+        CodexSubagentV2ProjectionStatus::PendingRetry => {
+            (CodexSubagentV2RoleFilesStatus::PendingRetry, Vec::new())
+        }
+        CodexSubagentV2ProjectionStatus::Applied => {
+            let checks =
+                crate::codex_config::codex_provider_classification_context(state.db.as_ref())
+                    .and_then(|context| {
+                        crate::codex_config::verify_codex_subagent_role_files(
+                            settings,
+                            Some(&context),
+                        )
+                    });
+            match checks {
+                Ok(files) if files.iter().all(|file| file.exists && file.content_matches) => {
+                    (CodexSubagentV2RoleFilesStatus::Verified, files)
+                }
+                Ok(files) => (CodexSubagentV2RoleFilesStatus::Failed, files),
+                Err(error) => {
+                    log::warn!(
+                        "Codex V2 子 Agent live 投影完成但文件回读验证失败，error_kind={}",
+                        app_error_diagnostic_kind(&error)
+                    );
+                    (CodexSubagentV2RoleFilesStatus::Failed, Vec::new())
+                }
+            }
+        }
+    };
+    CodexSubagentV2WriteVerification {
+        database_persisted: true,
+        role_files_status,
+        role_files,
+        activation: CodexSubagentV2ActivationBoundary::RestartCodexAndStartNewSession,
+    }
+}
+
+fn app_error_diagnostic_kind(error: &AppError) -> &'static str {
+    match error {
+        AppError::Config(_) => "config",
+        AppError::InvalidInput(_) => "invalid_input",
+        AppError::Io { .. } => "io",
+        AppError::IoContext { .. } => "io_context",
+        AppError::Json { .. } => "json",
+        AppError::JsonSerialize { .. } => "json_serialize",
+        AppError::Toml { .. } => "toml",
+        AppError::Lock(_) => "lock",
+        AppError::McpValidation(_) => "mcp_validation",
+        AppError::Message(_) => "message",
+        AppError::HttpStatus { .. } => "http_status",
+        AppError::Localized { .. } => "localized",
+        AppError::Database(_) => "database",
+        AppError::OmoConfigNotFound => "omo_config_not_found",
+        AppError::AllProvidersCircuitOpen => "all_providers_circuit_open",
+        AppError::NoProvidersConfigured => "no_providers_configured",
+    }
+}
+
 /// 在同步的 provider 命令里安全等待异步代理任务。
 ///
 /// Tauri 的同步 command 不一定处在 Tokio reactor 中；直接用
@@ -131,18 +442,321 @@ where
 #[serde(rename_all = "camelCase")]
 pub struct SwitchResult {
     pub warnings: Vec<String>,
+    #[serde(skip)]
+    pub(crate) codex_receipt: Option<CodexSwitchReceipt>,
+    #[serde(skip)]
+    pub(crate) codex_provider_receipt: Option<crate::codex_config::CodexProviderWriteReceipt>,
+    #[serde(skip)]
+    pub(crate) codex_mcp_receipt: Option<crate::codex_config::CodexProviderWriteReceipt>,
+    #[serde(skip)]
+    pub(crate) codex_auth_cleanup_attempt: Option<crate::codex_config::CodexAuthWriteAttempt>,
+}
+
+/// The complete ownership proof for a Codex provider switch.  The ordinary
+/// provider writer returns exact config/auth/companion receipts.  Takeover and
+/// hot-switch helpers historically hid those writes behind the proxy service,
+/// so this outer receipt also records a coherent before/after boundary for
+/// every Codex file and for proxy/backup/current state.  Force-repair can then
+/// compensate only the versions still equal to this switch attempt's output.
+#[derive(Debug)]
+pub(crate) struct CodexSwitchReceipt {
+    pub(crate) provider_receipts: Vec<crate::codex_config::CodexProviderWriteReceipt>,
+    pub(crate) auth_attempts: Vec<crate::codex_config::CodexAuthWriteAttempt>,
+    pub(crate) auth_cleanup_attempt: Option<crate::codex_config::CodexAuthWriteAttempt>,
+    pub(crate) before: CodexSwitchStateSnapshot,
+    pub(crate) after: CodexSwitchStateSnapshot,
+}
+
+/// Mutation receipts returned by the proxy helpers used by Codex's three
+/// special switch branches.  Every field is either a typed file-writer proof
+/// or the value known at the point where the corresponding DB/runtime write
+/// completed; no field is populated by a later state recapture.
+#[derive(Debug, Default)]
+pub(crate) struct CodexSwitchMutationReceipt {
+    pub(crate) provider_receipts: Vec<crate::codex_config::CodexProviderWriteReceipt>,
+    pub(crate) mcp_receipts: Vec<crate::codex_config::CodexProviderWriteReceipt>,
+    pub(crate) auth_attempts: Vec<crate::codex_config::CodexAuthWriteAttempt>,
+    pub(crate) backup_after: Option<Option<crate::proxy::types::LiveBackup>>,
+    pub(crate) proxy_config_after: Option<crate::proxy::types::AppProxyConfig>,
+    pub(crate) global_takeover_active_after: Option<bool>,
+    pub(crate) db_current_after: Option<Option<String>>,
+    pub(crate) local_current_after: Option<Option<String>>,
+    pub(crate) proxy_running_after: Option<bool>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CodexSwitchStateSnapshot {
+    pub(crate) config: crate::codex_config::ExactCodexSnapshot,
+    pub(crate) auth: crate::codex_config::ExactCodexSnapshot,
+    pub(crate) companions: crate::codex_config::CodexProjectionSnapshot,
+    pub(crate) proxy_config: crate::proxy::types::AppProxyConfig,
+    pub(crate) live_backup: Option<crate::proxy::types::LiveBackup>,
+    pub(crate) global_takeover_active: bool,
+    pub(crate) db_current: Option<String>,
+    pub(crate) local_current: Option<String>,
+    pub(crate) proxy_running: bool,
+}
+
+impl CodexSwitchStateSnapshot {
+    fn capture(state: &AppState) -> Result<Self, AppError> {
+        let config_path = crate::codex_config::get_codex_config_path();
+        let auth_path = crate::codex_config::get_codex_auth_path();
+        Ok(Self {
+            config: crate::codex_config::ExactCodexSnapshot::read(&config_path)?,
+            auth: crate::codex_config::ExactCodexSnapshot::read(&auth_path)?,
+            companions: crate::codex_config::CodexProjectionSnapshot::capture()?,
+            proxy_config: block_on_tauri_runtime(
+                state.db.get_proxy_config_for_app(AppType::Codex.as_str()),
+            )?,
+            live_backup: block_on_tauri_runtime(state.db.get_live_backup(AppType::Codex.as_str()))?,
+            global_takeover_active: block_on_tauri_runtime(state.db.is_live_takeover_active())?,
+            db_current: state.db.get_current_provider(AppType::Codex.as_str())?,
+            local_current: crate::settings::get_current_provider(&AppType::Codex),
+            proxy_running: block_on_tauri_runtime(state.proxy_service.is_running()),
+        })
+    }
+
+    fn after_from_mutation(
+        before: &CodexSwitchStateSnapshot,
+        mutation: &CodexSwitchMutationReceipt,
+        auth_cleanup_attempt: Option<&crate::codex_config::CodexAuthWriteAttempt>,
+    ) -> Self {
+        let mut after = CodexSwitchStateSnapshot {
+            config: before.config.clone(),
+            auth: before.auth.clone(),
+            companions: before.companions.clone(),
+            proxy_config: before.proxy_config.clone(),
+            live_backup: before.live_backup.clone(),
+            global_takeover_active: before.global_takeover_active,
+            db_current: before.db_current.clone(),
+            local_current: before.local_current.clone(),
+            proxy_running: before.proxy_running,
+        };
+
+        let mut companion_attempts = Vec::new();
+        for receipt in mutation
+            .provider_receipts
+            .iter()
+            .chain(mutation.mcp_receipts.iter())
+        {
+            after.config = crate::codex_config::ExactCodexSnapshot::from_fingerprint(
+                receipt.projection.config_attempt.after_fingerprint,
+            );
+            if let Some(auth_attempt) = receipt.auth_attempt.as_ref() {
+                after.auth = crate::codex_config::ExactCodexSnapshot::from_fingerprint(
+                    auth_attempt.written_fingerprint,
+                );
+            }
+            companion_attempts.push(&receipt.projection.companion_attempt);
+        }
+        for auth_attempt in &mutation.auth_attempts {
+            after.auth = crate::codex_config::ExactCodexSnapshot::from_fingerprint(
+                auth_attempt.written_fingerprint,
+            );
+        }
+        if let Some(auth_attempt) = auth_cleanup_attempt {
+            after.auth = crate::codex_config::ExactCodexSnapshot::from_fingerprint(
+                auth_attempt.written_fingerprint,
+            );
+        }
+        after.companions = before.companions.overlay_attempt_after(&companion_attempts);
+
+        if let Some(backup) = mutation.backup_after.as_ref() {
+            after.live_backup = backup.clone();
+        }
+        if let Some(proxy_config) = mutation.proxy_config_after.as_ref() {
+            after.proxy_config = proxy_config.clone();
+        }
+        if let Some(active) = mutation.global_takeover_active_after {
+            after.global_takeover_active = active;
+        }
+        if let Some(current) = mutation.db_current_after.as_ref() {
+            after.db_current = current.clone();
+        }
+        if let Some(current) = mutation.local_current_after.as_ref() {
+            after.local_current = current.clone();
+        }
+        if let Some(running) = mutation.proxy_running_after {
+            after.proxy_running = running;
+        }
+        after
+    }
+
+    fn same_proxy_config(
+        left: &crate::proxy::types::AppProxyConfig,
+        right: &crate::proxy::types::AppProxyConfig,
+    ) -> bool {
+        left.app_type == right.app_type
+            && left.enabled == right.enabled
+            && left.auto_failover_enabled == right.auto_failover_enabled
+            && left.max_retries == right.max_retries
+            && left.streaming_first_byte_timeout == right.streaming_first_byte_timeout
+            && left.streaming_idle_timeout == right.streaming_idle_timeout
+            && left.non_streaming_timeout == right.non_streaming_timeout
+            && left.circuit_failure_threshold == right.circuit_failure_threshold
+            && left.circuit_success_threshold == right.circuit_success_threshold
+            && left.circuit_timeout_seconds == right.circuit_timeout_seconds
+            && left.circuit_error_rate_threshold == right.circuit_error_rate_threshold
+            && left.circuit_min_requests == right.circuit_min_requests
+    }
+
+    fn same_backup(
+        left: &Option<crate::proxy::types::LiveBackup>,
+        right: &Option<crate::proxy::types::LiveBackup>,
+    ) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                left.app_type == right.app_type
+                    && left.original_config == right.original_config
+                    && left.backed_up_at == right.backed_up_at
+            }
+            _ => false,
+        }
+    }
+
+    fn restore_files_if_unchanged(
+        &self,
+        before: &CodexSwitchStateSnapshot,
+        provider_receipts: &[crate::codex_config::CodexProviderWriteReceipt],
+        auth_attempts: &[crate::codex_config::CodexAuthWriteAttempt],
+        auth_cleanup_attempt: Option<&crate::codex_config::CodexAuthWriteAttempt>,
+        state: &AppState,
+    ) -> Result<bool, AppError> {
+        // A normal provider switch already exposes the exact commit receipt for
+        // config/auth/companions.  Use that receipt as the ownership proof instead
+        // of rebuilding a weaker proof from the outer after snapshot.  The outer
+        // snapshot remains the fallback for takeover/hot-switch helpers whose
+        // writes are hidden behind the proxy service.
+        let (config_ok, auth_ok, companions_ok) = if !provider_receipts.is_empty() {
+            let mut config_ok = true;
+            let mut auth_ok = true;
+            let mut companions_ok = true;
+            for receipt in provider_receipts.iter().rev() {
+                config_ok &= receipt
+                    .projection
+                    .config_attempt
+                    .restore_if_unchanged(&crate::codex_config::get_codex_config_path())?;
+                companions_ok &= receipt
+                    .projection
+                    .companion_attempt
+                    .restore_if_unchanged()?;
+                if let Some(attempt) = receipt.auth_attempt.as_ref() {
+                    auth_ok &=
+                        attempt.restore_if_unchanged(&crate::codex_config::get_codex_auth_path())?;
+                }
+            }
+            for attempt in auth_attempts.iter().rev() {
+                auth_ok &=
+                    attempt.restore_if_unchanged(&crate::codex_config::get_codex_auth_path())?;
+            }
+            if let Some(attempt) = auth_cleanup_attempt {
+                auth_ok &=
+                    attempt.restore_if_unchanged(&crate::codex_config::get_codex_auth_path())?;
+            }
+            (config_ok, auth_ok, companions_ok)
+        } else {
+            let config_attempt = crate::codex_config::CommittedCodexAttempt {
+                before: before.config.clone(),
+                after_fingerprint: self.config.fingerprint(),
+            };
+            let auth_attempt = crate::codex_config::CommittedCodexAttempt {
+                before: before.auth.clone(),
+                after_fingerprint: self.auth.fingerprint(),
+            };
+            let config_ok = config_attempt
+                .restore_if_unchanged(&crate::codex_config::get_codex_config_path())?;
+            let auth_ok = if let Some(attempt) = auth_cleanup_attempt {
+                attempt.restore_if_unchanged(&crate::codex_config::get_codex_auth_path())?
+            } else {
+                auth_attempt.restore_if_unchanged(&crate::codex_config::get_codex_auth_path())?
+            };
+            let companions_ok = before.companions.restore_if_unchanged(&self.companions)?;
+            (config_ok, auth_ok, companions_ok)
+        };
+
+        let current = Self::capture(state)?;
+        let proxy_config_owned = Self::same_proxy_config(&current.proxy_config, &self.proxy_config);
+        let backup_owned = Self::same_backup(&current.live_backup, &self.live_backup);
+        let global_takeover_owned = current.global_takeover_active == self.global_takeover_active;
+        let db_current_owned = current.db_current == self.db_current;
+        let local_current_owned = current.local_current == self.local_current;
+        let proxy_running_owned = current.proxy_running == self.proxy_running;
+
+        // Restore each runtime component independently.  An external current
+        // pointer (or a separate backup/proxy edit) must not block compensation
+        // for the other components that this switch still owns.
+        if proxy_config_owned {
+            block_on_tauri_runtime(
+                state
+                    .db
+                    .update_proxy_config_for_app(before.proxy_config.clone()),
+            )?;
+        }
+        if backup_owned {
+            match &before.live_backup {
+                Some(backup) => block_on_tauri_runtime(
+                    state
+                        .db
+                        .save_live_backup(AppType::Codex.as_str(), &backup.original_config),
+                )?,
+                None => {
+                    block_on_tauri_runtime(state.db.delete_live_backup(AppType::Codex.as_str()))?
+                }
+            }
+        }
+        if global_takeover_owned {
+            block_on_tauri_runtime(
+                state
+                    .db
+                    .set_live_takeover_active(before.global_takeover_active),
+            )?;
+        }
+        if proxy_running_owned && self.proxy_running != before.proxy_running {
+            if before.proxy_running {
+                block_on_tauri_runtime(state.proxy_service.start())
+                    .map_err(|error| AppError::Message(format!("恢复 Codex 代理失败: {error}")))?;
+            } else {
+                block_on_tauri_runtime(state.proxy_service.stop())
+                    .map_err(|error| AppError::Message(format!("停止 Codex 代理失败: {error}")))?;
+            }
+        }
+        Ok(config_ok
+            && auth_ok
+            && companions_ok
+            && proxy_config_owned
+            && backup_owned
+            && global_takeover_owned
+            && db_current_owned
+            && local_current_owned
+            && proxy_running_owned)
+    }
+}
+
+/// Outcome of the explicit Codex recovery action shown after a failed switch.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexForceRepairOutcome {
+    pub provider_id: String,
+    pub backup_directory: String,
+    pub repaired_fields: Vec<String>,
+    pub repaired_models: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_config::{McpApps, McpServer};
     #[cfg(any(target_os = "macos", windows))]
     use crate::claude_desktop_config::PROFILE_ID;
     use crate::config::{get_claude_settings_path, read_json_file, write_json_file};
     use crate::database::Database;
     #[cfg(any(target_os = "macos", windows))]
     use crate::provider::{ClaudeDesktopMode, ClaudeDesktopModelRoute};
-    use crate::provider::{ProviderMeta, UsageScript};
+    use crate::provider::{
+        CodexModelConfig, ProviderMeta, UniversalProvider, UniversalProviderModels, UsageScript,
+    };
     use crate::proxy::types::ProxyConfig;
     use crate::store::AppState;
     use serde_json::json;
@@ -265,6 +879,129 @@ mod tests {
         result
     }
 
+    #[cfg(test)]
+    fn set_force_repair_rollback_mutation(contents: &str) {
+        *super::TEST_FORCE_REPAIR_ROLLBACK_MUTATION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lock force-repair rollback mutation") = Some(contents.to_string());
+    }
+
+    #[cfg(test)]
+    fn set_force_repair_companion_after_switch_mutation(path: &Path, contents: &str) {
+        *super::TEST_FORCE_REPAIR_COMPANION_AFTER_SWITCH_MUTATION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lock force-repair companion after-switch mutation") =
+            Some((path.to_path_buf(), contents.to_string()));
+    }
+
+    #[cfg(test)]
+    fn set_force_repair_finalize_mutation(contents: &str) {
+        *super::TEST_FORCE_REPAIR_FINALIZE_MUTATION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lock force-repair finalize mutation") = Some(contents.to_string());
+    }
+
+    #[cfg(test)]
+    fn set_force_repair_finalize_error() {
+        *super::TEST_FORCE_REPAIR_FINALIZE_ERROR
+            .get_or_init(|| std::sync::Mutex::new(false))
+            .lock()
+            .expect("lock force-repair finalize error") = true;
+    }
+
+    #[cfg(test)]
+    fn set_force_repair_auth_after_switch_mutation(contents: &str) {
+        *super::TEST_FORCE_REPAIR_AUTH_AFTER_SWITCH_MUTATION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lock force-repair auth after-switch mutation") = Some(contents.to_string());
+    }
+
+    #[cfg(test)]
+    fn set_force_repair_companion_rollback_mutation(path: &Path, contents: &str) {
+        *super::TEST_FORCE_REPAIR_COMPANION_ROLLBACK_MUTATION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lock force-repair companion rollback mutation") =
+            Some((path.to_path_buf(), contents.to_string()));
+    }
+
+    #[cfg(test)]
+    fn set_force_repair_current_after_switch_mutation(provider_id: &str) {
+        *super::TEST_FORCE_REPAIR_CURRENT_AFTER_SWITCH_MUTATION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lock force-repair current after-switch mutation") =
+            Some(provider_id.to_string());
+    }
+
+    #[cfg(test)]
+    fn set_force_repair_config_after_switch_mutation(contents: &str) {
+        *super::TEST_FORCE_REPAIR_CONFIG_AFTER_SWITCH_MUTATION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lock force-repair config after-switch mutation") = Some(contents.to_string());
+    }
+
+    #[cfg(test)]
+    fn set_codex_switch_writer_boundary_mutation(
+        config: Option<&str>,
+        auth: Option<&str>,
+        companion: Option<(&Path, &str)>,
+    ) {
+        *super::TEST_CODEX_SWITCH_WRITER_BOUNDARY_MUTATION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lock Codex switch writer boundary mutation") =
+            Some(super::CodexSwitchWriterBoundaryMutation {
+                config: config.map(str::to_string),
+                auth: auth.map(str::to_string),
+                companion: companion
+                    .map(|(path, contents)| (path.to_path_buf(), contents.to_string())),
+            });
+    }
+
+    fn seed_force_repair_codex_switch_state(
+        state: &AppState,
+        current_id: &str,
+        live_config: &str,
+        live_auth: &Value,
+        target: Provider,
+    ) -> Provider {
+        let mut current = Provider::with_id(
+            current_id.to_string(),
+            "Force repair current".to_string(),
+            json!({
+                "auth": live_auth,
+                "config": live_config
+            }),
+            None,
+        );
+        current.category = Some("custom".to_string());
+        state
+            .db
+            .save_provider(AppType::Codex.as_str(), &current)
+            .expect("seed force-repair current provider");
+        state
+            .db
+            .save_provider(AppType::Codex.as_str(), &target)
+            .expect("seed force-repair target provider");
+        state
+            .db
+            .set_current_provider(AppType::Codex.as_str(), current_id)
+            .expect("set force-repair DB current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(current_id))
+            .expect("set force-repair local current provider");
+        crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), live_config)
+            .expect("seed force-repair live config");
+        crate::config::write_json_file(&crate::codex_config::get_codex_auth_path(), live_auth)
+            .expect("seed force-repair live auth");
+        current
+    }
+
     fn codex_settings(base_url: &str, api_key: &str) -> Value {
         json!({
             "auth": {
@@ -278,6 +1015,44 @@ mod tests {
                  wire_api = \"chat\"\n"
             )
         })
+    }
+
+    fn codex_settings_with_unknown_subagent(base_url: &str, api_key: &str) -> Value {
+        let mut settings = codex_settings(base_url, api_key);
+        settings["modelCatalog"] = json!({
+            "models": [{
+                "model": "private-model",
+                "contextWindow": 128000
+            }]
+        });
+        settings["codexRouting"] = json!({
+            "enabled": true,
+            "subagentVersion": "v2",
+            "routes": [{
+                "id": "private-route",
+                "enabled": true,
+                "match": { "models": ["private-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }],
+            "subagentV2": {
+                "schemaVersion": 2,
+                "selectionPolicy": "balanced",
+                "profiles": {
+                    "private-model": {
+                        "model": "private-model",
+                        "enabled": true,
+                        "questionnaire": {
+                            "taskStrengths": ["repository_exploration"],
+                            "optimization": "speed",
+                            "writeScope": "read_only",
+                            "preference": "eligible"
+                        },
+                        "reasoning": { "policy": "delegated" }
+                    }
+                }
+            }
+        });
+        settings
     }
 
     fn usage_script_with_credentials(
@@ -453,6 +1228,39 @@ mod tests {
             "omo-slim" => crate::services::omo::SLIM.preferred_filename,
             other => panic!("unexpected OMO category in test: {other}"),
         })
+    }
+
+    #[test]
+    fn switch_rejects_schema_v1_codex_multirouter_before_explicit_migration() {
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+        let provider = Provider::with_id(
+            "legacy-router".to_string(),
+            "Legacy Router".to_string(),
+            json!({
+                "codexRouting": {
+                    "enabled": true,
+                    "routes": [{
+                        "id": "legacy-route",
+                        "upstream": {
+                            "apiFormat": "openai_chat",
+                            "apiKey": "must-not-log"
+                        }
+                    }]
+                }
+            }),
+            None,
+        );
+        db.save_provider(AppType::Codex.as_str(), &provider)
+            .expect("save legacy router");
+
+        let error = ProviderService::switch(&state, AppType::Codex, "legacy-router")
+            .expect_err("schema v1 activation must require explicit migration");
+
+        assert!(error
+            .to_string()
+            .contains("codex_multirouter_migration_required"));
+        assert!(!error.to_string().contains("must-not-log"));
     }
 
     #[test]
@@ -702,6 +1510,1769 @@ mod tests {
             assert_eq!(script.access_key_id.as_deref(), Some("ak-test"));
             assert_eq!(script.secret_access_key.as_deref(), Some("sk-test"));
         });
+    }
+
+    #[test]
+    #[serial]
+    fn update_codex_subagent_v2_compiles_before_mutating_a_non_current_provider() {
+        with_test_home(|state, _| {
+            let current = Provider::with_id(
+                "current-router".to_string(),
+                "Current router".to_string(),
+                codex_settings("https://current.example/v1", "sk-current"),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &current)
+                .expect("seed current provider");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &current.id)
+                .expect("mark a different provider current");
+
+            let target_settings = json!({
+                "auth": { "OPENAI_API_KEY": "sk-target" },
+                "config": "model = \"deepseek-v4-flash\"\n",
+                "modelCatalog": {
+                    "models": [{
+                        "model": "deepseek-v4-flash",
+                        "displayName": "DeepSeek V4 Flash",
+                        "contextWindow": 1000000
+                    }]
+                },
+                "codexRouting": {
+                    "enabled": true,
+                    "subagentVersion": "v2",
+                    "routes": [{
+                        "id": "flash-route",
+                        "enabled": true,
+                        "match": { "models": ["deepseek-v4-flash"] },
+                        "upstream": { "auth": { "source": "provider_config" } }
+                    }],
+                    "subagentV2": {
+                        "schemaVersion": 1,
+                        "selectionPolicy": "balanced",
+                        "profiles": {}
+                    }
+                }
+            });
+            let target = Provider::with_id(
+                "non-current-router".to_string(),
+                "Non-current router".to_string(),
+                target_settings,
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("seed non-current target provider");
+            let before = state
+                .db
+                .get_provider_by_id(&target.id, AppType::Codex.as_str())
+                .expect("read target before invalid save")
+                .expect("target exists before invalid save");
+            let compiler_invalid = json!({
+                "schemaVersion": 1,
+                "selectionPolicy": "balanced",
+                "profiles": {
+                    "deepseek-v4-flash": {
+                        "model": "deepseek-v4-flash",
+                        "enabled": true,
+                        "questionnaire": {
+                            "taskStrengths": ["repository_exploration"],
+                            "optimization": "speed",
+                            "writeScope": "read_only",
+                            "preference": "eligible",
+                            "reasoningEffort": "auto"
+                        },
+                        "overrides": { "roleName": "default" }
+                    }
+                }
+            });
+
+            let result =
+                ProviderService::update_codex_subagent_v2(state, &target.id, compiler_invalid);
+            let after = state
+                .db
+                .get_provider_by_id(&target.id, AppType::Codex.as_str())
+                .expect("read target after rejected save")
+                .expect("target still exists after rejected save");
+
+            assert_eq!(
+                after.settings_config, before.settings_config,
+                "compiler-domain rejection must happen before SQLite mutation; result was {result:?}"
+            );
+            assert!(
+                matches!(result, Err(AppError::InvalidInput(_) | AppError::Message(_))),
+                "reserved roleName must be rejected by the compiler before persistence, got {result:?}"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn schema_v2_subagent_initialization_uses_provider_owned_catalog() {
+        with_test_home(|state, _| {
+            let target = Provider::with_id(
+                "qwen-source".to_string(),
+                "Qwen source".to_string(),
+                json!({
+                    "modelCatalog": {"models": [{
+                        "model": "qwen3.8",
+                        "inputModalities": ["text"],
+                        "contextWindow": 262144
+                    }]}
+                }),
+                None,
+            );
+            let router = Provider::with_id(
+                "router-provider-owned".to_string(),
+                "Provider-owned router".to_string(),
+                json!({
+                    "codexRouting": {
+                        "schemaVersion": 2,
+                        "enabled": true,
+                        "subagentVersion": "v2",
+                        "routes": [{
+                            "id": "qwen",
+                            "enabled": true,
+                            "targetProviderId": "qwen-source",
+                            "modelSelection": {"mode": "all"},
+                            "authPolicy": {"source": "provider_config"}
+                        }]
+                    }
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider("codex", &target)
+                .expect("save target");
+            state
+                .db
+                .save_provider("codex", &router)
+                .expect("save router without derived catalog");
+
+            let result =
+                ProviderService::initialize_codex_subagent_v2(state, "router-provider-owned")
+                    .expect("initialize from Provider-owned catalog");
+
+            let profiles = result
+                .provider
+                .settings_config
+                .pointer("/codexRouting/subagentV2/profiles")
+                .and_then(Value::as_object)
+                .expect("initialized profiles");
+            assert!(profiles.values().any(|profile| {
+                profile.get("model").and_then(Value::as_str) == Some("qwen3.8")
+            }));
+            assert!(result
+                .provider
+                .settings_config
+                .get("modelCatalog")
+                .is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn add_rejects_unknown_reasoning_before_provider_persistence() {
+        with_test_home(|state, _| {
+            let provider = Provider::with_id(
+                "codex-unknown-reasoning-add".to_string(),
+                "Unknown reasoning add".to_string(),
+                codex_settings_with_unknown_subagent("https://api.example.com/v1", "sk-test"),
+                None,
+            );
+
+            let result = ProviderService::add(state, AppType::Codex, provider, false);
+
+            assert!(result
+                .expect_err("provider add must reject incomplete subagent capability")
+                .to_string()
+                .contains("unknown_reasoning_capability_requires_declaration"));
+            assert!(state
+                .db
+                .get_provider_by_id("codex-unknown-reasoning-add", AppType::Codex.as_str())
+                .expect("query rejected provider")
+                .is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn update_rejects_unknown_reasoning_before_provider_persistence() {
+        with_test_home(|state, _| {
+            let provider = Provider::with_id(
+                "codex-unknown-reasoning-update".to_string(),
+                "Unknown reasoning update".to_string(),
+                codex_settings("https://api.example.com/v1", "sk-old"),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed provider");
+
+            let mut updated = provider.clone();
+            updated.settings_config =
+                codex_settings_with_unknown_subagent("https://api.example.com/v1", "sk-new");
+            let result = ProviderService::update(state, AppType::Codex, None, updated);
+
+            assert!(result
+                .expect_err("provider update must reject incomplete subagent capability")
+                .to_string()
+                .contains("unknown_reasoning_capability_requires_declaration"));
+            let saved = state
+                .db
+                .get_provider_by_id("codex-unknown-reasoning-update", AppType::Codex.as_str())
+                .expect("query provider after rejected update")
+                .expect("seed provider remains persisted");
+            assert_eq!(saved.settings_config, provider.settings_config);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_switch_backs_up_and_repairs_live_alias_and_provider_reasoning() {
+        with_test_home(|state, _| {
+            let live = r#"[agents]
+max_threads = 10
+max_concurrent_threads_per_session = 8
+max_depth = 2
+
+[mcp_servers.user_owned]
+command = "example-mcp"
+"#;
+            crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), live)
+                .expect("seed legacy live config");
+
+            let settings = json!({
+                "auth": { "OPENAI_API_KEY": "sk-test" },
+                "config": "model = \"deepseek-v4-flash\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nname = \"DeepSeek\"\nbase_url = \"https://example.test/v1\"\nwire_api = \"responses\"\n",
+                "modelCatalog": { "models": [{
+                    "model": "deepseek-v4-flash",
+                    "reasoning": {
+                        "supported": true,
+                        "supportedEfforts": ["low", "high", "max"],
+                        "defaultEffort": "medium",
+                        "disableAllowed": true,
+                        "upstream": { "format": "string", "parameter": "reasoning_effort" },
+                        "source": "builtin"
+                    }
+                }]}
+            });
+            let mut provider = Provider::with_id(
+                "force-repair-target".to_string(),
+                "Force repair target".to_string(),
+                settings,
+                None,
+            );
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed provider");
+
+            let outcome =
+                ProviderService::force_repair_and_switch_codex_provider(state, &provider.id)
+                    .expect("force repair should succeed");
+
+            assert!(Path::new(&outcome.backup_directory)
+                .join("config.toml")
+                .exists());
+            let repaired_live = crate::codex_config::read_and_validate_codex_config_text()
+                .expect("read repaired live config");
+            let parsed: toml::Value = toml::from_str(&repaired_live).expect("parse repaired live");
+            assert!(parsed["agents"].get("max_threads").is_none());
+            assert_eq!(
+                parsed["agents"]["max_concurrent_threads_per_session"].as_integer(),
+                Some(8)
+            );
+            assert_eq!(
+                parsed["mcp_servers"]["user_owned"]["command"].as_str(),
+                Some("example-mcp")
+            );
+            let stored = state
+                .db
+                .get_provider_by_id(&provider.id, AppType::Codex.as_str())
+                .expect("read repaired provider")
+                .expect("provider exists");
+            assert_eq!(
+                stored.settings_config["modelCatalog"]["models"][0]["reasoning"]["defaultEffort"],
+                json!("high")
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_initial_rebases_on_user_write_before_raw_writer_snapshot() {
+        with_test_home(|state, _| {
+            let live = "[agents]\nmax_threads = 7\n";
+            crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), live)
+                .expect("seed repair live config");
+            let mut provider = Provider::with_id(
+                "force-repair-pre-writer-race".to_string(),
+                "Force repair race target".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "sk-test" },
+                    "config": "model_provider = \"custom\"\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://example.test/v1\"\nwire_api = \"responses\"\n"
+                }),
+                None,
+            );
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed repair provider");
+
+            crate::codex_config::set_test_pre_writer_mutations_for_test(&[
+                "[agents]\nmax_threads = 7\n\n[desktop]\nmarketplace = \"user-change\"\n",
+            ]);
+            ProviderService::force_repair_and_switch_codex_provider(state, &provider.id)
+                .expect("force repair should continue after a rebased write");
+
+            let restored =
+                crate::codex_config::read_codex_config_text().expect("read repaired live config");
+            assert!(
+                restored.contains("marketplace = \"user-change\""),
+                "force-repair initial write must preserve a user table changed before writer snapshot"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_finalize_rebases_on_user_write_before_raw_writer_snapshot() {
+        with_test_home(|state, _| {
+            let live = "[agents]\nmax_threads = 7\n";
+            crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), live)
+                .expect("seed repair live config");
+            let mut provider = Provider::with_id(
+                "force-repair-finalize-race".to_string(),
+                "Force repair finalize race target".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "sk-test" },
+                    "config": "model_provider = \"custom\"\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://example.test/v1\"\nwire_api = \"responses\"\n"
+                }),
+                None,
+            );
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed repair provider");
+
+            crate::codex_config::set_test_pre_writer_mutations_for_test(&[
+                "[agents]\nmax_threads = 7\n\n[desktop]\nmarketplace = \"initial-user-change\"\n",
+                "[agents]\nmax_threads = 7\n\n[desktop]\nmarketplace = \"final-user-change\"\n",
+            ]);
+            ProviderService::force_repair_and_switch_codex_provider(state, &provider.id)
+                .expect("force repair should continue after finalize race");
+
+            let restored =
+                crate::codex_config::read_codex_config_text().expect("read finalized live config");
+            assert!(
+                restored.contains("marketplace = \"final-user-change\""),
+                "force-repair finalize must preserve a user table changed before its raw writer snapshot"
+            );
+        });
+    }
+
+    fn seed_normal_codex_mcp_rows(state: &AppState) {
+        state
+            .db
+            .save_mcp_server(&McpServer {
+                id: "stale-managed".to_string(),
+                name: "Stale managed".to_string(),
+                server: json!({"type": "stdio", "command": "db-stale"}),
+                apps: McpApps::default(),
+                description: None,
+                homepage: None,
+                docs: None,
+                tags: Vec::new(),
+            })
+            .expect("seed disabled Codex MCP row");
+        state
+            .db
+            .save_mcp_server(&McpServer {
+                id: "managed-enabled".to_string(),
+                name: "Managed enabled".to_string(),
+                server: json!({"type": "stdio", "command": "db-enabled"}),
+                apps: McpApps {
+                    codex: true,
+                    ..McpApps::default()
+                },
+                description: None,
+                homepage: None,
+                docs: None,
+                tags: Vec::new(),
+            })
+            .expect("seed enabled Codex MCP row");
+    }
+
+    fn seed_normal_codex_switch_state(state: &AppState) -> (Provider, Provider, String) {
+        let live = r#"model_provider = "custom"
+model = "custom-model"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+
+[mcp_servers.external-only]
+type = "stdio"
+command = "external"
+
+[mcp_servers.stale-managed]
+type = "stdio"
+command = "stale-before"
+"#;
+        let live_auth = json!({"OPENAI_API_KEY": "current-key"});
+        let mut target = Provider::with_id(
+            "force-repair-normal-target".to_string(),
+            "Normal target".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "target-key" },
+                "config": "model_provider = \"target\"\nmodel = \"target-model\"\n\n[model_providers.target]\nname = \"Target\"\nbase_url = \"https://target.example/v1\"\nwire_api = \"responses\"\n\n[mcp_servers.stale-managed]\ntype = \"stdio\"\ncommand = \"target-stale\"\n"
+            }),
+            None,
+        );
+        target.category = Some("custom".to_string());
+        let current = seed_force_repair_codex_switch_state(
+            state,
+            "force-repair-normal-current",
+            live,
+            &live_auth,
+            target.clone(),
+        );
+        seed_normal_codex_mcp_rows(state);
+        (current, target, live.to_string())
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_normal_switch_preserves_external_config_at_finish_boundary() {
+        with_test_home(|state, _| {
+            let (_current, target, _original_live) = seed_normal_codex_switch_state(state);
+            let external_config = "[desktop]\nmarketplace = \"external-after-normal-mcp\"\n";
+            set_codex_switch_writer_boundary_mutation(Some(external_config), None, None);
+            set_force_repair_finalize_error();
+
+            let error = ProviderService::force_repair_and_switch_codex_provider(state, &target.id)
+                .expect_err("normal finalize failure must roll back");
+            assert!(
+                error.to_string().contains("恢复未完成")
+                    || error.to_string().contains("deferred")
+                    || error.to_string().contains("force"),
+                "external normal config must defer rollback: {error}"
+            );
+            assert_eq!(
+                crate::codex_config::read_codex_config_text().expect("read external config"),
+                external_config,
+                "external config written after MCP projection must survive rollback"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_normal_switch_restores_config_after_mcp_projection_when_finalize_fails() {
+        with_test_home(|state, _| {
+            let (_current, target, original_live) = seed_normal_codex_switch_state(state);
+            set_force_repair_finalize_error();
+
+            let error = ProviderService::force_repair_and_switch_codex_provider(state, &target.id)
+                .expect_err("normal finalize failure must roll back");
+            assert!(
+                error.to_string().contains("已恢复原配置")
+                    || error.to_string().contains("恢复")
+                    || error.to_string().contains("force"),
+                "normal finalize failure should identify rollback: {error}"
+            );
+            assert_eq!(
+                crate::codex_config::read_codex_config_text().expect("read restored config"),
+                original_live,
+                "rollback must restore config that preceded the provider and MCP writers"
+            );
+            let restored = crate::codex_config::read_codex_config_text().expect("read config");
+            assert!(
+                restored.contains("[mcp_servers.external-only]"),
+                "live-only MCP must survive rollback"
+            );
+            assert!(
+                restored.contains("command = \"stale-before\""),
+                "disabled managed MCP must restore its original bytes"
+            );
+            assert!(
+                !restored.contains("command = \"target-stale\""),
+                "stale provider MCP must not be resurrected into the final config"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_official_auth_cleanup_is_restored_when_finalize_fails() {
+        with_test_home(|state, _| {
+            let live = r#"model_provider = "custom"
+model = "custom-model"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+"#;
+            crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), live)
+                .expect("seed custom live config");
+            let auth_path = crate::codex_config::get_codex_auth_path();
+            let original_auth = json!({ "OPENAI_API_KEY": "stale-third-party-key" });
+            crate::config::write_json_file(&auth_path, &original_auth).expect("seed stale auth");
+
+            let mut current = Provider::with_id(
+                "cleanup-current".to_string(),
+                "Cleanup current".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "stale-third-party-key" },
+                    "config": live
+                }),
+                None,
+            );
+            current.category = Some("custom".to_string());
+            let mut target = Provider::with_id(
+                "cleanup-official-alt".to_string(),
+                "Official alternate".to_string(),
+                json!({
+                    "auth": {},
+                    "config": "model_provider = \"official-alt\"\nmodel = \"gpt-5.6\"\n\n[model_providers.official-alt]\nname = \"Official alternate\"\nbase_url = \"https://official.example/v1\"\nwire_api = \"responses\"\n"
+                }),
+                None,
+            );
+            target.category = Some("official".to_string());
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &current)
+                .expect("seed current provider");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("seed official target");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &current.id)
+                .expect("set current provider");
+            crate::settings::set_current_provider(&AppType::Codex, Some(&current.id))
+                .expect("set local current provider");
+
+            set_force_repair_finalize_error();
+            let error = ProviderService::force_repair_and_switch_codex_provider(state, &target.id)
+                .expect_err("finalize failure must roll back official auth cleanup");
+            assert!(
+                error.to_string().contains("已恢复原配置") || error.to_string().contains("恢复"),
+                "force-repair error should identify rollback: {error}"
+            );
+            assert_eq!(
+                crate::config::read_json_file::<Value>(&auth_path)
+                    .expect("read restored stale auth"),
+                original_auth,
+                "successful stale-auth cleanup must be reversible when finalize fails"
+            );
+            assert_eq!(
+                state
+                    .db
+                    .get_current_provider(AppType::Codex.as_str())
+                    .expect("read DB current")
+                    .as_deref(),
+                Some(current.id.as_str()),
+                "DB current provider must roll back after finalize failure"
+            );
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex).as_deref(),
+                Some(current.id.as_str()),
+                "local current provider must roll back after finalize failure"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_official_auth_cleanup_defers_when_new_auth_appears_before_finalize_failure() {
+        with_test_home(|state, _| {
+            let live = r#"model_provider = "custom"
+model = "custom-model"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+"#;
+            crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), live)
+                .expect("seed custom live config");
+            let auth_path = crate::codex_config::get_codex_auth_path();
+            crate::config::write_json_file(
+                &auth_path,
+                &json!({ "OPENAI_API_KEY": "stale-third-party-key" }),
+            )
+            .expect("seed stale auth");
+
+            let mut current = Provider::with_id(
+                "cleanup-deferred-current".to_string(),
+                "Cleanup deferred current".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "stale-third-party-key" },
+                    "config": live
+                }),
+                None,
+            );
+            current.category = Some("custom".to_string());
+            let mut target = Provider::with_id(
+                "cleanup-deferred-official-alt".to_string(),
+                "Official alternate deferred".to_string(),
+                json!({
+                    "auth": {},
+                    "config": "model_provider = \"official-alt\"\nmodel = \"gpt-5.6\"\n\n[model_providers.official-alt]\nname = \"Official alternate\"\nbase_url = \"https://official.example/v1\"\nwire_api = \"responses\"\n"
+                }),
+                None,
+            );
+            target.category = Some("official".to_string());
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &current)
+                .expect("seed current provider");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("seed official target");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &current.id)
+                .expect("set current provider");
+            crate::settings::set_current_provider(&AppType::Codex, Some(&current.id))
+                .expect("set local current provider");
+
+            let external_auth =
+                r#"{"auth_mode":"chatgpt","tokens":{"access_token":"new-external"}}"#;
+            set_force_repair_auth_after_switch_mutation(external_auth);
+            set_force_repair_finalize_error();
+            let error = ProviderService::force_repair_and_switch_codex_provider(state, &target.id)
+                .expect_err("finalize failure must report deferred auth rollback");
+            let error_text = error.to_string();
+            assert!(
+                error_text.contains("并发")
+                    || error_text.contains("deferred")
+                    || error_text.contains("恢复未完成"),
+                "external auth after cleanup must surface deferred rollback: {error_text}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&auth_path).expect("read external auth"),
+                external_auth,
+                "new auth created after cleanup must survive rollback"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_takeover_official_switch_restores_takeover_state_when_finalize_fails() {
+        with_test_home(|state, _| {
+            let live = r#"model_provider = "custom"
+model = "custom-model"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+
+[desktop]
+marketplace = "user-owned"
+"#;
+            let live_auth = json!({ "OPENAI_API_KEY": "current-key" });
+            let mut target = Provider::with_id(
+                "force-repair-official-alt".to_string(),
+                "Official alternate".to_string(),
+                json!({
+                    "auth": {},
+                    "config": "model_provider = \"official-alt\"\nmodel = \"gpt-5.6\"\n\n[model_providers.official-alt]\nname = \"Official alternate\"\nbase_url = \"https://official.example/v1\"\nwire_api = \"responses\"\n"
+                }),
+                None,
+            );
+            target.category = Some("official".to_string());
+            let current = seed_force_repair_codex_switch_state(
+                state,
+                "force-repair-takeover-current",
+                live,
+                &live_auth,
+                target.clone(),
+            );
+            let backup_json = serde_json::to_string(&json!({
+                "auth": live_auth,
+                "config": live
+            }))
+            .expect("serialize takeover backup");
+            block_on_tauri_runtime(state.db.save_live_backup("codex", &backup_json))
+                .expect("seed takeover backup");
+            let mut proxy_config =
+                block_on_tauri_runtime(state.db.get_proxy_config_for_app("codex"))
+                    .expect("read Codex proxy config");
+            proxy_config.enabled = true;
+            block_on_tauri_runtime(state.db.update_proxy_config_for_app(proxy_config))
+                .expect("mark Codex takeover enabled");
+            block_on_tauri_runtime(state.db.set_live_takeover_active(true))
+                .expect("mark live takeover active");
+
+            let external_config = "[desktop]\nmarketplace = \"external-after-takeover\"\n";
+            let external_auth =
+                r#"{"auth_mode":"chatgpt","tokens":{"access_token":"external-after-takeover"}}"#;
+            let catalog_path = crate::codex_config::get_codex_model_catalog_path();
+            let external_catalog = "{\"external\":\"after-takeover\"}";
+            set_codex_switch_writer_boundary_mutation(
+                Some(external_config),
+                Some(external_auth),
+                Some((&catalog_path, external_catalog)),
+            );
+            set_force_repair_finalize_error();
+            let error = ProviderService::force_repair_and_switch_codex_provider(state, &target.id)
+                .expect_err("takeover-to-official finalize failure must roll back");
+            assert!(
+                error.to_string().contains("恢复未完成")
+                    || error.to_string().contains("deferred")
+                    || error.to_string().contains("强制覆盖")
+                    || error.to_string().contains("force"),
+                "error should identify force-repair failure: {error}"
+            );
+            assert_eq!(
+                crate::codex_config::read_codex_config_text().expect("read restored config"),
+                external_config,
+                "external config written at the special-branch boundary must survive rollback"
+            );
+            assert_eq!(
+                crate::config::read_json_file::<Value>(&crate::codex_config::get_codex_auth_path())
+                    .expect("read restored auth"),
+                serde_json::from_str::<Value>(external_auth).expect("parse external auth"),
+                "external auth written at the special-branch boundary must survive rollback"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&catalog_path).expect("read external catalog"),
+                external_catalog,
+                "external companion written at the special-branch boundary must survive rollback"
+            );
+            let backup = block_on_tauri_runtime(state.db.get_live_backup("codex"))
+                .expect("read restored backup");
+            assert_eq!(
+                backup.as_ref().map(|value| value.original_config.as_str()),
+                Some(backup_json.as_str()),
+                "takeover-to-official rollback must restore the original live backup"
+            );
+            assert!(
+                block_on_tauri_runtime(state.db.get_proxy_config_for_app("codex"))
+                    .expect("read restored proxy config")
+                    .enabled,
+                "takeover-to-official rollback must restore app enabled state"
+            );
+            assert!(
+                block_on_tauri_runtime(state.db.is_live_takeover_active())
+                    .expect("read restored global takeover state"),
+                "takeover-to-official rollback must restore global takeover state"
+            );
+            assert_eq!(
+                state
+                    .db
+                    .get_current_provider("codex")
+                    .expect("read DB current"),
+                Some(current.id.clone()),
+                "takeover-to-official rollback must restore DB current provider"
+            );
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex),
+                Some(current.id),
+                "takeover-to-official rollback must restore local current provider"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_auto_proxy_switch_restores_proxy_state_when_finalize_fails() {
+        with_test_home(|state, _| {
+            let live = r#"model_provider = "custom"
+model = "custom-model"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+"#;
+            let live_auth = json!({ "OPENAI_API_KEY": "current-key" });
+            let mut target = Provider::with_id(
+                "force-repair-auto-proxy".to_string(),
+                "Chat conversion target".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "target-key" },
+                    "config": "model_provider = \"chat-target\"\nmodel = \"chat-model\"\n\n[model_providers.chat-target]\nname = \"Chat target\"\nbase_url = \"https://chat.example/v1\"\nwire_api = \"chat\"\n"
+                }),
+                None,
+            );
+            target.category = Some("custom".to_string());
+            let current = seed_force_repair_codex_switch_state(
+                state,
+                "force-repair-auto-current",
+                live,
+                &live_auth,
+                target.clone(),
+            );
+            let mut proxy_config =
+                block_on_tauri_runtime(state.db.get_proxy_config()).expect("read proxy config");
+            proxy_config.listen_port = 0;
+            block_on_tauri_runtime(state.db.update_proxy_config(proxy_config))
+                .expect("set ephemeral proxy port");
+
+            let external_config = "[desktop]\nmarketplace = \"external-after-auto-proxy\"\n";
+            set_codex_switch_writer_boundary_mutation(Some(external_config), None, None);
+            set_force_repair_finalize_error();
+            let error = ProviderService::force_repair_and_switch_codex_provider(state, &target.id)
+                .expect_err("auto-proxy finalize failure must roll back");
+            assert!(
+                error.to_string().contains("恢复未完成")
+                    || error.to_string().contains("deferred")
+                    || error.to_string().contains("强制覆盖")
+                    || error.to_string().contains("force"),
+                "error should identify force-repair failure: {error}"
+            );
+            assert_eq!(
+                crate::codex_config::read_codex_config_text().expect("read restored config"),
+                external_config,
+                "external config written at the special-branch boundary must survive rollback"
+            );
+            assert_eq!(
+                state
+                    .db
+                    .get_current_provider("codex")
+                    .expect("read DB current"),
+                Some(current.id.clone()),
+                "auto-proxy rollback must restore DB current provider"
+            );
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex),
+                Some(current.id),
+                "auto-proxy rollback must restore local current provider"
+            );
+            assert!(
+                block_on_tauri_runtime(state.db.get_live_backup("codex"))
+                    .expect("read backup after rollback")
+                    .is_none(),
+                "auto-proxy rollback must remove a backup created by the failed attempt"
+            );
+            assert!(
+                !block_on_tauri_runtime(state.db.get_proxy_config_for_app("codex"))
+                    .expect("read proxy config after rollback")
+                    .enabled,
+                "auto-proxy rollback must restore app disabled state"
+            );
+            assert!(
+                !block_on_tauri_runtime(state.proxy_service.is_running()),
+                "auto-proxy rollback must stop a proxy started by the failed attempt"
+            );
+            assert!(
+                !block_on_tauri_runtime(state.db.is_live_takeover_active())
+                    .expect("read restored global takeover state"),
+                "auto-proxy rollback must restore global takeover state"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_hot_switch_restores_backup_when_finalize_fails() {
+        with_test_home(|state, _| {
+            let live = r#"model_provider = "custom"
+model = "custom-model"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+"#;
+            let live_auth = json!({ "OPENAI_API_KEY": "current-key" });
+            let mut target = Provider::with_id(
+                "force-repair-hot-target".to_string(),
+                "Hot switch target".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "target-key" },
+                    "config": "model_provider = \"hot-target\"\nmodel = \"hot-model\"\n\n[model_providers.hot-target]\nname = \"Hot target\"\nbase_url = \"https://hot.example/v1\"\nwire_api = \"responses\"\n"
+                }),
+                None,
+            );
+            target.category = Some("custom".to_string());
+            let current = seed_force_repair_codex_switch_state(
+                state,
+                "force-repair-hot-current",
+                live,
+                &live_auth,
+                target.clone(),
+            );
+            let backup_json = serde_json::to_string(&json!({
+                "auth": live_auth,
+                "config": live
+            }))
+            .expect("serialize hot-switch backup");
+            block_on_tauri_runtime(state.db.save_live_backup("codex", &backup_json))
+                .expect("seed hot-switch backup");
+            let mut proxy_config =
+                block_on_tauri_runtime(state.db.get_proxy_config_for_app("codex"))
+                    .expect("read Codex proxy config");
+            proxy_config.enabled = true;
+            block_on_tauri_runtime(state.db.update_proxy_config_for_app(proxy_config))
+                .expect("mark takeover enabled");
+            block_on_tauri_runtime(state.db.set_live_takeover_active(true))
+                .expect("mark takeover active");
+
+            let external_config = "[desktop]\nmarketplace = \"external-after-hot-switch\"\n";
+            set_codex_switch_writer_boundary_mutation(Some(external_config), None, None);
+            set_force_repair_finalize_error();
+            let error = ProviderService::force_repair_and_switch_codex_provider(state, &target.id)
+                .expect_err("hot-switch finalize failure must roll back");
+            assert!(
+                error.to_string().contains("恢复未完成")
+                    || error.to_string().contains("deferred")
+                    || error.to_string().contains("强制覆盖")
+                    || error.to_string().contains("force"),
+                "error should identify force-repair failure: {error}"
+            );
+            assert_eq!(
+                crate::codex_config::read_codex_config_text().expect("read restored config"),
+                external_config,
+                "external config written at the special-branch boundary must survive rollback"
+            );
+            let backup = block_on_tauri_runtime(state.db.get_live_backup("codex"))
+                .expect("read restored hot-switch backup");
+            assert_eq!(
+                backup.as_ref().map(|value| value.original_config.as_str()),
+                Some(backup_json.as_str()),
+                "hot-switch rollback must restore original backup bytes"
+            );
+            assert!(
+                block_on_tauri_runtime(state.db.get_proxy_config_for_app("codex"))
+                    .expect("read restored proxy config")
+                    .enabled,
+                "hot-switch rollback must preserve takeover enabled state"
+            );
+            assert!(
+                block_on_tauri_runtime(state.db.is_live_takeover_active())
+                    .expect("read restored global takeover state"),
+                "hot-switch rollback must preserve global takeover state"
+            );
+            assert_eq!(
+                state
+                    .db
+                    .get_current_provider("codex")
+                    .expect("read DB current"),
+                Some(current.id.clone()),
+                "hot-switch rollback must restore DB current provider"
+            );
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex),
+                Some(current.id),
+                "hot-switch rollback must restore local current provider"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_current_change_after_switch_is_deferred() {
+        with_test_home(|state, _| {
+            let live = r#"model_provider = "custom"
+model = "custom-model"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+"#;
+            let live_auth = json!({ "OPENAI_API_KEY": "current-key" });
+            let mut target = Provider::with_id(
+                "force-repair-current-race-target".to_string(),
+                "Current race target".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "target-key" },
+                    "config": "model_provider = \"chat-target\"\nmodel = \"chat-model\"\n\n[model_providers.chat-target]\nname = \"Chat target\"\nbase_url = \"https://chat.example/v1\"\nwire_api = \"chat\"\n"
+                }),
+                None,
+            );
+            target.category = Some("custom".to_string());
+            let before_current = seed_force_repair_codex_switch_state(
+                state,
+                "force-repair-current-race-before",
+                live,
+                &live_auth,
+                target.clone(),
+            );
+            let mut proxy_config =
+                block_on_tauri_runtime(state.db.get_proxy_config()).expect("read proxy config");
+            proxy_config.listen_port = 0;
+            block_on_tauri_runtime(state.db.update_proxy_config(proxy_config))
+                .expect("set ephemeral proxy port");
+
+            let external_current = "force-repair-current-race-external";
+            let external_provider = Provider::with_id(
+                external_current.to_string(),
+                "External current provider".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "external-key" },
+                    "config": live
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &external_provider)
+                .expect("seed external current provider");
+            set_force_repair_current_after_switch_mutation(external_current);
+            set_force_repair_finalize_error();
+            let error = ProviderService::force_repair_and_switch_codex_provider(state, &target.id)
+                .expect_err("external current change must defer rollback");
+            let error_text = error.to_string();
+            assert!(
+                error_text.contains("并发")
+                    || error_text.contains("deferred")
+                    || error_text.contains("恢复未完成"),
+                "current race must report deferred rollback: {error_text}"
+            );
+            assert_eq!(
+                state
+                    .db
+                    .get_current_provider(AppType::Codex.as_str())
+                    .expect("read external DB current")
+                    .as_deref(),
+                Some(external_current),
+                "external DB current must survive conditional rollback"
+            );
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex).as_deref(),
+                Some(external_current),
+                "external local current must survive conditional rollback"
+            );
+            assert!(
+                !block_on_tauri_runtime(state.db.is_live_takeover_active())
+                    .expect("read global takeover state after current race"),
+                "current race rollback must not claim a new global takeover state"
+            );
+            assert_ne!(before_current.id, external_current);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_config_change_after_switch_is_deferred() {
+        with_test_home(|state, _| {
+            let live = r#"model_provider = "custom"
+model = "custom-model"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+"#;
+            let live_auth = json!({ "OPENAI_API_KEY": "current-key" });
+            let mut target = Provider::with_id(
+                "force-repair-config-race-target".to_string(),
+                "Config race target".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "target-key" },
+                    "config": "model_provider = \"chat-target\"\nmodel = \"chat-model\"\n\n[model_providers.chat-target]\nname = \"Chat target\"\nbase_url = \"https://chat.example/v1\"\nwire_api = \"chat\"\n"
+                }),
+                None,
+            );
+            target.category = Some("custom".to_string());
+            seed_force_repair_codex_switch_state(
+                state,
+                "force-repair-config-race-before",
+                live,
+                &live_auth,
+                target.clone(),
+            );
+            let mut proxy_config =
+                block_on_tauri_runtime(state.db.get_proxy_config()).expect("read proxy config");
+            proxy_config.listen_port = 0;
+            block_on_tauri_runtime(state.db.update_proxy_config(proxy_config))
+                .expect("set ephemeral proxy port");
+
+            let external_config = "[desktop]\nmarketplace = \"external-after-switch\"\n";
+            set_force_repair_config_after_switch_mutation(external_config);
+            set_force_repair_finalize_error();
+            let error = ProviderService::force_repair_and_switch_codex_provider(state, &target.id)
+                .expect_err("external config change must defer rollback");
+            let error_text = error.to_string();
+            assert!(
+                error_text.contains("并发")
+                    || error_text.contains("deferred")
+                    || error_text.contains("恢复未完成"),
+                "config race must report deferred rollback: {error_text}"
+            );
+            assert_eq!(
+                crate::codex_config::read_codex_config_text()
+                    .expect("read external config")
+                    .as_str(),
+                external_config,
+                "external config must survive conditional rollback"
+            );
+            assert!(
+                !block_on_tauri_runtime(state.db.is_live_takeover_active())
+                    .expect("read global takeover state after config race"),
+                "config race rollback must not claim a new global takeover state"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_does_not_claim_companion_update_before_finish() {
+        with_test_home(|state, _| {
+            let live = "[agents]\nmax_threads = 7\n";
+            crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), live)
+                .expect("seed repair live config");
+            let provider = Provider::with_id(
+                "force-repair-companion-finish-race".to_string(),
+                "Companion finish race target".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "sk-test" },
+                    "config": "model_provider = \"custom\"\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://example.test/v1\"\nwire_api = \"responses\"\n",
+                    "modelCatalog": { "models": [{
+                        "model": "gpt-5.6",
+                        "reasoning": {
+                            "supported": true,
+                            "supportedEfforts": ["low", "high", "max"],
+                            "defaultEffort": "high",
+                            "disableAllowed": true,
+                            "upstream": { "format": "string", "parameter": "reasoning_effort" },
+                            "source": "builtin"
+                        }
+                    }]}
+                }),
+                None,
+            );
+            let mut provider = provider;
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed repair provider");
+
+            let catalog_path = crate::codex_config::get_codex_model_catalog_path();
+            let external_catalog = "{\"external\":true}";
+            set_force_repair_companion_after_switch_mutation(&catalog_path, external_catalog);
+            set_force_repair_finalize_mutation("[desktop\ninvalid = true\n");
+
+            let error =
+                ProviderService::force_repair_and_switch_codex_provider(state, &provider.id)
+                    .expect_err("finalize mutation should force rollback");
+            assert!(
+                error.to_string().contains("强制覆盖") || error.to_string().contains("force"),
+                "error should identify force-repair failure: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&catalog_path).ok().as_deref(),
+                Some(external_catalog),
+                "an external catalog update before finish must not be claimed by this attempt"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_reports_deferred_when_companion_restore_is_skipped() {
+        with_test_home(|state, _| {
+            let live = "[agents]\nmax_threads = 7\n";
+            crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), live)
+                .expect("seed repair live config");
+            let catalog_path = crate::codex_config::get_codex_model_catalog_path();
+            let original_catalog = "{\"models\":[]}";
+            crate::config::write_text_file(&catalog_path, original_catalog)
+                .expect("seed managed catalog");
+            let mut provider = Provider::with_id(
+                "force-repair-companion-rollback-race".to_string(),
+                "Companion rollback race target".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "sk-test" },
+                    "config": "model_provider = \"custom\"\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://example.test/v1\"\nwire_api = \"responses\"\n",
+                    "modelCatalog": { "models": [{
+                        "model": "gpt-5.6",
+                        "reasoning": {
+                            "supported": true,
+                            "supportedEfforts": ["low", "high", "max"],
+                            "defaultEffort": "high",
+                            "disableAllowed": true,
+                            "upstream": { "format": "string", "parameter": "reasoning_effort" },
+                            "source": "builtin"
+                        }
+                    }]}
+                }),
+                None,
+            );
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed invalid provider");
+
+            let external_catalog = "{\"external\":\"during-rollback\"}";
+            set_force_repair_finalize_mutation("[desktop\ninvalid = true\n");
+            set_force_repair_companion_rollback_mutation(&catalog_path, external_catalog);
+
+            let error =
+                ProviderService::force_repair_and_switch_codex_provider(state, &provider.id)
+                    .expect_err("finalize failure must enter rollback");
+            let error_text = error.to_string();
+            assert!(
+                error_text.contains("并发")
+                    || error_text.contains("deferred")
+                    || error_text.contains("恢复未完成"),
+                "rollback error must report skipped companion restoration: {error_text}"
+            );
+            assert!(
+                !error_text.contains("已恢复原配置"),
+                "a skipped companion restore must not be reported as fully restored: {error_text}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&catalog_path).expect("read external catalog"),
+                external_catalog,
+                "an external companion update must survive conditional rollback"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_switch_restores_exact_live_and_provider_when_retry_fails() {
+        with_test_home(|state, _| {
+            let live = "[agents]\nmax_threads = 7\n";
+            crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), live)
+                .expect("seed legacy live config");
+            let provider = Provider::with_id(
+                "force-repair-invalid".to_string(),
+                "Invalid target".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "sk-test" },
+                    "config": "this is not valid TOML = ["
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed invalid provider");
+
+            let error =
+                ProviderService::force_repair_and_switch_codex_provider(state, &provider.id)
+                    .expect_err("invalid target must fail after recovery preparation");
+            assert!(error.to_string().contains("已恢复原配置"));
+            assert_eq!(
+                crate::codex_config::read_codex_config_text().expect("read rolled back live"),
+                live,
+                "rollback must restore the exact original TOML text"
+            );
+            let stored = state
+                .db
+                .get_provider_by_id(&provider.id, AppType::Codex.as_str())
+                .expect("read rolled back provider")
+                .expect("provider exists");
+            assert_eq!(stored.settings_config, provider.settings_config);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_repair_rollback_defers_when_user_changes_live_after_failed_switch() {
+        with_test_home(|state, _| {
+            let live = "[agents]\nmax_threads = 7\n";
+            crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), live)
+                .expect("seed legacy live config");
+            let provider = Provider::with_id(
+                "force-repair-rollback-race".to_string(),
+                "Invalid rollback target".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "sk-test" },
+                    "config": "this is not valid TOML = ["
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed invalid provider");
+            set_force_repair_rollback_mutation(
+                "[desktop]\nmarketplace = \"rollback-user-change\"\n",
+            );
+
+            let _ = ProviderService::force_repair_and_switch_codex_provider(state, &provider.id)
+                .expect_err("invalid target must enter rollback");
+            let current =
+                crate::codex_config::read_codex_config_text().expect("read rollback live config");
+            assert!(
+                current.contains("marketplace = \"rollback-user-change\""),
+                "force-repair rollback must not overwrite a user write made after the failed switch"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn updating_valid_non_current_subagent_v2_does_not_touch_live_projection_files() {
+        with_test_home(|state, _| {
+            let current = Provider::with_id(
+                "openai".to_string(),
+                "OpenAI Official".to_string(),
+                codex_settings("https://api.openai.com/v1", "sk-current"),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &current)
+                .expect("seed current provider");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &current.id)
+                .expect("mark official provider current");
+
+            let target = Provider::with_id(
+                "saved-router".to_string(),
+                "Saved router".to_string(),
+                json!({
+                    "modelCatalog": { "models": [{
+                        "model": "deepseek-v4-flash",
+                        "displayName": "DeepSeek V4 Flash",
+                        "contextWindow": 1000000
+                    }] },
+                    "codexRouting": {
+                        "enabled": true,
+                        "subagentVersion": "v2",
+                        "routes": [{
+                            "id": "flash-route",
+                            "enabled": true,
+                            "match": { "models": ["deepseek-v4-flash"] },
+                            "upstream": { "auth": { "source": "provider_config" } }
+                        }],
+                        "subagentV2": {
+                            "schemaVersion": 1,
+                            "selectionPolicy": "balanced",
+                            "profiles": {}
+                        }
+                    }
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("seed saved router");
+
+            let config_path = crate::codex_config::get_codex_config_path();
+            let catalog_path = crate::codex_config::get_codex_model_catalog_path();
+            let agents_dir = crate::codex_config::get_codex_agents_dir();
+            std::fs::create_dir_all(config_path.parent().expect("config parent"))
+                .expect("create config dir");
+            std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+            std::fs::write(&config_path, "model_provider = \"openai\"\n")
+                .expect("seed official live config");
+            std::fs::write(&catalog_path, "{\"sentinel\":true}").expect("seed catalog sentinel");
+            let managed_path = agents_dir.join("sentinel.toml");
+            std::fs::write(&managed_path, "# user sentinel\nmodel = \"keep\"\n")
+                .expect("seed agent sentinel");
+
+            let result = ProviderService::update_codex_subagent_v2(
+                state,
+                &target.id,
+                json!({
+                    "schemaVersion": 1,
+                    "selectionPolicy": "balanced",
+                    "profiles": {}
+                }),
+            )
+            .expect("save non-current V2 config");
+
+            assert_eq!(
+                result.projection.status,
+                CodexSubagentV2ProjectionStatus::NotRequired
+            );
+            let public = serde_json::to_value(&result).expect("serialize non-current result");
+            assert_eq!(public["verification"]["databasePersisted"], true);
+            assert_eq!(public["verification"]["roleFilesStatus"], "not_required");
+            assert_eq!(public["verification"]["roleFiles"], json!([]));
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read live config"),
+                "model_provider = \"openai\"\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&catalog_path).expect("read catalog sentinel"),
+                "{\"sentinel\":true}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&managed_path).expect("read agent sentinel"),
+                "# user sentinel\nmodel = \"keep\"\n"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn updating_current_subagent_v2_returns_verified_role_file_readback() {
+        with_test_home(|state, _| {
+            let provider = Provider::with_id(
+                "active-router".to_string(),
+                "Active router".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "sk-test" },
+                    "config": "model = \"deepseek-v4-flash\"\n",
+                    "modelCatalog": { "models": [{
+                        "model": "deepseek-v4-flash",
+                        "displayName": "DeepSeek V4 Flash",
+                        "contextWindow": 1000000,
+                        "inputModalities": ["text"],
+                        "textOnly": true,
+                        "supportsImage": false,
+                        "reasoning": {
+                            "supported": true,
+                            "supportedEfforts": ["low", "high", "max"],
+                            "defaultEffort": "high",
+                            "disableAllowed": true,
+                            "upstream": {
+                                "format": "string",
+                                "parameter": "reasoning_effort",
+                                "effortMap": {
+                                    "low": "low",
+                                    "medium": "high",
+                                    "high": "high",
+                                    "xhigh": "high",
+                                    "max": "max"
+                                }
+                            },
+                            "source": "builtin"
+                        }
+                    }] },
+                    "codexRouting": {
+                        "enabled": true,
+                        "subagentVersion": "v2",
+                        "routes": [{
+                            "id": "flash-route",
+                            "enabled": true,
+                            "match": { "models": ["deepseek-v4-flash"] },
+                            "upstream": {
+                                "baseUrl": "https://router.example/v1",
+                                "apiFormat": "openai_responses",
+                                "auth": { "source": "provider_config" }
+                            }
+                        }],
+                        "subagentV2": {
+                            "schemaVersion": 1,
+                            "selectionPolicy": "balanced",
+                            "profiles": {}
+                        }
+                    }
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed active provider");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &provider.id)
+                .expect("mark provider current");
+
+            let result = ProviderService::update_codex_subagent_v2(
+                state,
+                &provider.id,
+                json!({
+                    "schemaVersion": 1,
+                    "selectionPolicy": "balanced",
+                    "profiles": {
+                        "deepseek-v4-flash": {
+                            "model": "deepseek-v4-flash",
+                            "enabled": true,
+                            "questionnaire": {
+                                "taskStrengths": ["repository_exploration"],
+                                "optimization": "speed",
+                                "writeScope": "read_only",
+                                "preference": "eligible",
+                                "reasoningEffort": "medium"
+                            }
+                        }
+                    }
+                }),
+            )
+            .expect("save and project active V2 profile");
+
+            assert_eq!(
+                result.projection.status,
+                CodexSubagentV2ProjectionStatus::Applied
+            );
+            assert_eq!(
+                result.verification.role_files_status,
+                CodexSubagentV2RoleFilesStatus::Verified
+            );
+            assert_eq!(result.verification.role_files.len(), 1);
+            assert!(
+                result.provider.settings_config["codexRouting"]["subagentV2"]["profiles"]
+                    ["deepseek-v4-flash"]
+                    .get("inputModalities")
+                    .is_none(),
+                "catalog-derived capability must remain runtime metadata"
+            );
+            let file = &result.verification.role_files[0];
+            assert!(file.exists);
+            assert!(file.content_matches);
+            let content = std::fs::read_to_string(&file.path).expect("read verified role TOML");
+            assert!(content.contains(
+                "This model does not support image input; do not select this role for tasks that depend on image understanding."
+            ));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_codex_subagent_v2_uses_the_complete_current_draft_for_batch_actions() {
+        with_test_home(|state, _| {
+            let current = Provider::with_id(
+                "current-router".to_string(),
+                "Current router".to_string(),
+                codex_settings("https://current.example/v1", "sk-current"),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &current)
+                .expect("seed current provider");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &current.id)
+                .expect("keep target provider non-current");
+
+            let target_settings = json!({
+                "modelCatalog": { "models": [
+                    {
+                        "model": "repository-scout",
+                        "contextWindow": 128000,
+                        "reasoning": {
+                            "supported": true,
+                            "supportedEfforts": ["low", "medium", "high"],
+                            "defaultEffort": "medium",
+                            "disableAllowed": true,
+                            "upstream": {
+                                "format": "string",
+                                "parameter": "reasoning_effort"
+                            },
+                            "source": "builtin"
+                        }
+                    },
+                    { "model": "qwen3.6", "contextWindow": 262144 }
+                ] },
+                "codexRouting": {
+                    "enabled": true,
+                    "subagentVersion": "v2",
+                    "routes": [{
+                        "id": "all-models",
+                        "match": { "models": ["repository-scout", "qwen3.6"] },
+                        "upstream": { "auth": { "source": "provider_config" } }
+                    }],
+                    "subagentV2": {
+                        "schemaVersion": 1,
+                        "selectionPolicy": "balanced",
+                        "profiles": {
+                            "repository-scout": {
+                                "model": "repository-scout",
+                                "enabled": true,
+                                "questionnaire": {
+                                    "taskStrengths": ["repository_exploration"],
+                                    "optimization": "speed",
+                                    "writeScope": "read_only",
+                                    "preference": "eligible",
+                                    "reasoningEffort": "auto"
+                                }
+                            },
+                            "RAW_INVALID_PROFILE_SENTINEL": {
+                                "model": "qwen3.6",
+                                "enabled": "broken"
+                            }
+                        }
+                    }
+                }
+            });
+            let target = Provider::with_id(
+                "draft-router".to_string(),
+                "Draft router".to_string(),
+                target_settings.clone(),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("seed target provider");
+
+            let mut current_draft = target_settings["codexRouting"]["subagentV2"].clone();
+            current_draft["selectionPolicy"] = json!("third_party_first");
+            current_draft["profiles"]["repository-scout"]["overrides"] = json!({
+                "description": "Unsaved batch edit must survive."
+            });
+
+            let result = ProviderService::reconcile_codex_subagent_v2_profiles(
+                state,
+                &target.id,
+                crate::codex_config::CodexSubagentV2ReconcileAction::RemoveAllInvalid,
+                Some(current_draft),
+            )
+            .expect("batch action must accept and persist the complete current draft");
+            let persisted = &result.provider.settings_config["codexRouting"]["subagentV2"];
+
+            assert_eq!(persisted["selectionPolicy"], "third_party_first");
+            assert_eq!(
+                persisted["profiles"]["repository-scout"]["overrides"]["description"],
+                "Unsaved batch edit must survive."
+            );
+            assert!(persisted["profiles"]
+                .get("RAW_INVALID_PROFILE_SENTINEL")
+                .is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn update_codex_subagent_v2_service_error_redacts_raw_profile_identity() {
+        with_test_home(|state, _| {
+            let target = Provider::with_id(
+                "redaction-router".to_string(),
+                "Redaction router".to_string(),
+                json!({
+                    "modelCatalog": { "models": [
+                        { "model": "PRIVATE_MODEL_SENTINEL", "contextWindow": 128000 }
+                    ] },
+                    "codexRouting": {
+                        "enabled": true,
+                        "subagentVersion": "v2",
+                        "routes": [{
+                            "id": "private-route",
+                            "match": { "models": ["PRIVATE_MODEL_SENTINEL"] },
+                            "upstream": { "auth": { "source": "provider_config" } }
+                        }],
+                        "subagentV2": {
+                            "schemaVersion": 1,
+                            "selectionPolicy": "balanced",
+                            "profiles": {}
+                        }
+                    }
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("seed target provider");
+            let invalid = json!({
+                "schemaVersion": 1,
+                "selectionPolicy": "balanced",
+                "profiles": {
+                    "RAW_PROFILE_KEY_SENTINEL": {
+                        "model": "PRIVATE_MODEL_SENTINEL",
+                        "enabled": true,
+                        "questionnaire": {
+                            "taskStrengths": ["repository_exploration"],
+                            "optimization": "speed",
+                            "writeScope": "read_only",
+                            "preference": "eligible",
+                            "reasoningEffort": "auto"
+                        }
+                    }
+                }
+            });
+
+            let error = ProviderService::update_codex_subagent_v2(state, &target.id, invalid)
+                .expect_err("strict update must reject key/model mismatch");
+            let public_error = error.to_string();
+
+            assert_eq!(
+                public_error,
+                "无效输入: Codex subagent V2 configuration is invalid (profile_key_model_mismatch)"
+            );
+            assert!(!public_error.contains("RAW_PROFILE_KEY_SENTINEL"));
+            assert!(!public_error.contains("PRIVATE_MODEL_SENTINEL"));
+        });
+    }
+
+    #[test]
+    fn codex_subagent_v2_mutation_result_keeps_provider_shape_and_redacts_projection_errors() {
+        let sensitive_error = AppError::Config(
+            "settings.taskBody=PRIVATE_TASK apiKey=PRIVATE_CREDENTIAL".to_string(),
+        );
+        assert_eq!(app_error_diagnostic_kind(&sensitive_error), "config");
+
+        let provider = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({ "codexRouting": { "subagentVersion": "v2" } }),
+            None,
+        );
+        let result = CodexSubagentV2MutationResult {
+            provider,
+            projection: CodexSubagentV2ProjectionOutcome {
+                status: CodexSubagentV2ProjectionStatus::PendingRetry,
+                warning: Some(codex_subagent_v2_projection_warning(
+                    CODEX_LIVE_PROJECTION_RETRY_CODE,
+                    CODEX_LIVE_PROJECTION_RETRY_MESSAGE,
+                )),
+            },
+            verification: CodexSubagentV2WriteVerification {
+                database_persisted: true,
+                role_files_status: CodexSubagentV2RoleFilesStatus::PendingRetry,
+                role_files: Vec::new(),
+                activation: CodexSubagentV2ActivationBoundary::RestartCodexAndStartNewSession,
+            },
+        };
+        let serialized = serde_json::to_value(&result).expect("serialize mutation result");
+
+        assert_eq!(serialized["id"], "router");
+        assert_eq!(serialized["name"], "Router");
+        assert_eq!(serialized["projection"]["status"], "pending_retry");
+        assert_eq!(serialized["verification"]["databasePersisted"], true);
+        assert_eq!(
+            serialized["verification"]["roleFilesStatus"],
+            "pending_retry"
+        );
+        assert_eq!(
+            serialized["verification"]["activation"],
+            "restart_codex_and_start_new_session"
+        );
+        assert_eq!(
+            serialized["projection"]["warning"],
+            json!({
+                "code": "codex_live_projection_pending_retry",
+                "message": "数据库已保存，Codex live 投影待重试。"
+            })
+        );
+        let public_payload = serialized.to_string();
+        assert!(!public_payload.contains("PRIVATE_TASK"));
+        assert!(!public_payload.contains("PRIVATE_CREDENTIAL"));
+
+        let provider_consumer: Provider = serde_json::from_value(serialized)
+            .expect("existing Provider consumers must ignore the additive projection field");
+        assert_eq!(provider_consumer.id, "router");
+        assert_eq!(provider_consumer.name, "Router");
     }
 
     #[test]
@@ -1628,7 +4199,20 @@ model = "gpt-5.4-mini"
             "OpenAI".to_string(),
             json!({
                 "auth": { "OPENAI_API_KEY": "old-openai-key" },
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "apiFormat": "openai_responses",
                 "config": current_config,
+                "modelCatalog": {
+                    "models": [
+                        { "model": "gpt-5.5", "displayName": "GPT-5.5", "contextWindow": 272000 },
+                        { "model": "gpt-5.4", "displayName": "GPT-5.4", "contextWindow": 272000 },
+                        { "model": "gpt-5.4-mini", "displayName": "GPT-5.4 Mini", "contextWindow": 128000 },
+                        { "model": "gpt-5.3-codex-spark", "displayName": "Codex Spark", "contextWindow": 128000 },
+                        { "model": "qwen3.6", "displayName": "Qwen 3.6", "contextWindow": 262144 },
+                        { "model": "deepseek-v4-flash", "displayName": "DeepSeek V4 Flash", "contextWindow": 1000000 },
+                        { "model": "deepseek-v4-pro", "displayName": "DeepSeek V4 Pro", "contextWindow": 1000000 }
+                    ]
+                }
             }),
             None,
         );
@@ -1641,33 +4225,17 @@ model = "gpt-5.4-mini"
 model_provider = "openai"
 openai_base_url = "http://127.0.0.1:15721/v1"
 "#,
-                "modelCatalog": {
-                    "models": [
-                        { "model": "gpt-5.5", "displayName": "GPT-5.5", "contextWindow": 272000 },
-                        { "model": "gpt-5.4", "displayName": "GPT-5.4", "contextWindow": 272000 },
-                        { "model": "gpt-5.4-mini", "displayName": "GPT-5.4 Mini", "contextWindow": 128000 },
-                        { "model": "gpt-5.3-codex-spark", "displayName": "Codex Spark", "contextWindow": 128000 },
-                        { "model": "qwen3.6", "displayName": "Qwen 3.6", "contextWindow": 262144 },
-                        { "model": "deepseek-v4-flash", "displayName": "DeepSeek V4 Flash", "contextWindow": 1000000 },
-                        { "model": "deepseek-v4-pro", "displayName": "DeepSeek V4 Pro", "contextWindow": 1000000 }
-                    ]
-                },
                 "codexRouting": {
+                    "schemaVersion": 2,
                     "enabled": true,
                     "routes": [
                         {
                             "id": "openai-official",
                             "enabled": true,
-                            "match": {
-                                "models": ["gpt-5.5"],
-                                "prefixes": ["gpt-"]
-                            },
-                            "upstream": {
-                                "baseUrl": "https://chatgpt.com/backend-api/codex",
-                                "apiFormat": "openai_responses",
-                                "auth": { "source": "managed_codex_oauth" },
-                                "modelMap": { "gpt-5.5": "gpt-5.5" }
-                            }
+                            "targetProviderId": "openai",
+                            "modelSelection": { "mode": "all" },
+                            "matchPrefixes": ["gpt-"],
+                            "authPolicy": { "source": "managed_codex_oauth" }
                         }
                     ]
                 }
@@ -1678,15 +4246,40 @@ openai_base_url = "http://127.0.0.1:15721/v1"
 
         db.save_provider("codex", &current)
             .expect("save current provider");
-        db.save_provider("codex", &router)
-            .expect("save router provider");
+        ProviderService::add(&state, AppType::Codex, router.clone(), false)
+            .expect("save and compile schema v2 router provider");
         db.set_current_provider("codex", "openai")
             .expect("set current provider");
         crate::settings::set_current_provider(&AppType::Codex, Some("openai"))
             .expect("set local current provider");
+        assert_eq!(
+            db.get_provider_by_id("openai", "codex")
+                .expect("read target before switch")
+                .expect("target exists before switch")
+                .settings_config["modelCatalog"]["models"]
+                .as_array()
+                .map(Vec::len),
+            Some(7),
+            "target Provider catalog is the compiler SSOT before activation"
+        );
 
-        ProviderService::switch(&state, AppType::Codex, "codex-openai-router")
+        let switch_result = ProviderService::switch(&state, AppType::Codex, "codex-openai-router")
             .expect("switch router through local proxy takeover");
+        assert_eq!(
+            db.get_provider_by_id("openai", "codex")
+                .expect("read target after switch")
+                .expect("target exists after switch")
+                .settings_config["modelCatalog"]["models"]
+                .as_array()
+                .map(Vec::len),
+            Some(7),
+            "activation must not erase the target Provider catalog SSOT"
+        );
+        assert!(
+            switch_result.warnings.is_empty(),
+            "schema v2 projection must publish during activation: {:?}",
+            switch_result.warnings
+        );
 
         let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read Codex live config");
@@ -1702,9 +4295,21 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             live_config.contains("supports_websockets = false"),
             "router takeover must disable Codex websocket attempts, got:\n{live_config}"
         );
+        let live_config_toml: toml::Value =
+            toml::from_str(&live_config).expect("parse Codex live config");
+        let model_catalog_json = live_config_toml
+            .get("model_catalog_json")
+            .and_then(toml::Value::as_str)
+            .expect("router takeover must expose the generated model catalog to Codex");
+        let expected_catalog_path = crate::codex_config::get_codex_model_catalog_path();
+        assert_eq!(
+            std::path::Path::new(model_catalog_json),
+            expected_catalog_path.as_path(),
+            "router takeover must point Codex at the generated model catalog"
+        );
         assert!(
-            live_config.contains("model_catalog_json = \"cc-switch-model-catalog.json\""),
-            "router takeover must expose the generated model catalog to Codex, got:\n{live_config}"
+            std::path::Path::new(model_catalog_json).is_absolute(),
+            "Codex requires model_catalog_json to be absolute, got: {model_catalog_json}"
         );
         assert!(
             !live_config.contains("openai_base_url"),
@@ -1860,9 +4465,20 @@ experimental_bearer_token = "PROXY_MANAGED"
                 live_config.contains("model_provider = \"codex_model_router_v2\""),
                 "{label}: live config must stay on the stable MultiRouter provider, got:\n{live_config}"
             );
+            let live_toml: toml::Value =
+                toml::from_str(&live_config).expect("parse refreshed Codex live config");
+            let model_catalog_json = live_toml
+                .get("model_catalog_json")
+                .and_then(toml::Value::as_str)
+                .expect("live config must keep the generated catalog pointer");
+            assert_eq!(
+                std::path::Path::new(model_catalog_json),
+                crate::codex_config::get_codex_model_catalog_path().as_path(),
+                "{label}: live config must point at the generated catalog"
+            );
             assert!(
-                live_config.contains("model_catalog_json = \"cc-switch-model-catalog.json\""),
-                "{label}: live config must keep the generated catalog pointer, got:\n{live_config}"
+                std::path::Path::new(model_catalog_json).is_absolute(),
+                "{label}: Codex requires an absolute generated catalog pointer"
             );
             assert!(
                 !live_config.contains("model_provider = \"openai\""),
@@ -1872,16 +4488,14 @@ experimental_bearer_token = "PROXY_MANAGED"
                 !live_config.contains("openai_base_url"),
                 "{label}: live config must not use built-in OpenAI base URL, got:\n{live_config}"
             );
-            let live_toml: toml::Value =
-                toml::from_str(&live_config).expect("parse refreshed Codex live config");
             let router_facade = live_toml
                 .get("model_providers")
                 .and_then(|providers| providers.get("codex_model_router_v2"))
                 .expect("router facade");
             assert_eq!(
                 router_facade.get("name").and_then(|value| value.as_str()),
-                Some("OpenAI"),
-                "{label}: managed OAuth must retain OpenAI capabilities"
+                Some("CCSwitch MultiRouter"),
+                "{label}: projection must retain the stable MultiRouter facade"
             );
             assert_eq!(
                 router_facade
@@ -3066,6 +5680,76 @@ requires_openai_auth = true
             );
         });
     }
+
+    #[test]
+    fn deleting_universal_provider_cascades_its_generated_codex_route_dependencies() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let state = AppState::new(db.clone());
+        let mut universal = UniversalProvider::new(
+            "shared".to_string(),
+            "Shared".to_string(),
+            "custom".to_string(),
+            "https://example.com".to_string(),
+            "secret".to_string(),
+        );
+        universal.apps.codex = true;
+        universal.models = UniversalProviderModels {
+            codex: Some(CodexModelConfig {
+                model: Some("shared-model".to_string()),
+                reasoning_effort: Some("high".to_string()),
+            }),
+            ..Default::default()
+        };
+        db.save_universal_provider(&universal)
+            .expect("save universal provider");
+
+        let mut generated = universal
+            .to_codex_provider()
+            .expect("generate Codex provider");
+        generated.settings_config["modelCatalog"] = json!({"models": [{"model": "shared-model"}]});
+        db.save_provider("codex", &generated)
+            .expect("save generated provider");
+        let router = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({
+                "codexRouting": {
+                    "schemaVersion": 2,
+                    "enabled": true,
+                    "routes": [{
+                        "id": "shared-route",
+                        "enabled": true,
+                        "targetProviderId": "universal-codex-shared",
+                        "modelSelection": {"mode": "all"},
+                        "authPolicy": {"source": "provider_config"}
+                    }]
+                }
+            }),
+            None,
+        );
+        db.save_provider("codex", &router).expect("save router");
+        let official = Provider::with_id(
+            "codex-official".to_string(),
+            "Official".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &official).expect("save official");
+        db.set_current_provider("codex", "codex-official")
+            .expect("set non-router current provider");
+
+        ProviderService::delete_universal(&state, "shared").expect("delete universal provider");
+
+        let saved_router = db
+            .get_provider_by_id("router", "codex")
+            .expect("read router")
+            .expect("router remains");
+        assert_eq!(
+            saved_router.settings_config["codexRouting"]["routes"],
+            json!([]),
+            "generated Codex Provider deletion must not leave a dangling V2 route"
+        );
+    }
 }
 
 impl ProviderService {
@@ -3249,12 +5933,15 @@ impl ProviderService {
         Self::validate_provider_settings(&app_type, &provider)?;
         normalize_provider_common_config_for_storage(state.db.as_ref(), &app_type, &mut provider)?;
         Self::normalize_usage_script_credential_overrides(&app_type, &mut provider);
+        Self::validate_codex_subagent_v2_provider_candidate(state, &provider)?;
         if app_type.is_additive_mode() {
             Self::set_provider_live_config_managed(&mut provider, add_to_live);
         }
 
-        // Save to database
-        state.db.save_provider(app_type.as_str(), &provider)?;
+        // Codex mutations compile all affected schema-v2 plans before committing the Provider,
+        // then refresh their derived projections from the database truth. Other applications keep
+        // their existing persistence path.
+        Self::persist_provider_mutation(state, &app_type, &provider)?;
 
         // Additive mode apps (OpenCode, OpenClaw): optionally write to live config.
         if app_type.is_additive_mode() {
@@ -3280,7 +5967,9 @@ impl ProviderService {
             state
                 .db
                 .set_current_provider(app_type.as_str(), &provider.id)?;
-            write_live_with_common_config(state.db.as_ref(), &app_type, &provider)?;
+            if !Self::is_codex_schema_v2_router(&app_type, &provider) {
+                write_live_with_common_config(state.db.as_ref(), &app_type, &provider)?;
+            }
         }
 
         Ok(true)
@@ -3304,6 +5993,7 @@ impl ProviderService {
         Self::validate_provider_settings(&app_type, &provider)?;
         normalize_provider_common_config_for_storage(state.db.as_ref(), &app_type, &mut provider)?;
         Self::normalize_usage_script_credential_overrides(&app_type, &mut provider);
+        Self::validate_codex_subagent_v2_provider_candidate(state, &provider)?;
 
         if provider_id_changed {
             if !app_type.is_additive_mode() {
@@ -3435,15 +6125,35 @@ impl ProviderService {
             return Ok(true);
         }
 
-        // Save to database
-        state.db.save_provider(app_type.as_str(), &provider)?;
+        // Save through the Codex domain mutation so Provider edits, catalog refreshes and
+        // MultiRouter plan saves all share the same compiler/projection lifecycle.
+        Self::persist_provider_mutation(state, &app_type, &provider)?;
 
         // For other apps: Check if this is current provider (use effective current, not just DB)
         let effective_current =
             crate::settings::get_effective_current_provider(&state.db, &app_type)?;
         let is_current = effective_current.as_deref() == Some(provider.id.as_str());
 
-        if is_current {
+        if is_current && Self::is_codex_schema_v2_router(&app_type, &provider) {
+            let status = crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
+                state.db.as_ref(),
+                &provider.id,
+                true,
+            )?;
+            if status.state == crate::codex_multirouter::projection::ProjectionState::Pending {
+                log::warn!(
+                    "Codex MultiRouter projection pending after current Provider update: router={} code={}",
+                    provider.id,
+                    status
+                        .last_error_code
+                        .as_deref()
+                        .unwrap_or("projection_pending")
+                );
+            }
+            return Ok(true);
+        }
+
+        if is_current && !Self::is_codex_schema_v2_router(&app_type, &provider) {
             // 如果 Claude 代理接管处于激活状态，并且代理服务正在运行：
             // - 不直接走普通 Live 写入逻辑
             // - 改为更新 Live 备份，并在 Claude 下同步代理安全的 Live 配置
@@ -3513,11 +6223,301 @@ impl ProviderService {
         Ok(true)
     }
 
+    fn persist_provider_mutation(
+        state: &AppState,
+        app_type: &AppType,
+        provider: &Provider,
+    ) -> Result<(), AppError> {
+        if *app_type != AppType::Codex {
+            return state.db.save_provider(app_type.as_str(), provider);
+        }
+
+        let outcome = crate::codex_multirouter::mutation::apply_codex_provider_mutation(
+            state.db.as_ref(),
+            provider.clone(),
+        )?;
+        for projection in outcome.projections {
+            if projection.state == crate::codex_multirouter::projection::ProjectionState::Pending {
+                log::warn!(
+                    "Codex MultiRouter projection pending after Provider mutation: router={} code={}",
+                    projection.router_provider_id,
+                    projection.last_error_code.as_deref().unwrap_or("projection_pending")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn is_codex_schema_v2_router(app_type: &AppType, provider: &Provider) -> bool {
+        if *app_type != AppType::Codex {
+            return false;
+        }
+        provider
+            .settings_config
+            .get("codexRouting")
+            .and_then(|routing| {
+                crate::codex_multirouter::schema::CodexRoutingDocument::parse(routing).ok()
+            })
+            .is_some_and(|routing| {
+                matches!(
+                    routing,
+                    crate::codex_multirouter::schema::CodexRoutingDocument::V2(_)
+                )
+            })
+    }
+
+    fn ensure_codex_multirouter_activation_schema(
+        app_type: &AppType,
+        provider: &Provider,
+    ) -> Result<(), AppError> {
+        if *app_type != AppType::Codex {
+            return Ok(());
+        }
+        let Some(routing) = provider
+            .settings_config
+            .get("codexRouting")
+            .and_then(Value::as_object)
+        else {
+            return Ok(());
+        };
+        let enabled = routing
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let has_routes = routing
+            .get("routes")
+            .and_then(Value::as_array)
+            .is_some_and(|routes| !routes.is_empty());
+        if !enabled && !has_routes {
+            return Ok(());
+        }
+        if routing.get("schemaVersion").and_then(Value::as_u64) == Some(2) {
+            return Ok(());
+        }
+        Err(AppError::Message(
+            "codex_multirouter_migration_required".to_string(),
+        ))
+    }
+
+    fn refresh_codex_multirouter_projection_after_activation(
+        state: &AppState,
+        app_type: &AppType,
+        provider: &Provider,
+    ) -> Result<Vec<String>, AppError> {
+        if !Self::is_codex_schema_v2_router(app_type, provider) {
+            return Ok(Vec::new());
+        }
+        let status = crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
+            state.db.as_ref(),
+            &provider.id,
+            true,
+        )?;
+        if status.state == crate::codex_multirouter::projection::ProjectionState::Pending {
+            return Ok(vec!["codex_multirouter_projection_pending".to_string()]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn finish_codex_subagent_v2_mutation(
+        state: &AppState,
+        provider_id: &str,
+        candidate_settings: Value,
+    ) -> Result<CodexSubagentV2MutationResult, AppError> {
+        let mut provider = state
+            .db
+            .get_provider_by_id(provider_id, AppType::Codex.as_str())?
+            .ok_or_else(|| AppError::InvalidInput("Codex provider does not exist".to_string()))?;
+        provider.settings_config = candidate_settings;
+
+        let current = crate::settings::get_effective_current_provider(&state.db, &AppType::Codex);
+        let projection = match current {
+            Ok(Some(current_id)) if current_id == provider_id => {
+                match Self::sync_current_provider_for_app(state, AppType::Codex) {
+                    Ok(()) => CodexSubagentV2ProjectionOutcome {
+                        status: CodexSubagentV2ProjectionStatus::Applied,
+                        warning: None,
+                    },
+                    Err(error) => {
+                        log::warn!(
+                            "Codex V2 子 Agent 数据库保存成功但 live 投影失败；\
+                             将在后续同步重试，error_kind={}",
+                            app_error_diagnostic_kind(&error)
+                        );
+                        CodexSubagentV2ProjectionOutcome {
+                            status: CodexSubagentV2ProjectionStatus::PendingRetry,
+                            warning: Some(codex_subagent_v2_projection_warning(
+                                CODEX_LIVE_PROJECTION_RETRY_CODE,
+                                CODEX_LIVE_PROJECTION_RETRY_MESSAGE,
+                            )),
+                        }
+                    }
+                }
+            }
+            Ok(_) => CodexSubagentV2ProjectionOutcome {
+                status: CodexSubagentV2ProjectionStatus::NotRequired,
+                warning: None,
+            },
+            Err(error) => {
+                log::warn!(
+                    "Codex V2 子 Agent 数据库保存成功但当前 Provider 查询失败；\
+                     将在后续同步重试，error_kind={}",
+                    app_error_diagnostic_kind(&error)
+                );
+                CodexSubagentV2ProjectionOutcome {
+                    status: CodexSubagentV2ProjectionStatus::PendingRetry,
+                    warning: Some(codex_subagent_v2_projection_warning(
+                        CODEX_CURRENT_PROVIDER_LOOKUP_RETRY_CODE,
+                        CODEX_CURRENT_PROVIDER_LOOKUP_RETRY_MESSAGE,
+                    )),
+                }
+            }
+        };
+        let effective_settings = Self::codex_subagent_effective_settings(state, &provider, false);
+        let verification = match effective_settings {
+            Ok(settings) => {
+                codex_subagent_v2_write_verification(state, &settings, projection.status)
+            }
+            Err(error) => {
+                log::warn!(
+                    "Codex V2 子 Agent 无法重建 Provider-derived 验证目录，error_kind={}",
+                    app_error_diagnostic_kind(&error)
+                );
+                CodexSubagentV2WriteVerification {
+                    database_persisted: true,
+                    role_files_status: match projection.status {
+                        CodexSubagentV2ProjectionStatus::NotRequired => {
+                            CodexSubagentV2RoleFilesStatus::NotRequired
+                        }
+                        _ => CodexSubagentV2RoleFilesStatus::Failed,
+                    },
+                    role_files: Vec::new(),
+                    activation: CodexSubagentV2ActivationBoundary::RestartCodexAndStartNewSession,
+                }
+            }
+        };
+        Ok(CodexSubagentV2MutationResult {
+            provider,
+            projection,
+            verification,
+        })
+    }
+
+    /// Persist one V2 capability document without replacing the surrounding Provider record.
+    /// The DAO acquires an IMMEDIATE write boundary, merges the focused field into the latest
+    /// settings, and invokes the full compiler validation closure before committing.
+    pub fn update_codex_subagent_v2(
+        state: &AppState,
+        provider_id: &str,
+        subagent_v2: Value,
+    ) -> Result<CodexSubagentV2MutationResult, AppError> {
+        let effective_catalog = Self::codex_subagent_effective_catalog(state, provider_id)?;
+        let provider_context =
+            crate::codex_config::codex_provider_classification_context(state.db.as_ref())?;
+        let transform_catalog = effective_catalog.clone();
+        let validate_catalog = effective_catalog;
+        let candidate = state.db.update_codex_subagent_v2(
+            provider_id,
+            move |settings| {
+                let effective = Self::with_codex_derived_catalog(settings, &transform_catalog);
+                Ok(
+                    crate::codex_config::hydrate_codex_subagent_v2_input_modalities(
+                        &effective,
+                        &subagent_v2,
+                    ),
+                )
+            },
+            move |settings| {
+                let effective = Self::with_codex_derived_catalog(settings, &validate_catalog);
+                crate::codex_config::validate_codex_subagent_v2_candidate(
+                    &effective,
+                    Some(&provider_context),
+                    true,
+                )
+            },
+        )?;
+        Self::finish_codex_subagent_v2_mutation(state, provider_id, candidate)
+    }
+
+    pub fn initialize_codex_subagent_v2(
+        state: &AppState,
+        provider_id: &str,
+    ) -> Result<CodexSubagentV2MutationResult, AppError> {
+        let effective_catalog = Self::codex_subagent_effective_catalog(state, provider_id)?;
+        let provider_context =
+            crate::codex_config::codex_provider_classification_context(state.db.as_ref())?;
+        let transform_context = provider_context.clone();
+        let transform_catalog = effective_catalog.clone();
+        let validate_catalog = effective_catalog;
+        let candidate = state.db.update_codex_subagent_v2(
+            provider_id,
+            move |settings| {
+                let effective = Self::with_codex_derived_catalog(settings, &transform_catalog);
+                crate::codex_config::initialize_codex_subagent_v2_for_candidate(
+                    &effective,
+                    Some(&transform_context),
+                )
+            },
+            move |settings| {
+                let effective = Self::with_codex_derived_catalog(settings, &validate_catalog);
+                crate::codex_config::validate_codex_subagent_v2_candidate(
+                    &effective,
+                    Some(&provider_context),
+                    true,
+                )
+            },
+        )?;
+        Self::finish_codex_subagent_v2_mutation(state, provider_id, candidate)
+    }
+
+    pub fn reconcile_codex_subagent_v2_profiles(
+        state: &AppState,
+        provider_id: &str,
+        action: crate::codex_config::CodexSubagentV2ReconcileAction,
+        subagent_v2: Option<Value>,
+    ) -> Result<CodexSubagentV2MutationResult, AppError> {
+        if subagent_v2.is_none() {
+            return Err(AppError::InvalidInput(
+                "Reconcile actions require the current subagentV2 draft".to_string(),
+            ));
+        }
+        let effective_catalog = Self::codex_subagent_effective_catalog(state, provider_id)?;
+        let provider_context =
+            crate::codex_config::codex_provider_classification_context(state.db.as_ref())?;
+        let transform_context = provider_context.clone();
+        let transform_catalog = effective_catalog.clone();
+        let validate_catalog = effective_catalog;
+        let candidate = state.db.update_codex_subagent_v2(
+            provider_id,
+            move |settings| {
+                let effective = Self::with_codex_derived_catalog(settings, &transform_catalog);
+                crate::codex_config::reconcile_codex_subagent_v2_for_candidate(
+                    &effective,
+                    action,
+                    subagent_v2.as_ref(),
+                    Some(&transform_context),
+                )
+            },
+            move |settings| {
+                let effective = Self::with_codex_derived_catalog(settings, &validate_catalog);
+                crate::codex_config::validate_codex_subagent_v2_candidate(
+                    &effective,
+                    Some(&provider_context),
+                    false,
+                )
+            },
+        )?;
+        Self::finish_codex_subagent_v2_mutation(state, provider_id, candidate)
+    }
+
     /// Delete a provider
     ///
     /// 同时检查本地 settings 和数据库的当前供应商，防止删除任一端正在使用的供应商。
     /// 对于累加模式应用（OpenCode, OpenClaw），可以随时删除任意供应商，同时从 live 配置中移除。
-    pub fn delete(state: &AppState, app_type: AppType, id: &str) -> Result<(), AppError> {
+    pub fn delete(
+        state: &AppState,
+        app_type: AppType,
+        id: &str,
+    ) -> Result<crate::codex_multirouter::mutation::CodexProviderDeleteOutcome, AppError> {
         // Additive mode apps - no current provider concept
         if app_type.is_additive_mode() {
             // Single DB read shared across all additive-mode sub-paths below.
@@ -3540,7 +6540,7 @@ impl ProviderService {
                     if was_current {
                         crate::services::OmoService::delete_config_file(variant)?;
                     }
-                    return Ok(());
+                    return Ok(Self::empty_provider_delete_outcome(id));
                 }
             }
 
@@ -3563,7 +6563,7 @@ impl ProviderService {
                 }
             }
             state.db.delete_provider(app_type.as_str(), id)?;
-            return Ok(());
+            return Ok(Self::empty_provider_delete_outcome(id));
         }
 
         // For other apps: Check both local settings and database
@@ -3576,7 +6576,49 @@ impl ProviderService {
             ));
         }
 
-        state.db.delete_provider(app_type.as_str(), id)
+        if app_type != AppType::Codex {
+            state.db.delete_provider(app_type.as_str(), id)?;
+            return Ok(Self::empty_provider_delete_outcome(id));
+        }
+
+        let current_provider_id =
+            crate::settings::get_effective_current_provider(state.db.as_ref(), &AppType::Codex)?;
+        crate::codex_multirouter::mutation::apply_codex_provider_delete_with_hooks(
+            state.db.as_ref(),
+            id,
+            current_provider_id.as_deref(),
+            || {
+                state.db.ensure_official_seed_by_id(
+                    crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+                    AppType::Codex,
+                )?;
+                Self::switch(
+                    state,
+                    AppType::Codex,
+                    crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+                )?;
+                crate::codex_config::force_codex_builtin_openai_live_provider()?;
+                Ok(())
+            },
+            |artifact| {
+                crate::codex_config::publish_codex_multirouter_projection(
+                    &artifact.projection_settings,
+                )
+                .map_err(|error| error.to_string())
+            },
+        )
+    }
+
+    fn empty_provider_delete_outcome(
+        id: &str,
+    ) -> crate::codex_multirouter::mutation::CodexProviderDeleteOutcome {
+        crate::codex_multirouter::mutation::CodexProviderDeleteOutcome {
+            deleted_provider_id: id.to_string(),
+            affected_plan_ids: Vec::new(),
+            disabled_plan_ids: Vec::new(),
+            removed_candidates: Vec::new(),
+            projections: Vec::new(),
+        }
     }
 
     /// Remove provider from live config only (for additive mode apps like OpenCode, OpenClaw)
@@ -3658,6 +6700,7 @@ impl ProviderService {
         let _provider = providers
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
+        Self::ensure_codex_multirouter_activation_schema(&app_type, _provider)?;
 
         // OMO providers are switched through their own exclusive path.
         if matches!(app_type, AppType::OpenCode) && _provider.category.as_deref() == Some("omo") {
@@ -3702,6 +6745,11 @@ impl ProviderService {
             .detect_takeover_in_live_config_for_app(&app_type);
 
         let should_hot_switch = is_app_taken_over || live_taken_over;
+        let codex_before = if matches!(app_type, AppType::Codex) {
+            Some(CodexSwitchStateSnapshot::capture(state)?)
+        } else {
+            None
+        };
 
         // Block switching to official providers when proxy takeover is active.
         // Using a proxy with official APIs (Anthropic/OpenAI/Google) may cause account bans.
@@ -3718,7 +6766,7 @@ impl ProviderService {
             );
             // 官方兜底 provider 不是走本地代理热切，而是退出当前 app 的接管态后
             // 写回干净 live 配置；否则 Codex 会继续命中旧的本地 router。
-            block_on_tauri_runtime(
+            let mut mutation = block_on_tauri_runtime(
                 state
                     .proxy_service
                     .disable_takeover_for_app_after_switch_lock(&app_type),
@@ -3727,13 +6775,22 @@ impl ProviderService {
 
             crate::settings::set_current_provider(&app_type, Some(id))?;
             state.db.set_current_provider(app_type.as_str(), id)?;
+            mutation.db_current_after = Some(Some(id.to_string()));
+            mutation.local_current_after = Some(Some(id.to_string()));
             if matches!(app_type, AppType::Codex) {
-                write_codex_config_only_with_common_config(state.db.as_ref(), _provider)?;
+                let receipt = write_codex_config_only_with_common_config_with_receipt(
+                    state.db.as_ref(),
+                    _provider,
+                )?;
+                mutation.provider_receipts.push(receipt);
             } else {
                 write_live_with_common_config(state.db.as_ref(), &app_type, _provider)?;
             }
-            McpService::sync_all_enabled(state)?;
-            return Ok(SwitchResult::default());
+            let result = SwitchResult::default();
+            if let Some(before) = codex_before {
+                return Self::finish_codex_switch_mutation_result(before, result, mutation);
+            }
+            return Ok(result);
         }
 
         if matches!(app_type, AppType::Codex)
@@ -3744,14 +6801,23 @@ impl ProviderService {
                 "Codex provider '{}' 需要 Chat 转换或多模型路由，自动启用 Codex 接管并通过本地代理处理",
                 id
             );
-            block_on_tauri_runtime(
+            let mutation = block_on_tauri_runtime(
                 state
                     .proxy_service
                     .takeover_app_and_switch_provider_after_switch_lock(&app_type, id),
             )
             .map_err(|e| AppError::Message(format!("启用 Codex 本地代理接管失败: {e}")))?;
 
-            return Ok(SwitchResult::default());
+            let result = SwitchResult {
+                warnings: Self::refresh_codex_multirouter_projection_after_activation(
+                    state, &app_type, _provider,
+                )?,
+                ..Default::default()
+            };
+            if let Some(before) = codex_before {
+                return Self::finish_codex_switch_mutation_result(before, result, mutation);
+            }
+            return Ok(result);
         }
 
         if should_hot_switch {
@@ -3764,7 +6830,7 @@ impl ProviderService {
                 id
             );
 
-            block_on_tauri_runtime(
+            let outcome = block_on_tauri_runtime(
                 state
                     .proxy_service
                     .hot_switch_provider_inner(app_type.as_str(), id),
@@ -3773,11 +6839,327 @@ impl ProviderService {
 
             // The proxy server will route requests to the new provider via is_current.
             // MCP sync is intentionally skipped while Live config is owned by takeover.
-            return Ok(SwitchResult::default());
+            let result = SwitchResult {
+                warnings: Self::refresh_codex_multirouter_projection_after_activation(
+                    state, &app_type, _provider,
+                )?,
+                ..Default::default()
+            };
+            if let (Some(before), Some(mutation)) = (codex_before, outcome.codex_mutation) {
+                return Self::finish_codex_switch_mutation_result(before, result, mutation);
+            }
+            return Ok(result);
         }
 
         // Normal mode: full switch with Live config write
-        Self::switch_normal(state, app_type, id, &providers)
+        let result = Self::switch_normal(state, app_type, id, &providers)?;
+        Self::finish_codex_switch_result(codex_before, result, id)
+    }
+
+    fn finish_codex_switch_result(
+        before: Option<CodexSwitchStateSnapshot>,
+        mut result: SwitchResult,
+        target_id: &str,
+    ) -> Result<SwitchResult, AppError> {
+        let Some(before) = before else {
+            return Ok(result);
+        };
+        let provider_receipt = result.codex_provider_receipt.take();
+        let mcp_receipt = result.codex_mcp_receipt.take();
+        let auth_cleanup_attempt = result.codex_auth_cleanup_attempt.take();
+        #[cfg(test)]
+        maybe_mutate_codex_switch_after_writers();
+        let mut provider_receipts = provider_receipt.into_iter().collect::<Vec<_>>();
+        if let Some(receipt) = mcp_receipt {
+            provider_receipts.push(receipt);
+        }
+        let mutation = CodexSwitchMutationReceipt {
+            provider_receipts,
+            db_current_after: Some(Some(target_id.to_string())),
+            local_current_after: Some(Some(target_id.to_string())),
+            ..Default::default()
+        };
+        let after = CodexSwitchStateSnapshot::after_from_mutation(
+            &before,
+            &mutation,
+            auth_cleanup_attempt.as_ref(),
+        );
+        result.codex_receipt = Some(CodexSwitchReceipt {
+            provider_receipts: mutation.provider_receipts,
+            auth_attempts: Vec::new(),
+            auth_cleanup_attempt,
+            before,
+            after,
+        });
+        Ok(result)
+    }
+
+    fn finish_codex_switch_mutation_result(
+        before: CodexSwitchStateSnapshot,
+        mut result: SwitchResult,
+        mut mutation: CodexSwitchMutationReceipt,
+    ) -> Result<SwitchResult, AppError> {
+        // This is the exact ownership boundary for takeover and hot-switch
+        // branches.  The injected write happens before any after-state read;
+        // production code receives the already committed typed receipts and
+        // must not recapture the filesystem here.
+        #[cfg(test)]
+        maybe_mutate_codex_switch_after_writers();
+        mutation
+            .provider_receipts
+            .append(&mut mutation.mcp_receipts);
+        let after = CodexSwitchStateSnapshot::after_from_mutation(&before, &mutation, None);
+        let provider_receipts = mutation.provider_receipts;
+        let auth_attempts = mutation.auth_attempts;
+        result.codex_receipt = Some(CodexSwitchReceipt {
+            provider_receipts,
+            auth_attempts,
+            auth_cleanup_attempt: None,
+            before,
+            after,
+        });
+        Ok(result)
+    }
+
+    /// Back up, narrowly repair, and retry one failed Codex provider switch.
+    ///
+    /// This is deliberately separate from normal switching: users must explicitly choose the
+    /// recovery action. The original Provider row and exact Live TOML bytes are restored if any
+    /// later projection or switch step fails.
+    pub fn force_repair_and_switch_codex_provider(
+        state: &AppState,
+        provider_id: &str,
+    ) -> Result<CodexForceRepairOutcome, AppError> {
+        let original_provider = state
+            .db
+            .get_provider_by_id(provider_id, AppType::Codex.as_str())?
+            .ok_or_else(|| AppError::Message(format!("Codex 供应商 {provider_id} 不存在")))?;
+        let original_current_provider = Self::current(state, AppType::Codex)?;
+        let config_path = crate::codex_config::get_codex_config_path();
+        let original_live_snapshot = crate::codex_config::ExactCodexSnapshot::read(&config_path)?;
+        let original_live = original_live_snapshot.text(&config_path)?;
+        let live_repair =
+            crate::codex_config::repair_codex_live_config_text_for_force_switch(&original_live)?;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let backup_directory = crate::config::get_home_dir()
+            .join(".cc-switch")
+            .join("backups")
+            .join("codex-force-repair")
+            .join(format!(
+                "{timestamp}-{}",
+                crate::config::sanitize_provider_name(provider_id)
+            ));
+        std::fs::create_dir_all(&backup_directory)
+            .map_err(|error| AppError::io(&backup_directory, error))?;
+        crate::config::write_text_file(&backup_directory.join("config.toml"), &original_live)?;
+        let provider_backup = serde_json::to_string_pretty(&original_provider)
+            .map_err(|error| AppError::Message(format!("序列化 Codex 供应商备份失败: {error}")))?;
+        crate::config::write_text_file(&backup_directory.join("provider.json"), &provider_backup)?;
+
+        let restore_original_state =
+            |config_attempt: Option<&crate::codex_config::CommittedCodexAttempt>,
+             switch_receipt: Option<&CodexSwitchReceipt>|
+             -> Result<(), AppError> {
+                #[cfg(test)]
+                maybe_mutate_force_repair_live_before_rollback(&config_path);
+                let mut restore_deferred = false;
+
+                // Special switch branches mutate proxy-owned Live, auth,
+                // catalog/cache and takeover state behind the provider API.
+                // Restore their complete typed boundary first, while DB/local
+                // current still equal the receipt's after state.  This also
+                // covers the official-switch stale-auth deletion, whose
+                // writer has an optional-file (missing) after fingerprint.
+                if let Some(receipt) = switch_receipt {
+                    #[cfg(test)]
+                    maybe_mutate_force_repair_companion_before_rollback();
+                    if !receipt.after.restore_files_if_unchanged(
+                        &receipt.before,
+                        &receipt.provider_receipts,
+                        &receipt.auth_attempts,
+                        receipt.auth_cleanup_attempt.as_ref(),
+                        state,
+                    )? {
+                        restore_deferred = true;
+                    }
+                }
+
+                if let Some(attempt) = config_attempt {
+                    if !attempt.restore_if_unchanged(&config_path)? {
+                        restore_deferred = true;
+                    }
+                }
+
+                // Current-provider pointers are shared state too.  Restore them
+                // only while they still equal this switch's committed after
+                // state; otherwise a user/device update made after the failed
+                // attempt would be silently overwritten by force-repair.
+                let current_db = state.db.get_current_provider(AppType::Codex.as_str())?;
+                let current_local = crate::settings::get_current_provider(&AppType::Codex);
+                let current_owned = if let Some(receipt) = switch_receipt {
+                    current_db == receipt.after.db_current
+                        && current_local == receipt.after.local_current
+                } else {
+                    // If the switch failed before producing a receipt, the only
+                    // states force-repair may own are the original state (no
+                    // pointer changed) or the requested target pointer.
+                    let original_db = (!original_current_provider.is_empty())
+                        .then_some(original_current_provider.clone());
+                    let original_local = original_db.clone();
+                    (current_db == original_db && current_local == original_local)
+                        || (current_db.as_deref() == Some(provider_id)
+                            && current_local.as_deref() == Some(provider_id))
+                };
+                if !current_owned {
+                    restore_deferred = true;
+                } else {
+                    state
+                        .db
+                        .save_provider(AppType::Codex.as_str(), &original_provider)?;
+                    state.db.set_current_provider(
+                        AppType::Codex.as_str(),
+                        original_current_provider.as_str(),
+                    )?;
+                    crate::settings::set_current_provider(
+                        &AppType::Codex,
+                        (!original_current_provider.is_empty())
+                            .then_some(original_current_provider.as_str()),
+                    )?;
+                }
+
+                if restore_deferred {
+                    return Err(AppError::Message(
+                        "自动回滚恢复未完成：检测到 Codex 文件或代理状态并发修改，已保留最新现场"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            };
+
+        let mut repaired_provider = original_provider.clone();
+        let reasoning_repair =
+            crate::proxy::providers::codex_reasoning::repair_invalid_reasoning_capabilities(
+                &mut repaired_provider.settings_config,
+            );
+        state
+            .db
+            .save_provider(AppType::Codex.as_str(), &repaired_provider)?;
+        let initial_attempt =
+            match crate::codex_config::write_codex_live_config_reconcile_with_attempt(
+                &config_path,
+                |live| {
+                    crate::codex_config::repair_codex_live_config_text_for_force_switch(live)
+                        .map(|repair| repair.config_text)
+                },
+            ) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    return match restore_original_state(None, None) {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(AppError::Message(format!(
+                        "强制覆盖写入前迁移失败: {error}; 自动回滚也失败: {restore_error}; 备份位于 {}",
+                        backup_directory.display()
+                    ))),
+                };
+                }
+            };
+
+        let switch_result = match Self::switch(state, AppType::Codex, provider_id) {
+            Ok(result) => result,
+            Err(error) => {
+                return match restore_original_state(Some(&initial_attempt), None) {
+                    Ok(()) => Err(AppError::Message(format!(
+                        "强制覆盖失败，已恢复原配置: {error}; 备份位于 {}",
+                        backup_directory.display()
+                    ))),
+                    Err(restore_error) => Err(AppError::Message(format!(
+                        "强制覆盖失败: {error}; 自动回滚也失败: {restore_error}; 备份位于 {}",
+                        backup_directory.display()
+                    ))),
+                };
+            }
+        };
+        #[cfg(test)]
+        maybe_mutate_force_repair_companion_after_switch();
+        #[cfg(test)]
+        maybe_mutate_force_repair_config_after_switch(&config_path);
+        #[cfg(test)]
+        maybe_mutate_force_repair_current_after_switch(state);
+        #[cfg(test)]
+        maybe_mutate_force_repair_auth_after_switch(&crate::codex_config::get_codex_auth_path());
+
+        let switch_receipt = match switch_result.codex_receipt.as_ref() {
+            Some(receipt) => receipt,
+            None => {
+                let error = AppError::Message(
+                    "强制覆盖未取得 Codex provider 写入回执，无法安全回滚副作用".to_string(),
+                );
+                return match restore_original_state(Some(&initial_attempt), None) {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(AppError::Message(format!(
+                        "{error}; 自动回滚也失败: {restore_error}; 备份位于 {}",
+                        backup_directory.display()
+                    ))),
+                };
+            }
+        };
+
+        #[cfg(test)]
+        if take_force_repair_finalize_error() {
+            let error = AppError::Message("测试注入的 force-repair finalize 失败".to_string());
+            return match restore_original_state(Some(&initial_attempt), Some(switch_receipt)) {
+                Ok(()) => Err(AppError::Message(format!(
+                    "强制覆盖最终校验失败，已恢复原配置: {error}; 备份位于 {}",
+                    backup_directory.display()
+                ))),
+                Err(restore_error) => Err(AppError::Message(format!(
+                    "强制覆盖最终校验失败: {error}; 自动回滚也失败: {restore_error}; 备份位于 {}",
+                    backup_directory.display()
+                ))),
+            };
+        }
+
+        #[cfg(test)]
+        maybe_mutate_force_repair_before_finalize(&config_path);
+        let finalize_result = crate::codex_config::write_codex_live_config_reconcile_with_attempt(
+            &config_path,
+            |current_live| {
+                let merged =
+                    crate::codex_config::restore_codex_user_owned_tables_after_force_switch(
+                        &live_repair.config_text,
+                        current_live,
+                    )?;
+                crate::codex_config::repair_codex_live_config_text_for_force_switch(&merged)
+                    .map(|repair| repair.config_text)
+            },
+        );
+        if let Err(error) = finalize_result {
+            return match restore_original_state(Some(&initial_attempt), Some(switch_receipt)) {
+                Ok(()) => Err(AppError::Message(format!(
+                    "强制覆盖最终校验失败，已恢复原配置: {error}; 备份位于 {}",
+                    backup_directory.display()
+                ))),
+                Err(restore_error) => Err(AppError::Message(format!(
+                    "强制覆盖最终校验失败: {error}; 自动回滚也失败: {restore_error}; 备份位于 {}",
+                    backup_directory.display()
+                ))),
+            };
+        }
+
+        let mut warnings = live_repair.warnings;
+        warnings.extend(reasoning_repair.warnings);
+        warnings.extend(switch_result.warnings);
+        Ok(CodexForceRepairOutcome {
+            provider_id: provider_id.to_string(),
+            backup_directory: backup_directory.to_string_lossy().into_owned(),
+            repaired_fields: live_repair.repaired_fields,
+            repaired_models: reasoning_repair.repaired_models,
+            warnings,
+        })
     }
 
     /// Normal switch flow (non-proxy mode)
@@ -3790,6 +7172,22 @@ impl ProviderService {
         let provider = providers
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
+
+        // Validate Codex's provider-live payload before backfilling the old
+        // provider or changing either current-provider pointer.  A missing
+        // `config` field is an absent input, not an instruction to write an
+        // empty config.toml; common config is applied first so a shared
+        // snippet that supplies the field remains a valid target.
+        if matches!(app_type, AppType::Codex) {
+            let effective = build_effective_settings_with_common_config(
+                state.db.as_ref(),
+                &app_type,
+                provider,
+            )?;
+            if effective.get("config").and_then(Value::as_str).is_none() {
+                return Err(crate::codex_config::missing_codex_live_config_error());
+            }
+        }
 
         // OMO ↔ OMO Slim are mutually exclusive; activating one removes the other's config file.
         if matches!(app_type, AppType::OpenCode) {
@@ -3868,8 +7266,16 @@ impl ProviderService {
             state.db.set_current_provider(app_type.as_str(), id)?;
         }
 
-        // Sync to live (write_gemini_live handles security flag internally for Gemini)
-        write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
+        // Sync to live (write_gemini_live handles security flag internally for Gemini).
+        // Keep the Codex ownership receipt in the in-process switch result so
+        // explicit force-repair can roll back exactly the files committed by
+        // this switch, without inferring ownership by rereading them later.
+        if matches!(app_type, AppType::Codex) {
+            result.codex_provider_receipt =
+                write_live_with_common_config_with_receipt(state.db.as_ref(), &app_type, provider)?;
+        } else {
+            write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
+        }
 
         // A material-less official Codex provider gets a config-only live
         // write, which can leave the previous third-party key in
@@ -3883,14 +7289,17 @@ impl ProviderService {
             && provider.category.as_deref() == Some("official")
         {
             let db_auth = provider.settings_config.get("auth");
-            match crate::codex_config::clear_stale_codex_live_auth_after_official_switch(
+            match crate::codex_config::clear_stale_codex_live_auth_after_official_switch_with_receipt(
                 db_auth.unwrap_or(&serde_json::Value::Null),
             ) {
-                Ok(true) => log::info!(
+                Ok(Some(attempt)) => {
+                    result.codex_auth_cleanup_attempt = Some(attempt);
+                    log::info!(
                     "Removed stale third-party auth.json after switching to official Codex provider '{}'",
                     provider.id
-                ),
-                Ok(false) => {}
+                    )
+                }
+                Ok(None) => {}
                 Err(e) => log::warn!("Failed to clean stale Codex auth.json: {e}"),
             }
         }
@@ -3986,6 +7395,15 @@ impl ProviderService {
         let Some(provider) = providers.get(&current_id) else {
             return Ok(());
         };
+
+        if Self::is_codex_schema_v2_router(&app_type, provider) {
+            crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
+                state.db.as_ref(),
+                &provider.id,
+                true,
+            )?;
+            return Ok(());
+        }
 
         let has_live_backup = block_on_tauri_runtime(state.db.get_live_backup(app_type.as_str()))
             .ok()
@@ -5224,6 +8642,60 @@ impl ProviderService {
             }
         }
     }
+
+    fn validate_codex_subagent_v2_provider_candidate(
+        state: &AppState,
+        provider: &Provider,
+    ) -> Result<(), AppError> {
+        if provider
+            .settings_config
+            .pointer("/codexRouting/subagentV2")
+            .is_none()
+        {
+            return Ok(());
+        }
+        let effective_settings = Self::codex_subagent_effective_settings(state, provider, true)?;
+        let provider_context =
+            crate::codex_config::codex_provider_classification_context(state.db.as_ref())?;
+        crate::codex_config::validate_codex_subagent_v2_candidate(
+            &effective_settings,
+            Some(&provider_context),
+            true,
+        )
+    }
+
+    fn codex_subagent_effective_settings(
+        state: &AppState,
+        provider: &Provider,
+        strict_router_references: bool,
+    ) -> Result<Value, AppError> {
+        crate::codex_multirouter::projection::effective_settings_for_candidate(
+            state.db.as_ref(),
+            provider,
+            strict_router_references,
+        )
+    }
+
+    fn codex_subagent_effective_catalog(
+        state: &AppState,
+        provider_id: &str,
+    ) -> Result<Value, AppError> {
+        let provider = state
+            .db
+            .get_provider_by_id(provider_id, AppType::Codex.as_str())?
+            .ok_or_else(|| AppError::InvalidInput("Codex provider does not exist".to_string()))?;
+        let effective = Self::codex_subagent_effective_settings(state, &provider, false)?;
+        Ok(effective
+            .get("modelCatalog")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"models": []})))
+    }
+
+    fn with_codex_derived_catalog(settings: &Value, catalog: &Value) -> Value {
+        let mut effective = settings.clone();
+        effective["modelCatalog"] = catalog.clone();
+        effective
+    }
 }
 
 /// Normalize Claude model keys in a JSON value
@@ -5346,9 +8818,6 @@ impl ProviderService {
         // 获取统一供应商（用于删除生成的子供应商）
         let provider = state.db.get_universal_provider(id)?;
 
-        // 删除统一供应商
-        state.db.delete_universal_provider(id)?;
-
         // 删除生成的子供应商
         if let Some(p) = provider {
             if p.apps.claude {
@@ -5357,13 +8826,24 @@ impl ProviderService {
             }
             if p.apps.codex {
                 let codex_id = format!("universal-codex-{id}");
-                let _ = state.db.delete_provider("codex", &codex_id);
+                if state
+                    .db
+                    .get_provider_by_id(&codex_id, AppType::Codex.as_str())?
+                    .is_some()
+                {
+                    Self::delete(state, AppType::Codex, &codex_id)?;
+                }
             }
             if p.apps.gemini {
                 let gemini_id = format!("universal-gemini-{id}");
                 let _ = state.db.delete_provider("gemini", &gemini_id);
             }
         }
+
+        // Delete the universal definition only after every generated child has been handled.
+        // In particular, Codex deletion may need to cascade MultiRouter routes or reject deleting
+        // a currently active Provider; either outcome must leave the universal definition intact.
+        state.db.delete_universal_provider(id)?;
 
         Ok(true)
     }
@@ -5398,10 +8878,16 @@ impl ProviderService {
                 Self::merge_json(&mut merged, &codex_provider.settings_config);
                 codex_provider.settings_config = merged;
             }
-            state.db.save_provider("codex", &codex_provider)?;
+            Self::persist_provider_mutation(state, &AppType::Codex, &codex_provider)?;
         } else {
             let codex_id = format!("universal-codex-{id}");
-            let _ = state.db.delete_provider("codex", &codex_id);
+            if state
+                .db
+                .get_provider_by_id(&codex_id, AppType::Codex.as_str())?
+                .is_some()
+            {
+                Self::delete(state, AppType::Codex, &codex_id)?;
+            }
         }
 
         // 同步到 Gemini

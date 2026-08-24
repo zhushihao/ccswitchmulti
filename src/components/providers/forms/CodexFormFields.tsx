@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import {
@@ -11,6 +12,7 @@ import {
 } from "@/components/ui/dialog";
 import { FormLabel } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
   SelectContent,
@@ -30,11 +32,7 @@ import {
   ChevronRight,
   ArrowDown,
   ArrowUp,
-  Download,
-  Loader2,
-  Pencil,
   Plus,
-  Route,
   Trash2,
 } from "lucide-react";
 import EndpointSpeedTest from "./EndpointSpeedTest";
@@ -51,6 +49,10 @@ import {
 } from "@/lib/api/model-fetch";
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
+import { CodexProviderReadinessSection } from "./CodexProviderReadinessSection";
+import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
+import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
+import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
 import { cn } from "@/lib/utils";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
 import {
@@ -63,13 +65,19 @@ import type {
   CodexApiFormat,
   CodexCatalogModel,
   CodexChatReasoning,
+  CodexModelReasoningCapability,
+  CodexReasoningEffort,
   CodexRoutingConfig,
-  CodexRoutingRoute,
-  CodexRoutingAuthSource,
   PromptCacheRoutingMode,
+  Provider,
   ProviderCategory,
 } from "@/types";
 import type { AppId } from "@/lib/api";
+import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
+import type {
+  CodexModelReasoningResolution,
+  CodexReasoningDiscoveryOutcome,
+} from "@/types/codexSubagentV2";
 
 interface EndpointCandidate {
   url: string;
@@ -82,6 +90,116 @@ interface CodexProtocolProbeOutcome {
 }
 
 const CODEX_PROTOCOL_PROBE_MODEL_CONCURRENCY = 3;
+const PROVIDER_REASONING_EFFORT_CHOICES: CodexReasoningEffort[] = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+export type CodexReasoningCapabilitySourceMode =
+  | "automatic"
+  | "builtin"
+  | "manual";
+
+export function applyCodexReasoningCapabilitySource(
+  mode: CodexReasoningCapabilitySourceMode,
+  current?: CodexModelReasoningCapability,
+  maintained?: CodexModelReasoningCapability,
+  discovered?: CodexModelReasoningCapability,
+): CodexModelReasoningCapability | undefined {
+  if (mode === "automatic") return undefined;
+  if (mode === "builtin") {
+    return maintained ? structuredClone(maintained) : undefined;
+  }
+  const seed = current ?? maintained ?? discovered;
+  if (seed) return { ...structuredClone(seed), source: "user" };
+  return {
+    schemaVersion: 2,
+    supportStatus: "confirmed_supported",
+    controlKind: "none",
+    supportedEfforts: [],
+    disableAllowed: false,
+    upstream: { format: "none", parameter: "none" },
+    source: "user",
+  };
+}
+
+export function validateCodexReasoningCapabilityDraft(
+  capability: CodexModelReasoningCapability,
+): void {
+  const allowed = new Set<CodexReasoningEffort>(
+    PROVIDER_REASONING_EFFORT_CHOICES,
+  );
+  if (
+    !Array.isArray(capability.supportedEfforts) ||
+    capability.supportedEfforts.some((effort) => !allowed.has(effort))
+  ) {
+    throw new Error("支持的推理强度包含未知档位，或包含仅供 Codex 使用的档位");
+  }
+  // schema v2 用 supportStatus；legacy 数据用 supported。至少声明其一，
+  // 同时存在时不得矛盾。
+  if (
+    capability.supportStatus === undefined &&
+    typeof capability.supported !== "boolean"
+  ) {
+    throw new Error("必须声明该模型是否支持推理");
+  }
+  if (
+    capability.supportStatus !== undefined &&
+    typeof capability.supported === "boolean" &&
+    (capability.supportStatus === "confirmed_supported") !==
+      capability.supported
+  ) {
+    throw new Error("新旧推理支持状态相互冲突");
+  }
+  if (
+    capability.defaultEffort !== undefined &&
+    !capability.supportedEfforts.includes(capability.defaultEffort)
+  ) {
+    throw new Error("默认推理强度不是供应商支持的档位");
+  }
+  if (typeof capability.disableAllowed !== "boolean") {
+    throw new Error("是否允许关闭推理必须是布尔值");
+  }
+  if (
+    !capability.upstream ||
+    typeof capability.upstream.parameter !== "string" ||
+    !capability.upstream.parameter.trim()
+  ) {
+    throw new Error("上游推理参数名不能为空");
+  }
+  for (const target of Object.values(capability.upstream.effortMap ?? {})) {
+    if (target && !capability.supportedEfforts.includes(target)) {
+      throw new Error(`映射目标 ${target} 不是供应商支持的推理强度`);
+    }
+  }
+  const requiresEffortMap =
+    (capability.supportStatus !== undefined
+      ? capability.supportStatus === "confirmed_supported"
+      : capability.supported === true) &&
+    (capability.controlKind ??
+      (capability.supportedEfforts.length > 0 ? "graded" : "unknown")) ===
+      "graded" &&
+    capability.upstream.format !== "none" &&
+    capability.upstream.format !== "boolean";
+  if (requiresEffortMap) {
+    const missing = capability.supportedEfforts.filter(
+      (effort) => !capability.upstream.effortMap?.[effort],
+    );
+    if (missing.length > 0) {
+      throw new Error(`推理强度映射缺少 ${missing.join(", ")} 档`);
+    }
+  }
+  if (capability.codexUltraOrchestration?.enabled) {
+    const ultraTarget = capability.upstream.effortMap?.max;
+    if (!ultraTarget || !capability.supportedEfforts.includes(ultraTarget)) {
+      throw new Error("解锁 Ultra 档需要有效的 max 到供应商推理强度映射");
+    }
+  }
+}
 
 // 用小并发池执行真实上游探测，避免串行太慢，也避免一次性打爆供应商限流。
 async function runCodexProtocolProbePool(
@@ -243,6 +361,7 @@ interface CodexFormFieldsProps {
   providerName?: string;
   // xAI OAuth 托管预设（Grok 订阅）：隐藏 API Key / 端点输入，挂账号选择区块
   isXaiOauthPreset?: boolean;
+  isMaintainedPreset?: boolean;
   isXaiOauthAuthenticated?: boolean;
   selectedXaiAccountId?: string | null;
   onXaiAccountSelect?: (accountId: string | null) => void;
@@ -272,6 +391,7 @@ interface CodexFormFieldsProps {
   // Codex 菜单映射开关；仅控制是否把目录投射到 /model 菜单，不再控制目录/上下文的编辑和保存。
   takeoverEnabled?: boolean;
   onTakeoverEnabledChange?: (enabled: boolean) => void;
+  allowModelMenuProjectionToggle?: boolean;
 
   codexModel?: string;
   onModelChange?: (model: string) => void;
@@ -293,6 +413,8 @@ interface CodexFormFieldsProps {
 
   // Model Catalog
   catalogModels?: CodexCatalogModel[];
+  // Current maintained preset baseline, used only for explicit override/restore.
+  presetCatalogModels?: CodexCatalogModel[];
   onCatalogModelsChange?: (models: CodexCatalogModel[]) => void;
   spawnAgentModels?: string[];
   onSpawnAgentModelsChange?: (models: string[]) => void;
@@ -314,9 +436,57 @@ interface CodexFormFieldsProps {
   onLocalProxyBodyOverrideChange: (value: string) => void;
 }
 
-type CodexCatalogRow = CodexCatalogModel & { rowId: string };
+function capabilityFromReasoningDetection(
+  outcome: CodexReasoningDiscoveryOutcome,
+): CodexModelReasoningCapability | undefined {
+  if (typeof outcome !== "object" || !("found" in outcome)) return undefined;
+  const reasoning = outcome.found.reasoning;
+  if (!reasoning) return undefined;
+  const supportedEfforts = reasoning.supportedEfforts.filter(
+    (effort): effort is CodexReasoningEffort =>
+      ["none", ...PROVIDER_REASONING_EFFORT_CHOICES].includes(effort),
+  );
+  return {
+    schemaVersion: 2,
+    supportStatus: "confirmed_supported",
+    controlKind: supportedEfforts.length > 0 ? "graded" : "boolean",
+    supportedEfforts,
+    defaultEffort: supportedEfforts.includes(
+      reasoning.defaultEffort as CodexReasoningEffort,
+    )
+      ? (reasoning.defaultEffort as CodexReasoningEffort)
+      : supportedEfforts[0],
+    disableAllowed: !reasoning.mandatory,
+    upstream: { format: "reasoning_object", parameter: "reasoning.effort" },
+    outputFormat: "auto",
+    source: "user",
+    confidence: "authoritative",
+  };
+}
 
-type CodexRoutingRow = CodexRoutingRoute & { rowId: string };
+function unknownReasoningResolution(
+  model: string,
+): CodexModelReasoningResolution {
+  return {
+    model,
+    capability: null,
+    source: "unknown",
+    fingerprint: "",
+    resolved: {
+      supportKind: "unknown",
+      confidence: "unverified",
+      codexSelectableEfforts: [],
+      providerAcceptedEfforts: [],
+      providerDefaultEffort: null,
+      disableAllowed: false,
+      effortMap: {},
+    },
+    hasDetectionCandidate: false,
+    detection: null,
+  };
+}
+
+type CodexCatalogRow = CodexCatalogModel & { rowId: string };
 
 export interface CodexProviderSplitSuggestion {
   providerName: string;
@@ -324,7 +494,15 @@ export interface CodexProviderSplitSuggestion {
   chatModels: string[];
 }
 
+interface PendingCodexProviderSplitRouting {
+  identity: string;
+  suggestion: CodexProviderSplitSuggestion;
+}
+
 function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
+  const inputModalities = seed?.inputModalities ?? seed?.input_modalities;
+  const supportsImage =
+    seed?.supportsImage ?? seed?.supports_image ?? seed?.vision;
   return {
     rowId: crypto.randomUUID(),
     model: seed?.model ?? "",
@@ -336,11 +514,40 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
     ...(seed?.supportsParallelToolCalls !== undefined
       ? { supportsParallelToolCalls: seed.supportsParallelToolCalls }
       : {}),
-    ...(seed?.inputModalities ? { inputModalities: seed.inputModalities } : {}),
+    ...(inputModalities !== undefined
+      ? { inputModalities: [...inputModalities] }
+      : {}),
+    ...(supportsImage !== undefined ? { supportsImage } : {}),
+    ...(seed?.textOnly !== undefined ? { textOnly: seed.textOnly } : {}),
     ...(seed?.baseInstructions
       ? { baseInstructions: seed.baseInstructions }
       : {}),
+    ...(seed?.reasoning ? { reasoning: seed.reasoning } : {}),
+    ...(seed?.codexUltra ? { codexUltra: seed.codexUltra } : {}),
+    ...(seed?.apiFormat ? { apiFormat: seed.apiFormat } : {}),
+    ...(seed?.codexCache ? { codexCache: seed.codexCache } : {}),
+    ...(seed?.sortIndex !== undefined ? { sortIndex: seed.sortIndex } : {}),
   };
+}
+
+function catalogInputCapabilityPatch(
+  supportsImage: boolean,
+): Pick<CodexCatalogModel, "inputModalities" | "supportsImage" | "textOnly"> {
+  return {
+    inputModalities: supportsImage ? ["text", "image"] : ["text"],
+    supportsImage,
+    textOnly: !supportsImage,
+  };
+}
+
+function catalogSupportsImage(model: CodexCatalogModel): boolean {
+  const modalities = model.inputModalities ?? model.input_modalities ?? [];
+  return (
+    model.supportsImage === true ||
+    model.supports_image === true ||
+    model.vision === true ||
+    modalities.some((modality) => modality.toLowerCase() === "image")
+  );
 }
 
 // 读取 catalog 行的真实上游模型名；为空时回退到可见模型名，兼容旧配置。
@@ -348,67 +555,6 @@ function catalogRowUpstreamModel(
   row: Pick<CodexCatalogModel, "model" | "upstreamModel" | "upstream_model">,
 ): string {
   return (row.upstreamModel ?? row.upstream_model ?? row.model ?? "").trim();
-}
-
-// 将逗号或换行分隔的字符串整理成 route 匹配列表。
-function parseRoutingList(value: string): string[] {
-  return value
-    .split(/[,\n]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-// 将 modelMap 的轻量文本编辑格式转成对象；格式为 `codexModel=upstreamModel`。
-function parseModelMap(value: string): Record<string, string> | undefined {
-  const entries = parseRoutingList(value)
-    .map((item) => item.split("="))
-    .map(([from, to]) => [from?.trim(), to?.trim()] as const)
-    .filter(([from, to]) => from && to);
-  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
-}
-
-// 将 modelMap 对象转成表单里便于扫描和编辑的单行文本。
-function formatModelMap(modelMap?: Record<string, string>): string {
-  return modelMap
-    ? Object.entries(modelMap)
-        .map(([from, to]) => `${from}=${to}`)
-        .join(", ")
-    : "";
-}
-
-function createRoutingRow(seed?: Partial<CodexRoutingRoute>): CodexRoutingRow {
-  return {
-    rowId: crypto.randomUUID(),
-    id: seed?.id ?? `route-${Math.random().toString(36).slice(2, 8)}`,
-    label: seed?.label ?? "",
-    enabled: seed?.enabled ?? true,
-    targetProviderId: seed?.targetProviderId,
-    match: {
-      models: seed?.match?.models ?? [],
-      prefixes: seed?.match?.prefixes ?? [],
-    },
-    upstream: {
-      baseUrl: seed?.upstream?.baseUrl ?? "",
-      apiFormat: seed?.upstream?.apiFormat ?? "openai_chat",
-      auth: seed?.upstream?.auth ?? { source: "provider_config" },
-      apiKey: seed?.upstream?.apiKey ?? "",
-      modelMap: seed?.upstream?.modelMap,
-    },
-    capabilities: seed?.capabilities,
-  };
-}
-
-// 比较路由数据时忽略 rowId，避免父子状态同步造成重复刷新。
-function routingRowsMatchConfig(
-  rows: CodexRoutingRow[],
-  config?: CodexRoutingConfig,
-): boolean {
-  const routes = config?.routes ?? [];
-  if (rows.length !== routes.length) return false;
-  return rows.every((row, index) => {
-    const { rowId: _rowId, ...route } = row;
-    return JSON.stringify(route) === JSON.stringify(routes[index]);
-  });
 }
 
 // Compares rows (with rowId) to incoming models (without) by data fields only,
@@ -427,6 +573,13 @@ function catalogRowsMatchModels(
       | "supportsParallelToolCalls"
       | "baseInstructions"
       | "inputModalities"
+      | "supportsImage"
+      | "textOnly"
+      | "reasoning"
+      | "codexUltra"
+      | "apiFormat"
+      | "codexCache"
+      | "sortIndex"
     >
   >,
   models: CodexCatalogModel[],
@@ -444,12 +597,138 @@ function catalogRowsMatchModels(
         (incoming.supportsParallelToolCalls ?? null) &&
       (row.baseInstructions ?? "") === (incoming.baseInstructions ?? "") &&
       JSON.stringify(row.inputModalities ?? []) ===
-        JSON.stringify(incoming.inputModalities ?? [])
+        JSON.stringify(
+          incoming.inputModalities ?? incoming.input_modalities ?? [],
+        ) &&
+      (row.supportsImage ?? null) ===
+        (incoming.supportsImage ??
+          incoming.supports_image ??
+          incoming.vision ??
+          null) &&
+      (row.textOnly ?? null) ===
+        (incoming.textOnly ?? incoming.text_only ?? null) &&
+      JSON.stringify(row.reasoning ?? null) ===
+        JSON.stringify(incoming.reasoning ?? null) &&
+      JSON.stringify(row.codexUltra ?? null) ===
+        JSON.stringify(incoming.codexUltra ?? null) &&
+      (row.apiFormat ?? null) ===
+        (incoming.apiFormat ?? incoming.api_format ?? null) &&
+      JSON.stringify(row.codexCache ?? null) ===
+        JSON.stringify(incoming.codexCache ?? incoming.codex_cache ?? null) &&
+      (row.sortIndex ?? null) === (incoming.sortIndex ?? null)
     );
   });
 }
 
-// 将远端 /models 返回合并进 Codex 模型映射；已有行保留用户显示名，只补空上下文和新增模型。
+interface CodexProviderReadinessIdentityInput {
+  providerId?: string;
+  providerName?: string;
+  baseUrl: string;
+  isFullUrl: boolean;
+  apiKey: string;
+  isXaiOauthPreset?: boolean;
+  isXaiOauthAuthenticated?: boolean;
+  selectedXaiAccountId?: string | null;
+  partnerPromotionKey?: string;
+  planAccessKeyId?: string;
+  planSecretAccessKey?: string;
+  customUserAgent: string;
+  localProxyHeadersOverride: string;
+  localProxyBodyOverride: string;
+  apiFormat: CodexApiFormat;
+  anthropicAuthField: ClaudeApiKeyField;
+  impersonateClaudeCode: boolean;
+  maxOutputTokens: string;
+  codexChatReasoning: CodexChatReasoning;
+  promptCacheRouting: PromptCacheRoutingMode;
+  defaultModel: string;
+  catalogModels: CodexCatalogModel[];
+}
+
+// 连接验证结果只属于发起请求时的完整 Provider 身份。这里保留精确凭据值用于
+// 内存内比较，但不会写入日志、DOM 或持久化；catalog 顺序也属于当前配置身份。
+function buildCodexProviderReadinessIdentity({
+  providerId,
+  providerName,
+  baseUrl,
+  isFullUrl,
+  apiKey,
+  isXaiOauthPreset,
+  isXaiOauthAuthenticated,
+  selectedXaiAccountId,
+  partnerPromotionKey,
+  planAccessKeyId,
+  planSecretAccessKey,
+  customUserAgent,
+  localProxyHeadersOverride,
+  localProxyBodyOverride,
+  apiFormat,
+  anthropicAuthField,
+  impersonateClaudeCode,
+  maxOutputTokens,
+  codexChatReasoning,
+  promptCacheRouting,
+  defaultModel,
+  catalogModels,
+}: CodexProviderReadinessIdentityInput): string {
+  return JSON.stringify({
+    provider: {
+      id: providerId ?? null,
+      name: providerName ?? null,
+    },
+    endpoint: {
+      baseUrl: baseUrl.trim(),
+      isFullUrl,
+    },
+    auth: {
+      apiKey,
+      isXaiOauthPreset: isXaiOauthPreset === true,
+      isXaiOauthAuthenticated: isXaiOauthAuthenticated === true,
+      selectedXaiAccountId: selectedXaiAccountId ?? null,
+      partnerPromotionKey: partnerPromotionKey ?? null,
+      planAccessKeyId: planAccessKeyId ?? null,
+      planSecretAccessKey: planSecretAccessKey ?? null,
+      anthropicAuthField,
+    },
+    requestOverrides: {
+      customUserAgent,
+      localProxyHeadersOverride,
+      localProxyBodyOverride,
+    },
+    protocol: {
+      apiFormat,
+      impersonateClaudeCode,
+      maxOutputTokens,
+      codexChatReasoning,
+      promptCacheRouting,
+    },
+    defaultModel: defaultModel.trim(),
+    catalog: catalogModels.map((model) => ({
+      model: model.model.trim(),
+      upstreamModel: catalogRowUpstreamModel(model),
+      displayName: (model.displayName ?? model.display_name ?? "").trim(),
+      contextWindow: String(model.contextWindow ?? model.context_window ?? ""),
+      inputModalities: model.inputModalities ?? model.input_modalities ?? null,
+      supportsImage:
+        model.supportsImage ?? model.supports_image ?? model.vision ?? null,
+      textOnly: model.textOnly ?? model.text_only ?? null,
+      supportsParallelToolCalls:
+        model.supportsParallelToolCalls ??
+        model.supports_parallel_tool_calls ??
+        null,
+      baseInstructions:
+        model.baseInstructions ?? model.base_instructions ?? null,
+      reasoning: model.reasoning ?? null,
+      codexUltra: model.codexUltra ?? null,
+      apiFormat: model.apiFormat ?? model.api_format ?? null,
+      codexCache: model.codexCache ?? model.codex_cache ?? null,
+      sortIndex: model.sortIndex ?? null,
+    })),
+  });
+}
+
+// 将远端 /models 返回合并进 Codex 模型映射；已有行保留用户显示名和已填上下文，
+// 同步服务端明确返回的能力字段，并追加新模型。
 function mergeFetchedModelsIntoCatalogRows(
   rows: CodexCatalogRow[],
   fetchedModels: FetchedModel[],
@@ -484,14 +763,25 @@ function mergeFetchedModelsIntoCatalogRows(
       existingModels: rows,
     });
     const contextWindowText = contextWindow ? String(contextWindow) : undefined;
+    const capabilityPatch: Partial<CodexCatalogModel> = {
+      ...(Array.isArray(fetched.inputModalities)
+        ? { inputModalities: [...fetched.inputModalities] }
+        : {}),
+      ...(typeof fetched.supportsImage === "boolean"
+        ? { supportsImage: fetched.supportsImage }
+        : {}),
+    };
     const existing = rowByFetchedModel.get(model);
     if (existing) {
-      if (!existing.row.contextWindow && contextWindowText) {
-        next[existing.index] = {
-          ...existing.row,
-          contextWindow: contextWindowText,
-        };
-      }
+      const updatedRow = {
+        ...existing.row,
+        ...(!existing.row.contextWindow && contextWindowText
+          ? { contextWindow: contextWindowText }
+          : {}),
+        ...capabilityPatch,
+      };
+      next[existing.index] = updatedRow;
+      rowByFetchedModel.set(model, { row: updatedRow, index: existing.index });
       continue;
     }
     const row = createCatalogRow({
@@ -499,6 +789,7 @@ function mergeFetchedModelsIntoCatalogRows(
       upstreamModel: model,
       displayName: model,
       ...(contextWindowText ? { contextWindow: contextWindowText } : {}),
+      ...capabilityPatch,
     });
     rowByFetchedModel.set(model, { row, index: next.length });
     next.push(row);
@@ -563,6 +854,7 @@ export function CodexFormFields({
   providerId,
   providerName,
   isXaiOauthPreset,
+  isMaintainedPreset = false,
   isXaiOauthAuthenticated,
   selectedXaiAccountId,
   onXaiAccountSelect,
@@ -587,6 +879,7 @@ export function CodexFormFields({
   onAutoSelectChange,
   takeoverEnabled = false,
   onTakeoverEnabledChange = () => undefined,
+  allowModelMenuProjectionToggle = true,
   codexModel = "",
   onModelChange,
   apiFormat,
@@ -602,9 +895,8 @@ export function CodexFormFields({
   promptCacheRouting = "auto",
   onPromptCacheRoutingChange = () => undefined,
   catalogModels = [],
+  presetCatalogModels = [],
   onCatalogModelsChange,
-  codexRouting = { enabled: false, defaultRouteId: "", routes: [] },
-  onCodexRoutingChange,
   onProviderSplitSuggestionChange,
   speedTestEndpoints,
   customUserAgent,
@@ -618,6 +910,13 @@ export function CodexFormFields({
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [reasoningResolutions, setReasoningResolutions] = useState<
+    Record<string, CodexModelReasoningResolution>
+  >({});
+  const [redetectingReasoningModel, setRedetectingReasoningModel] = useState<
+    string | null
+  >(null);
+  const reasoningResolutionRequestRef = useRef(0);
   const [isProtocolProbeConfirmOpen, setIsProtocolProbeConfirmOpen] =
     useState(false);
   const [isProbingProtocol, setIsProbingProtocol] = useState(false);
@@ -627,13 +926,15 @@ export function CodexFormFields({
   >("muted");
   const [protocolProbeOutcomesByModel, setProtocolProbeOutcomesByModel] =
     useState<Record<string, CodexProtocolProbeOutcome>>({});
+  const [protocolProbeIdentity, setProtocolProbeIdentity] = useState<
+    string | null
+  >(null);
+  const protocolProbeIdentityRef = useRef<string | null>(null);
+  const protocolProbeSeqRef = useRef(0);
   const [shouldHighlightFetchModels, setShouldHighlightFetchModels] =
     useState(false);
-  const [pendingSplitRouting, setPendingSplitRouting] =
-    useState<CodexProviderSplitSuggestion | null>(null);
-  const [editingRouteIndex, setEditingRouteIndex] = useState<number | null>(
-    null,
-  );
+  const [pendingSplitRoutingState, setPendingSplitRoutingState] =
+    useState<PendingCodexProviderSplitRouting | null>(null);
   // takeoverEnabled 现在只表示“Codex 菜单映射”开关；模型目录和上下文元数据可独立编辑。
   // isChatFormat 仅在选了 Chat Completions 上游格式时为真（思考能力是 Chat 专属）。
   // 拉取请求序号：请求身份（Base URL / 完整地址开关 / API Key / 自定义 UA）
@@ -659,12 +960,16 @@ export function CodexFormFields({
   const isChatFormat = apiFormat === "openai_chat";
   const isAnthropicFormat = apiFormat === "anthropic";
   const canEditCatalog = Boolean(onCatalogModelsChange);
-  const canEditRouting = Boolean(onCodexRoutingChange);
+
+  // 普通 Provider 表单只消费并原样回传历史 codexRouting；可见编辑入口统一收口到
+  // CodexRouterWorkspacePage，避免与完整 MultiRouter 工作台形成两套配置界面。
   const canEditReasoning = Boolean(onCodexChatReasoningChange);
   const supportsThinking =
     codexChatReasoning.supportsThinking === true ||
     codexChatReasoning.supportsEffort === true;
   const supportsEffort = codexChatReasoning.supportsEffort === true;
+  const hasLegacyProviderReasoningConfig =
+    Object.keys(codexChatReasoning).length > 0;
   // 高级区在有任何可见配置时自动展开；只做折叠到展开，避免编辑旧 provider 时藏起关键状态。
   const hasRequestOverrides = Boolean(
     localProxyHeadersOverride.trim() || localProxyBodyOverride.trim(),
@@ -672,19 +977,15 @@ export function CodexFormFields({
   const hasAnyAdvancedValue =
     !!customUserAgent ||
     hasRequestOverrides ||
-    takeoverEnabled ||
-    catalogModels.length > 0 ||
-    codexRouting.enabled ||
-    (codexRouting.routes?.length ?? 0) > 0 ||
-    apiFormat === "openai_responses" ||
-    isAnthropicFormat ||
-    supportsThinking ||
-    supportsEffort ||
+    (!isMaintainedPreset &&
+      (isAnthropicFormat || supportsThinking || supportsEffort)) ||
     promptCacheRouting !== "auto" ||
     !!maxOutputTokens;
   const [advancedExpanded, setAdvancedExpanded] = useState(
     isXaiOauthPreset ? false : hasAnyAdvancedValue,
   );
+  const [catalogMountElement, setCatalogMountElement] =
+    useState<HTMLDivElement | null>(null);
 
   // 预设/编辑加载填充高级值后自动展开（仅从折叠→展开，不会自动折叠）；
   // xAI OAuth 托管预设的高级值都是预设自带的，无需展示，保持折叠
@@ -700,31 +1001,180 @@ export function CodexFormFields({
   const [catalogRows, setCatalogRows] = useState<CodexCatalogRow[]>(() =>
     catalogModels.map((m) => createCatalogRow(m)),
   );
+  const [expandedReasoningRowId, setExpandedReasoningRowId] = useState<
+    string | null
+  >(null);
+
+  const reasoningSettingsConfig = useMemo(
+    () => ({ modelCatalog: { models: catalogRows } }),
+    [catalogRows],
+  );
+  const reasoningDetectionProvider = useMemo<Provider>(
+    () => ({
+      id: providerId ?? "codex-draft",
+      name: providerName?.trim() || "Codex provider",
+      settingsConfig: {
+        base_url: codexBaseUrl.trim(),
+      },
+      category,
+    }),
+    [providerId, providerName, codexBaseUrl, category],
+  );
+
+  useEffect(() => {
+    const models = catalogRows
+      .map((row) => catalogRowUpstreamModel(row) || row.model.trim())
+      .filter(Boolean);
+    if (models.length === 0) {
+      setReasoningResolutions({});
+      return;
+    }
+    const requestId = ++reasoningResolutionRequestRef.current;
+    let cancelled = false;
+    void Promise.all(
+      models.map(async (model) => {
+        try {
+          return [
+            model,
+            await codexSubagentV2Api.resolveModelReasoningCapability(
+              reasoningSettingsConfig,
+              providerId ?? "codex-draft",
+              model,
+            ),
+          ] as const;
+        } catch (error) {
+          console.warn("[CodexFormFields] reasoning resolution failed", {
+            model,
+            error,
+          });
+          return [model, unknownReasoningResolution(model)] as const;
+        }
+      }),
+    ).then((results) => {
+      if (cancelled || requestId !== reasoningResolutionRequestRef.current) {
+        return;
+      }
+      const next: Record<string, CodexModelReasoningResolution> = {};
+      for (const result of results) {
+        if (result) next[result[0]] = result[1];
+      }
+      setReasoningResolutions(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [catalogRows, providerId, reasoningSettingsConfig]);
   const catalogRowsRef = useRef<CodexCatalogRow[]>(catalogRows);
   const modelMappingSectionRef = useRef<HTMLDivElement | null>(null);
   const fetchModelsButtonRef = useRef<HTMLButtonElement | null>(null);
-  const [routingRows, setRoutingRows] = useState<CodexRoutingRow[]>(() =>
-    (codexRouting.routes ?? []).map((route) => createRoutingRow(route)),
-  );
-
   // 记录上次发送给父组件的数据，避免重复触发
   const lastSentModelsRef = useRef<CodexCatalogModel[]>(catalogModels);
-  const lastSentRoutingRef = useRef<CodexRoutingConfig>(codexRouting);
   const catalogPropKeyRef = useRef(JSON.stringify(catalogModels));
-  const routingPropKeyRef = useRef(JSON.stringify(codexRouting));
   const skipCatalogEchoRef = useRef(false);
-  const skipRoutingEchoRef = useRef(false);
 
   // 保留最新的模型映射行给异步刷新回调用，避免点击“获取模型列表”时合并到旧闭包里的 catalogRows。
   useEffect(() => {
     catalogRowsRef.current = catalogRows;
   }, [catalogRows]);
 
+  const buildReadinessIdentityFor = useCallback(
+    (nextApiFormat: CodexApiFormat, nextCatalogModels: CodexCatalogModel[]) =>
+      buildCodexProviderReadinessIdentity({
+        providerId,
+        providerName,
+        baseUrl: codexBaseUrl,
+        isFullUrl,
+        apiKey: codexApiKey,
+        isXaiOauthPreset,
+        isXaiOauthAuthenticated,
+        selectedXaiAccountId,
+        partnerPromotionKey,
+        planAccessKeyId,
+        planSecretAccessKey,
+        customUserAgent,
+        localProxyHeadersOverride,
+        localProxyBodyOverride,
+        apiFormat: nextApiFormat,
+        anthropicAuthField,
+        impersonateClaudeCode,
+        maxOutputTokens,
+        codexChatReasoning,
+        promptCacheRouting,
+        defaultModel: codexModel,
+        catalogModels: nextCatalogModels,
+      }),
+    [
+      anthropicAuthField,
+      codexApiKey,
+      codexBaseUrl,
+      codexChatReasoning,
+      codexModel,
+      customUserAgent,
+      impersonateClaudeCode,
+      isFullUrl,
+      isXaiOauthAuthenticated,
+      isXaiOauthPreset,
+      localProxyBodyOverride,
+      localProxyHeadersOverride,
+      maxOutputTokens,
+      partnerPromotionKey,
+      planAccessKeyId,
+      planSecretAccessKey,
+      promptCacheRouting,
+      providerId,
+      providerName,
+      selectedXaiAccountId,
+    ],
+  );
+  const readinessIdentity = useMemo(
+    () => buildReadinessIdentityFor(apiFormat, catalogRows),
+    [apiFormat, buildReadinessIdentityFor, catalogRows],
+  );
+  const readinessIdentityRef = useRef(readinessIdentity);
+  readinessIdentityRef.current = readinessIdentity;
+  const bindProtocolProbeIdentity = useCallback((identity: string) => {
+    protocolProbeIdentityRef.current = identity;
+    setProtocolProbeIdentity(identity);
+  }, []);
+  const bindPendingSplitRouting = useCallback(
+    (suggestion: CodexProviderSplitSuggestion, identity: string) => {
+      setPendingSplitRoutingState({ suggestion, identity });
+    },
+    [],
+  );
+
+  // 任一身份输入变化都立即使旧结果失效并取消其 UI ownership。异步请求本身可以
+  // 自然结束，但 sequence/identity guard 会阻止旧进度与最终结果回写到新配置。
+  useEffect(() => {
+    if (protocolProbeIdentityRef.current !== readinessIdentity) {
+      protocolProbeSeqRef.current += 1;
+      protocolProbeIdentityRef.current = null;
+      setProtocolProbeIdentity(null);
+      setIsProbingProtocol(false);
+      setIsProtocolProbeConfirmOpen(false);
+      setProtocolProbeTone("muted");
+      setProtocolProbeSummary("");
+      setProtocolProbeOutcomesByModel({});
+    }
+    setPendingSplitRoutingState((current) =>
+      current === null || current.identity === readinessIdentity
+        ? current
+        : null,
+    );
+  }, [readinessIdentity]);
+
+  const isProtocolProbeStateCurrent =
+    protocolProbeIdentity === readinessIdentity;
+  const pendingSplitRouting =
+    pendingSplitRoutingState?.identity === readinessIdentity
+      ? pendingSplitRoutingState.suggestion
+      : null;
+
   const revealModelCatalogFetchAction = useCallback(() => {
-    setAdvancedExpanded(true);
+    bindProtocolProbeIdentity(readinessIdentity);
     setProtocolProbeTone("warning");
     setProtocolProbeSummary(
-      "请先在上方“模型目录与上下文”点击“获取模型列表”，或手动添加模型后再测试。",
+      "请先在“模型与兼容性”同步模型，或在高级设置中手动添加至少一个模型后再验证。",
     );
     setShouldHighlightFetchModels(true);
     window.setTimeout(() => {
@@ -735,7 +1185,7 @@ export function CodexFormFields({
       fetchModelsButtonRef.current?.focus({ preventScroll: true });
     }, 0);
     window.setTimeout(() => setShouldHighlightFetchModels(false), 3000);
-  }, []);
+  }, [bindProtocolProbeIdentity, readinessIdentity]);
 
   // 父 → 子：仅当 prop 数据真的变化（预设切换 / 编辑加载）时才重建 rowId；
   // 同 shape 时保留现有 rowId，避免编辑过程中焦点丢失。
@@ -755,52 +1205,6 @@ export function CodexFormFields({
     // 同步更新 ref，避免父组件传入新数据时子→父 effect 误判为本地修改
     lastSentModelsRef.current = catalogModels;
   }, [catalogModels]);
-
-  // 父 → 子：外部加载或 preset 切换时同步 route 列表，保留编辑过程中的 rowId 稳定性。
-  useEffect(() => {
-    const incomingRoutingKey = JSON.stringify(codexRouting);
-    const isExternalRoutingChange =
-      incomingRoutingKey !== routingPropKeyRef.current;
-    routingPropKeyRef.current = incomingRoutingKey;
-
-    setRoutingRows((current) => {
-      if (routingRowsMatchConfig(current, codexRouting)) return current;
-      if (isExternalRoutingChange) {
-        skipRoutingEchoRef.current = true;
-      }
-      return (codexRouting.routes ?? []).map((route) =>
-        createRoutingRow(route),
-      );
-    });
-    lastSentRoutingRef.current = codexRouting;
-  }, [codexRouting]);
-
-  // 子 → 父：route rowId 不进入持久化，只把真正配置写回父组件。
-  useEffect(() => {
-    if (!onCodexRoutingChange) return;
-    // 外部 provider 刚加载时，本地 routingRows 仍可能是上一帧的空数组；
-    // 这一帧必须跳过反向回写，避免把刚加载出的路由覆盖为空。
-    if (skipRoutingEchoRef.current) {
-      if (!routingRowsMatchConfig(routingRows, codexRouting)) return;
-      skipRoutingEchoRef.current = false;
-    }
-    const next: CodexRoutingConfig = {
-      enabled: codexRouting.enabled ?? false,
-      defaultRouteId: codexRouting.defaultRouteId ?? "",
-      officialAuth: codexRouting.officialAuth,
-      routes: routingRows.map(({ rowId: _rowId, ...route }) => route),
-    };
-    if (JSON.stringify(next) === JSON.stringify(lastSentRoutingRef.current))
-      return;
-    lastSentRoutingRef.current = next;
-    onCodexRoutingChange(next);
-  }, [
-    routingRows,
-    codexRouting.enabled,
-    codexRouting.defaultRouteId,
-    codexRouting,
-    onCodexRoutingChange,
-  ]);
 
   // 子 → 父：rowId 是视图层概念，不应进入持久化数据；剥离后再回传。
   // 注意：依赖数组不包含 catalogModels，避免父→子更新触发子→父回调形成循环。
@@ -935,6 +1339,7 @@ export function CodexFormFields({
       .then((models) => {
         if (seq !== fetchModelsSeqRef.current) return;
         setFetchedModels(models);
+        let splitCatalogRows = catalogRowsRef.current;
         if (onCatalogModelsChange && models.length > 0) {
           const mergedRows = mergeFetchedModelsIntoCatalogRows(
             catalogRowsRef.current,
@@ -947,12 +1352,11 @@ export function CodexFormFields({
             },
           );
           catalogRowsRef.current = mergedRows;
+          splitCatalogRows = mergedRows;
           setCatalogRows(mergedRows);
         }
         const shouldAutoSplitRouting =
-          models.length > 0 &&
-          onProviderSplitSuggestionChange &&
-          (codexRouting.routes?.length ?? 0) === 0;
+          models.length > 0 && Boolean(onProviderSplitSuggestionChange);
         if (shouldAutoSplitRouting) {
           const splitRouting =
             buildSplitCodexProviderSuggestionForFetchedModels({
@@ -960,7 +1364,10 @@ export function CodexFormFields({
               models,
             });
           if (splitRouting) {
-            setPendingSplitRouting(splitRouting);
+            bindPendingSplitRouting(
+              splitRouting,
+              buildReadinessIdentityFor(apiFormat, splitCatalogRows),
+            );
           }
         }
         if (models.length === 0) {
@@ -980,6 +1387,9 @@ export function CodexFormFields({
         if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
       });
   }, [
+    apiFormat,
+    bindPendingSplitRouting,
+    buildReadinessIdentityFor,
     codexBaseUrl,
     codexApiKey,
     isFullUrl,
@@ -992,7 +1402,6 @@ export function CodexFormFields({
     websiteUrl,
     onCatalogModelsChange,
     onProviderSplitSuggestionChange,
-    codexRouting.routes,
     isXaiOauthPreset,
     isXaiOauthAuthenticated,
     selectedXaiAccountId,
@@ -1022,6 +1431,12 @@ export function CodexFormFields({
       return;
     }
 
+    const probeIdentity = readinessIdentity;
+    const probeSeq = ++protocolProbeSeqRef.current;
+    const ownsCurrentIdentity = () =>
+      probeSeq === protocolProbeSeqRef.current &&
+      readinessIdentityRef.current === probeIdentity;
+    bindProtocolProbeIdentity(probeIdentity);
     setIsProtocolProbeConfirmOpen(false);
     setIsProbingProtocol(true);
     setProtocolProbeTone("muted");
@@ -1053,6 +1468,7 @@ export function CodexFormFields({
           ]);
           completedCount += 1;
           const outcome = { model, responses, chat };
+          if (!ownsCurrentIdentity()) return outcome;
           setProtocolProbeSummary(
             `正在并发测试 ${completedCount}/${models.length}：刚完成 ${model}。失败会在这里显示。`,
           );
@@ -1063,6 +1479,7 @@ export function CodexFormFields({
           return outcome;
         },
       );
+      if (!ownsCurrentIdentity()) return;
 
       const { responsesPass, chatPass, failedCount, detail } =
         summarizeCodexProtocolProbeOutcomes(outcomes);
@@ -1079,7 +1496,7 @@ export function CodexFormFields({
         splitSuggestion && onProviderSplitSuggestionChange,
       );
       if (splitSuggestion && onProviderSplitSuggestionChange) {
-        setPendingSplitRouting(splitSuggestion);
+        bindPendingSplitRouting(splitSuggestion, probeIdentity);
         onProviderSplitSuggestionChange(null);
       }
 
@@ -1090,6 +1507,7 @@ export function CodexFormFields({
             : ""
         }通过不等于完整 Codex 功能验证。${detail}`;
         const tone = failedCount > 0 ? "warning" : "success";
+        bindProtocolProbeIdentity(probeIdentity);
         setProtocolProbeTone(tone);
         setProtocolProbeSummary(summary);
         if (tone === "warning") {
@@ -1101,6 +1519,11 @@ export function CodexFormFields({
       }
 
       if (responsesPass > 0) {
+        const resultIdentity = buildReadinessIdentityFor(
+          "openai_responses",
+          catalogRowsRef.current,
+        );
+        bindProtocolProbeIdentity(resultIdentity);
         onApiFormatChange("openai_responses");
         const summary = `只有 Responses 基础请求可用，已切换为 Responses。Responses 通过 ${responsesPass}/${models.length}。通过不等于完整 Codex 功能验证。${detail}`;
         const tone = failedCount > 0 ? "warning" : "success";
@@ -1114,6 +1537,11 @@ export function CodexFormFields({
         return;
       }
       if (chatPass > 0) {
+        const resultIdentity = buildReadinessIdentityFor(
+          "openai_chat",
+          catalogRowsRef.current,
+        );
+        bindProtocolProbeIdentity(resultIdentity);
         onApiFormatChange("openai_chat");
         const summary = `Responses 不通但 Chat 可用，已切换为 Chat Completions。Chat 通过 ${chatPass}/${models.length}。${
           canApplySplitSuggestion
@@ -1127,18 +1555,26 @@ export function CodexFormFields({
       }
 
       const summary = `Responses 和 Chat Completions 都不通，请检查 API Key、Base URL、模型权限、额度、网络或上游状态。${detail}`;
+      bindProtocolProbeIdentity(probeIdentity);
       setProtocolProbeTone("error");
       setProtocolProbeSummary(summary);
       toast.error(summary, { closeButton: true });
     } catch (error) {
+      if (!ownsCurrentIdentity()) return;
       const summary = `协议测试中断：${error instanceof Error ? error.message : String(error)}`;
+      bindProtocolProbeIdentity(probeIdentity);
       setProtocolProbeTone("error");
       setProtocolProbeSummary(summary);
       toast.error(summary, { closeButton: true });
     } finally {
-      setIsProbingProtocol(false);
+      if (probeSeq === protocolProbeSeqRef.current) {
+        setIsProbingProtocol(false);
+      }
     }
   }, [
+    bindPendingSplitRouting,
+    bindProtocolProbeIdentity,
+    buildReadinessIdentityFor,
     codexBaseUrl,
     codexApiKey,
     customUserAgent,
@@ -1147,6 +1583,7 @@ export function CodexFormFields({
     onApiFormatChange,
     onProviderSplitSuggestionChange,
     providerName,
+    readinessIdentity,
     revealModelCatalogFetchAction,
     t,
   ]);
@@ -1184,6 +1621,58 @@ export function CodexFormFields({
     [],
   );
 
+  const handleUpdateCatalogReasoningJson = useCallback(
+    (index: number, value: string) => {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        handleUpdateCatalogRow(index, { reasoning: undefined });
+        return;
+      }
+      try {
+        const reasoning = JSON.parse(trimmed) as CodexCatalogModel["reasoning"];
+        if (!reasoning) {
+          throw new Error("推理能力配置必须是一个对象");
+        }
+        validateCodexReasoningCapabilityDraft(reasoning);
+        handleUpdateCatalogRow(index, {
+          reasoning: { ...reasoning, source: "user" },
+        });
+      } catch (error) {
+        toast.error(
+          `推理能力 JSON 无效，未修改草稿：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    },
+    [handleUpdateCatalogRow],
+  );
+
+  const presetReasoningByModel = useMemo(() => {
+    const entries: Array<
+      readonly [string, NonNullable<CodexCatalogModel["reasoning"]>]
+    > = [];
+    for (const model of presetCatalogModels) {
+      if (!model.reasoning) continue;
+      const visible = model.model.trim();
+      const upstream = catalogRowUpstreamModel(model);
+      if (visible) entries.push([visible, model.reasoning]);
+      if (upstream && upstream !== visible) {
+        entries.push([upstream, model.reasoning]);
+      }
+    }
+    return new Map(entries);
+  }, [presetCatalogModels]);
+
+  const presetCatalogByModel = useMemo(() => {
+    const entries = new Map<string, CodexCatalogModel>();
+    for (const model of presetCatalogModels) {
+      const visible = model.model.trim();
+      const upstream = catalogRowUpstreamModel(model);
+      if (visible) entries.set(visible, model);
+      if (upstream && upstream !== visible) entries.set(upstream, model);
+    }
+    return entries;
+  }, [presetCatalogModels]);
+
   const handleSelectFetchedCatalogModel = useCallback(
     (
       index: number,
@@ -1206,6 +1695,12 @@ export function CodexFormFields({
         upstreamModel: modelId,
         displayName: currentDisplayName?.trim() ? currentDisplayName : modelId,
         ...(contextWindow ? { contextWindow: String(contextWindow) } : {}),
+        ...(Array.isArray(fetched?.inputModalities)
+          ? { inputModalities: [...fetched.inputModalities] }
+          : {}),
+        ...(typeof fetched?.supportsImage === "boolean"
+          ? { supportsImage: fetched.supportsImage }
+          : {}),
       });
     },
     [
@@ -1242,7 +1737,7 @@ export function CodexFormFields({
     if (!pendingSplitRouting || !onProviderSplitSuggestionChange) return;
     onTakeoverEnabledChange(true);
     onProviderSplitSuggestionChange(pendingSplitRouting);
-    setPendingSplitRouting(null);
+    setPendingSplitRoutingState(null);
     toast.info(
       `保存时将生成 ${pendingSplitRouting.providerName}-responses / ${pendingSplitRouting.providerName}-chat 两个 provider。`,
     );
@@ -1253,123 +1748,13 @@ export function CodexFormFields({
   ]);
 
   const handleCancelSplitRouting = useCallback(() => {
-    setPendingSplitRouting(null);
+    setPendingSplitRoutingState(null);
     onProviderSplitSuggestionChange?.(null);
   }, [onProviderSplitSuggestionChange]);
 
-  // 路由行的增删改必须同步写回父表单，避免用户切换开关后立即保存时仍提交上一帧旧值。
-  const publishRoutingRows = useCallback(
-    (
-      rows: CodexRoutingRow[],
-      patch: Partial<Omit<CodexRoutingConfig, "routes">> = {},
-    ) => {
-      if (!onCodexRoutingChange) return;
-      const next: CodexRoutingConfig = {
-        enabled: codexRouting.enabled ?? false,
-        defaultRouteId: codexRouting.defaultRouteId ?? "",
-        officialAuth: codexRouting.officialAuth,
-        ...patch,
-        routes: rows.map(({ rowId: _rowId, ...route }) => route),
-      };
-      lastSentRoutingRef.current = next;
-      onCodexRoutingChange(next);
-    },
-    [
-      codexRouting.defaultRouteId,
-      codexRouting.enabled,
-      codexRouting.officialAuth,
-      onCodexRoutingChange,
-    ],
-  );
-
-  const handleRoutingEnabledChange = useCallback(
-    (checked: boolean) => {
-      publishRoutingRows(routingRows, { enabled: checked });
-    },
-    [publishRoutingRows, routingRows],
-  );
-
-  const handleAddRoute = useCallback(() => {
-    setRoutingRows((current) => {
-      const next = [...current, createRoutingRow()];
-      setEditingRouteIndex(current.length);
-      publishRoutingRows(next);
-      return next;
-    });
-  }, [publishRoutingRows]);
-
-  const handleUpdateRoute = useCallback(
-    (index: number, patch: Partial<CodexRoutingRoute>) => {
-      setRoutingRows((current) => {
-        const next = current.map((row, i) =>
-          i === index ? { ...row, ...patch } : row,
-        );
-        publishRoutingRows(next);
-        return next;
-      });
-    },
-    [publishRoutingRows],
-  );
-
-  const handleRemoveRoute = useCallback(
-    (index: number) => {
-      setRoutingRows((current) => {
-        const next = current.filter((_, i) => i !== index);
-        publishRoutingRows(next);
-        return next;
-      });
-      setEditingRouteIndex((current) => {
-        if (current === null) return current;
-        if (current === index) return null;
-        return current > index ? current - 1 : current;
-      });
-    },
-    [publishRoutingRows],
-  );
-
-  const editingRoute =
-    editingRouteIndex !== null ? routingRows[editingRouteIndex] : undefined;
-  const editingRouteModelsText = editingRoute
-    ? (editingRoute.match.models ?? []).join(", ")
-    : "";
-  const editingRoutePrefixesText = editingRoute
-    ? (editingRoute.match.prefixes ?? []).join(", ")
-    : "";
-  const editingRouteModelMapText = editingRoute
-    ? formatModelMap(editingRoute.upstream.modelMap)
-    : "";
-  const editingRouteAuthSource =
-    editingRoute?.upstream.auth.source ?? "provider_config";
-  const editingRouteTextOnly = editingRoute?.capabilities?.textOnly === true;
-  const editingRouteSupportsImage =
-    editingRoute?.capabilities?.inputModalities?.includes("image") ??
-    !editingRouteTextOnly;
   const splitRoutingProviderName = providerName?.trim() || "provider";
   const pendingResponsesModels = pendingSplitRouting?.responsesModels ?? [];
   const pendingChatModels = pendingSplitRouting?.chatModels ?? [];
-
-  const renderFetchModelsButton = () => (
-    <Button
-      ref={fetchModelsButtonRef}
-      type="button"
-      variant="default"
-      size="sm"
-      onClick={handleFetchModels}
-      disabled={isFetchingModels}
-      className={cn(
-        "h-8 gap-1 border border-blue-700 bg-blue-600 px-3 text-white shadow-sm hover:bg-blue-700 dark:border-blue-400 dark:bg-blue-500 dark:hover:bg-blue-600",
-        shouldHighlightFetchModels &&
-          "border-blue-500 bg-blue-50 text-blue-700 shadow-[0_0_0_3px_rgba(59,130,246,0.18)] dark:bg-blue-950/40 dark:text-blue-200",
-      )}
-    >
-      {isFetchingModels ? (
-        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-      ) : (
-        <Download className="h-3.5 w-3.5" />
-      )}
-      {t("providerForm.fetchModels")}
-    </Button>
-  );
 
   const renderCatalogActionButtons = (onAdd: () => void, addLabel: string) => (
     <div className="flex gap-1">
@@ -1507,166 +1892,6 @@ export function CodexFormFields({
         </div>
       )}
 
-      {canEditRouting && (
-        <div className="space-y-4 rounded-lg border border-border-default p-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="space-y-1">
-              <FormLabel>
-                {t("codexConfig.localModelRoutingTitle", {
-                  defaultValue: "Codex 多模型路由",
-                })}
-              </FormLabel>
-              <p className="text-xs leading-relaxed text-muted-foreground">
-                {t("codexConfig.localModelRoutingHint", {
-                  defaultValue:
-                    "只在一个 provider 内配置多条 route 时使用：Codex 仍进入 CC Switch，本地再按 body.model 分流到不同上游；它不同于下方的 Codex 菜单映射。",
-                })}
-              </p>
-            </div>
-            <Switch
-              checked={codexRouting.enabled ?? false}
-              onCheckedChange={handleRoutingEnabledChange}
-              aria-label={t("codexConfig.localModelRoutingTitle", {
-                defaultValue: "Codex 多模型路由",
-              })}
-            />
-          </div>
-
-          <div className="flex items-center justify-between gap-3">
-            <Input
-              value={codexRouting.defaultRouteId ?? ""}
-              onChange={(event) =>
-                onCodexRoutingChange?.({
-                  ...codexRouting,
-                  defaultRouteId: event.target.value.trim(),
-                })
-              }
-              placeholder={t("codexConfig.defaultRoutePlaceholder", {
-                defaultValue: "默认路由 ID",
-              })}
-              className="max-w-xs"
-            />
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={handleAddRoute}
-              className="h-8 gap-1"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              {t("codexConfig.addRoute", { defaultValue: "添加路由" })}
-            </Button>
-          </div>
-
-          <div className="min-h-[72px] space-y-3">
-            {routingRows.length === 0 ? (
-              <div className="rounded-md border border-dashed border-border-default bg-muted/10 px-3 py-4 text-xs text-muted-foreground">
-                {t("codexConfig.noRoutesConfigured", {
-                  defaultValue:
-                    "还没有路由。添加 route 后，Codex 会按模型名分流到对应上游。",
-                })}
-              </div>
-            ) : (
-              routingRows.map((route, index) => {
-                const matchedModels = route.match.models?.join(", ") || "-";
-                const matchedPrefixes = route.match.prefixes?.join(", ") || "-";
-                const capabilityLabels = [
-                  route.capabilities?.textOnly ? "仅文本" : "图文",
-                  route.capabilities?.supportsReasoning ? "推理" : null,
-                ].filter(Boolean);
-
-                return (
-                  <div
-                    key={route.rowId}
-                    className={cn(
-                      "flex items-center justify-between gap-3 rounded-md border p-3 transition-colors",
-                      route.enabled === false
-                        ? "border-amber-500/45 bg-amber-500/10"
-                        : "border-emerald-500/45 bg-emerald-500/10",
-                    )}
-                  >
-                    <div className="min-w-0 space-y-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium text-sm">
-                          {route.label || route.id || "路由"}
-                        </span>
-                        <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                          {route.targetProviderId
-                            ? `目标: ${route.targetProviderId}`
-                            : route.upstream.apiFormat}
-                        </span>
-                        <span
-                          className={cn(
-                            "rounded border px-1.5 py-0.5 text-[11px] font-medium",
-                            route.enabled === false
-                              ? "border-amber-500/50 bg-amber-500/15 text-amber-200"
-                              : "border-emerald-500/50 bg-emerald-500/15 text-emerald-200",
-                          )}
-                        >
-                          {route.enabled === false ? "已停用" : "已启用"}
-                        </span>
-                        {capabilityLabels.map((label) => (
-                          <span
-                            key={label}
-                            className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground"
-                          >
-                            {label}
-                          </span>
-                        ))}
-                      </div>
-                      <p className="truncate text-xs text-muted-foreground">
-                        匹配模型：{matchedModels}；匹配前缀：{matchedPrefixes}
-                      </p>
-                      <p className="truncate text-xs text-muted-foreground">
-                        {route.targetProviderId
-                          ? `复用供应商配置：${route.targetProviderId}`
-                          : route.upstream.baseUrl || "尚未填写上游 Base URL"}
-                      </p>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      <label className="flex items-center gap-2 rounded-md border border-border-default bg-background/60 px-2 py-1 text-xs text-foreground">
-                        <Switch
-                          checked={route.enabled !== false}
-                          onCheckedChange={(checked) =>
-                            handleUpdateRoute(index, { enabled: checked })
-                          }
-                          aria-label={t("codexConfig.routeEnabled", {
-                            defaultValue: "启用路由",
-                          })}
-                        />
-                        {route.enabled === false ? "已停用" : "已启用"}
-                      </label>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        className="h-9 w-9 text-foreground/80 hover:text-foreground"
-                        onClick={() => setEditingRouteIndex(index)}
-                        title={t("codexConfig.editRoute", {
-                          defaultValue: "编辑路由",
-                        })}
-                      >
-                        <Pencil className="h-4 w-4" />
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        className="h-9 w-9 text-foreground/80 hover:text-destructive"
-                        onClick={() => handleRemoveRoute(index)}
-                        title={t("common.delete", { defaultValue: "删除" })}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-        </div>
-      )}
-
       <Dialog
         open={Boolean(pendingSplitRouting)}
         onOpenChange={(open) => {
@@ -1731,313 +1956,353 @@ export function CodexFormFields({
         </DialogContent>
       </Dialog>
 
-      <Dialog
-        open={Boolean(editingRoute)}
-        onOpenChange={(open) => {
-          if (!open) setEditingRouteIndex(null);
-        }}
-      >
-        <DialogContent className="max-w-3xl max-h-[90vh] overflow-hidden">
-          <DialogHeader>
-            <DialogTitle>
-              {t("codexConfig.editRoute", { defaultValue: "编辑路由" })}
-            </DialogTitle>
-            <DialogDescription>
-              {t("codexConfig.editRouteHint", {
-                defaultValue:
-                  "配置这条路由的匹配规则、上游 API 格式、认证方式、模型映射和能力标记。",
+      {category !== "official" && canEditCatalog && (
+        <CodexProviderReadinessSection
+          models={catalogRows}
+          defaultModel={codexModel}
+          apiFormat={apiFormat}
+          isMaintainedPreset={isMaintainedPreset}
+          isSyncingModels={isFetchingModels}
+          isValidatingConnection={
+            isProbingProtocol && isProtocolProbeStateCurrent
+          }
+          validationSummary={
+            isProtocolProbeStateCurrent ? protocolProbeSummary : ""
+          }
+          validationTone={
+            isProtocolProbeStateCurrent ? protocolProbeTone : "muted"
+          }
+          highlightSync={shouldHighlightFetchModels}
+          syncButtonRef={fetchModelsButtonRef}
+          sectionRef={modelMappingSectionRef}
+          onSyncModels={handleFetchModels}
+          onValidateConnection={() => {
+            bindProtocolProbeIdentity(readinessIdentity);
+            setProtocolProbeTone("muted");
+            setProtocolProbeSummary(
+              "已打开验证确认框；如果没有看到弹窗，请按 Esc 后重试。",
+            );
+            setIsProtocolProbeConfirmOpen(true);
+          }}
+        />
+      )}
+
+      {category !== "official" && canEditCatalog && (
+        <div ref={setCatalogMountElement} />
+      )}
+
+      {category !== "official" && canEditCatalog && (
+        <section
+          aria-labelledby="codex-model-reasoning-title"
+          className="space-y-4 rounded-lg border border-border-default bg-muted/10 p-4"
+        >
+          <div className="space-y-1">
+            <h3
+              id="codex-model-reasoning-title"
+              className="text-sm font-semibold text-foreground"
+            >
+              模型推理能力
+            </h3>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              每个模型独立配置。这里决定 Codex
+              可以选择哪些推理档位，以及请求最终如何发送给
+              Provider；能力不完整时会在保存 Provider 前阻止并指出缺失项。
+            </p>
+          </div>
+
+          {catalogRows.length === 0 ? (
+            <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
+              暂无模型。请先在上方同步模型，或在高级选项的模型目录明细中添加模型。
+            </p>
+          ) : (
+            <div className="space-y-3">
+              {catalogRows.map((row, index) => {
+                const model = row.model.trim();
+                const probeModel = catalogRowUpstreamModel(row) || model;
+                const reasoningResolution = reasoningResolutions[probeModel];
+                const presetReasoning =
+                  presetReasoningByModel.get(model) ??
+                  presetReasoningByModel.get(catalogRowUpstreamModel(row));
+                const isBuiltinReasoning = row.reasoning?.source === "builtin";
+                const isUserPresetOverride =
+                  Boolean(presetReasoning) && row.reasoning?.source === "user";
+                const reasoningSourceMode: CodexReasoningCapabilitySourceMode =
+                  isBuiltinReasoning
+                    ? "builtin"
+                    : row.reasoning
+                      ? "manual"
+                      : "automatic";
+                const isReasoningEditorExpanded =
+                  expandedReasoningRowId === row.rowId;
+                const reasoningSourceLabel = isBuiltinReasoning
+                  ? "CCSM 受维护声明"
+                  : isUserPresetOverride
+                    ? "用户声明（已覆盖维护值）"
+                    : row.reasoning
+                      ? "用户声明"
+                      : reasoningResolution?.source === "detection"
+                        ? "自动检测"
+                        : reasoningResolution?.source === "library"
+                          ? "维护能力库"
+                          : "自动发现或服务端默认";
+                const selectableEfforts =
+                  reasoningResolution?.resolved.codexSelectableEfforts ??
+                  row.reasoning?.supportedEfforts ??
+                  [];
+                const defaultEffort =
+                  reasoningResolution?.resolved.providerDefaultEffort ??
+                  row.reasoning?.defaultEffort;
+                const discoveredReasoning = reasoningResolution?.capability
+                  ? (reasoningResolution.capability as unknown as CodexModelReasoningCapability)
+                  : undefined;
+
+                return (
+                  <article
+                    key={`reasoning:${row.rowId}`}
+                    className="space-y-3 rounded-md border bg-background p-3 text-xs"
+                  >
+                    <CodexModelReasoningSummary
+                      model={row.displayName?.trim() || model || "未命名模型"}
+                      source={reasoningSourceLabel}
+                      selectableEfforts={selectableEfforts}
+                      defaultEffort={defaultEffort}
+                      ultraEnabled={row.codexUltra?.enabled === true}
+                      ultraEffort={row.codexUltra?.providerEffort}
+                      ultraEfforts={
+                        reasoningResolution?.resolved.providerAcceptedEfforts ??
+                        []
+                      }
+                      onUltraChange={(codexUltra) =>
+                        handleUpdateCatalogRow(index, { codexUltra })
+                      }
+                      expanded={isReasoningEditorExpanded}
+                      onToggle={() =>
+                        setExpandedReasoningRowId((current) =>
+                          current === row.rowId ? null : row.rowId,
+                        )
+                      }
+                    />
+
+                    {isReasoningEditorExpanded && (
+                      <>
+                        <label className="grid min-w-52 gap-1">
+                          <span className="font-medium">能力来源</span>
+                          <select
+                            className="rounded-md border bg-background px-3 py-2"
+                            value={reasoningSourceMode}
+                            aria-label={`${model || "模型"}推理能力来源`}
+                            onChange={(event) =>
+                              handleUpdateCatalogRow(index, {
+                                reasoning: applyCodexReasoningCapabilitySource(
+                                  event.target
+                                    .value as CodexReasoningCapabilitySourceMode,
+                                  row.reasoning,
+                                  presetReasoning,
+                                  discoveredReasoning,
+                                ),
+                              })
+                            }
+                          >
+                            <option value="automatic">自动发现</option>
+                            <option value="builtin" disabled={!presetReasoning}>
+                              使用 CCSM 受维护声明
+                            </option>
+                            <option value="manual">手动声明</option>
+                          </select>
+                          {reasoningSourceMode === "automatic" ? (
+                            <span className="text-muted-foreground">
+                              自动发现会按当前
+                              Provider、模型和已验证声明解析能力；它不会写入本模型配置。需要调整档位、映射或开启
+                              Ultra 时，请按当前结果创建用户覆盖。
+                            </span>
+                          ) : null}
+                        </label>
+
+                        {reasoningResolution ? (
+                          <CodexModelReasoningCard
+                            resolution={reasoningResolution}
+                            hasBuiltinPreset={Boolean(presetReasoning)}
+                            redetecting={
+                              redetectingReasoningModel === probeModel
+                            }
+                            onRedetect={async () => {
+                              setRedetectingReasoningModel(probeModel);
+                              try {
+                                const outcome =
+                                  await codexSubagentV2Api.triggerModelReasoningDetection(
+                                    reasoningDetectionProvider,
+                                    probeModel,
+                                  );
+                                if (
+                                  typeof outcome === "object" &&
+                                  "found" in outcome
+                                ) {
+                                  const next =
+                                    await codexSubagentV2Api.resolveModelReasoningCapability(
+                                      reasoningSettingsConfig,
+                                      providerId ?? "codex-draft",
+                                      probeModel,
+                                    );
+                                  setReasoningResolutions((current) => ({
+                                    ...current,
+                                    [probeModel]: next,
+                                  }));
+                                  toast.success("已更新模型推理能力检测结果");
+                                } else {
+                                  toast.info(
+                                    "未获得可采纳的模型推理能力声明，继续使用服务端默认。",
+                                  );
+                                }
+                              } catch (error) {
+                                console.error(
+                                  "[CodexFormFields] reasoning detection failed",
+                                  error,
+                                );
+                                toast.error("模型推理能力检测失败");
+                              } finally {
+                                setRedetectingReasoningModel(null);
+                              }
+                            }}
+                            onAdoptDetection={() => {
+                              const detected = reasoningResolution.detection
+                                ? capabilityFromReasoningDetection({
+                                    found: reasoningResolution.detection,
+                                  })
+                                : undefined;
+                              if (!detected) {
+                                toast.info(
+                                  "当前检测结果没有可采纳的推理档位声明。",
+                                );
+                                return;
+                              }
+                              handleUpdateCatalogRow(index, {
+                                reasoning: detected,
+                              });
+                              toast.success("已采用检测到的推理能力");
+                            }}
+                            onManualDeclare={() =>
+                              handleUpdateCatalogRow(index, {
+                                reasoning: applyCodexReasoningCapabilitySource(
+                                  "manual",
+                                  row.reasoning,
+                                  presetReasoning,
+                                  discoveredReasoning,
+                                ),
+                              })
+                            }
+                            onCustomizeEffective={
+                              !row.reasoning && discoveredReasoning
+                                ? () =>
+                                    handleUpdateCatalogRow(index, {
+                                      reasoning:
+                                        applyCodexReasoningCapabilitySource(
+                                          "manual",
+                                          row.reasoning,
+                                          presetReasoning,
+                                          discoveredReasoning,
+                                        ),
+                                    })
+                                : undefined
+                            }
+                            onRestoreBuiltin={() =>
+                              handleUpdateCatalogRow(index, {
+                                reasoning: applyCodexReasoningCapabilitySource(
+                                  "builtin",
+                                  row.reasoning,
+                                  presetReasoning,
+                                ),
+                              })
+                            }
+                          />
+                        ) : (
+                          <p className="text-muted-foreground">
+                            正在读取该模型的统一推理能力解析结果…
+                          </p>
+                        )}
+
+                        {isUserPresetOverride ? (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() =>
+                              handleUpdateCatalogRow(index, {
+                                reasoning: applyCodexReasoningCapabilitySource(
+                                  "builtin",
+                                  row.reasoning,
+                                  presetReasoning,
+                                ),
+                              })
+                            }
+                          >
+                            恢复内置默认
+                          </Button>
+                        ) : null}
+                        {isBuiltinReasoning && row.reasoning ? (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() =>
+                              handleUpdateCatalogRow(index, {
+                                reasoning: applyCodexReasoningCapabilitySource(
+                                  "manual",
+                                  row.reasoning,
+                                  presetReasoning,
+                                ),
+                              })
+                            }
+                          >
+                            创建高级覆盖
+                          </Button>
+                        ) : null}
+
+                        {row.reasoning ? (
+                          <CodexModelReasoningEditor
+                            model={model || "模型"}
+                            capability={row.reasoning}
+                            readOnly={isBuiltinReasoning}
+                            onChange={(reasoning) =>
+                              handleUpdateCatalogRow(index, { reasoning })
+                            }
+                          />
+                        ) : null}
+
+                        <details>
+                          <summary className="cursor-pointer text-muted-foreground">
+                            专家 JSON
+                          </summary>
+                          <Textarea
+                            key={`reasoning-json:${row.rowId}:${JSON.stringify(row.reasoning)}`}
+                            className="mt-2 min-h-28 font-mono text-xs"
+                            defaultValue={
+                              row.reasoning
+                                ? JSON.stringify(row.reasoning, null, 2)
+                                : ""
+                            }
+                            onBlur={(event) => {
+                              if (!isBuiltinReasoning) {
+                                handleUpdateCatalogReasoningJson(
+                                  index,
+                                  event.target.value,
+                                );
+                              }
+                            }}
+                            readOnly={isBuiltinReasoning}
+                            aria-label={`${model || "模型"}推理能力 JSON`}
+                          />
+                        </details>
+                      </>
+                    )}
+                  </article>
+                );
               })}
-            </DialogDescription>
-          </DialogHeader>
-
-          {editingRoute && editingRouteIndex !== null && (
-            <div className="flex-1 min-h-0 space-y-4 overflow-y-auto px-6 py-5">
-              <div className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_auto]">
-                <Input
-                  value={editingRoute.id}
-                  onChange={(event) =>
-                    handleUpdateRoute(editingRouteIndex, {
-                      id: event.target.value.trim(),
-                    })
-                  }
-                  placeholder={t("codexConfig.routeIdPlaceholder", {
-                    defaultValue: "路由 ID",
-                  })}
-                />
-                <Input
-                  value={editingRoute.label ?? ""}
-                  onChange={(event) =>
-                    handleUpdateRoute(editingRouteIndex, {
-                      label: event.target.value,
-                    })
-                  }
-                  placeholder={t("codexConfig.routeLabelPlaceholder", {
-                    defaultValue: "路由名称",
-                  })}
-                />
-                <label className="flex items-center justify-end gap-2 text-xs text-muted-foreground">
-                  <Switch
-                    checked={editingRoute.enabled !== false}
-                    onCheckedChange={(checked) =>
-                      handleUpdateRoute(editingRouteIndex, { enabled: checked })
-                    }
-                  />
-                  {editingRoute.enabled === false ? "已停用" : "已启用"}
-                </label>
-              </div>
-
-              <Input
-                value={editingRoute.targetProviderId ?? ""}
-                onChange={(event) =>
-                  handleUpdateRoute(editingRouteIndex, {
-                    targetProviderId: event.target.value.trim() || undefined,
-                  })
-                }
-                placeholder={t("codexConfig.targetProviderIdPlaceholder", {
-                  defaultValue:
-                    "目标供应商 ID（可选；填写后复用该供应商的 Base URL、认证和转换配置）",
-                })}
-              />
-
-              <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-                <Input
-                  value={editingRouteModelsText}
-                  onChange={(event) =>
-                    handleUpdateRoute(editingRouteIndex, {
-                      match: {
-                        ...editingRoute.match,
-                        models: parseRoutingList(event.target.value),
-                      },
-                    })
-                  }
-                  placeholder={t("codexConfig.matchModelsPlaceholder", {
-                    defaultValue: "匹配模型，多个用英文逗号分隔",
-                  })}
-                />
-                <Input
-                  value={editingRoutePrefixesText}
-                  onChange={(event) =>
-                    handleUpdateRoute(editingRouteIndex, {
-                      match: {
-                        ...editingRoute.match,
-                        prefixes: parseRoutingList(event.target.value),
-                      },
-                    })
-                  }
-                  placeholder={t("codexConfig.matchPrefixesPlaceholder", {
-                    defaultValue: "匹配前缀，多个用英文逗号分隔",
-                  })}
-                />
-              </div>
-
-              <div className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_180px_180px]">
-                <Input
-                  value={editingRoute.upstream.baseUrl ?? ""}
-                  onChange={(event) =>
-                    handleUpdateRoute(editingRouteIndex, {
-                      upstream: {
-                        ...editingRoute.upstream,
-                        baseUrl: event.target.value.trim(),
-                      },
-                    })
-                  }
-                  placeholder={t("codexConfig.routeBaseUrlPlaceholder", {
-                    defaultValue: "上游 Base URL",
-                  })}
-                />
-                <Select
-                  value={editingRoute.upstream.apiFormat}
-                  onValueChange={(value) =>
-                    handleUpdateRoute(editingRouteIndex, {
-                      upstream: {
-                        ...editingRoute.upstream,
-                        apiFormat: value as CodexApiFormat,
-                      },
-                    })
-                  }
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="openai_responses">
-                      OpenAI Responses
-                    </SelectItem>
-                    <SelectItem value="openai_chat">
-                      OpenAI Chat Completions
-                    </SelectItem>
-                    <SelectItem value="openai_messages">
-                      OpenAI Messages
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-                <Select
-                  value={editingRouteAuthSource}
-                  onValueChange={(value) =>
-                    handleUpdateRoute(editingRouteIndex, {
-                      upstream: {
-                        ...editingRoute.upstream,
-                        apiKey:
-                          value === "provider_config"
-                            ? editingRoute.upstream.apiKey
-                            : "",
-                        auth: {
-                          source: value as CodexRoutingAuthSource,
-                          authProvider:
-                            value === "managed_account" ||
-                            value === "managed_codex_oauth"
-                              ? "codex_oauth"
-                              : undefined,
-                          accountId:
-                            value === "managed_account" ||
-                            value === "managed_codex_oauth"
-                              ? editingRoute.upstream.auth.accountId
-                              : undefined,
-                        },
-                      },
-                    })
-                  }
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="provider_config">
-                      使用路由 API Key
-                    </SelectItem>
-                    <SelectItem value="managed_codex_oauth">
-                      托管 Codex OAuth
-                    </SelectItem>
-                    <SelectItem value="native_codex_auth">
-                      Codex Desktop 当前登录
-                    </SelectItem>
-                    <SelectItem value="account_pool">OAuth 账号池</SelectItem>
-                    <SelectItem value="managed_account">托管账号</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-                {editingRouteAuthSource === "provider_config" ? (
-                  <Input
-                    type="password"
-                    value={editingRoute.upstream.apiKey ?? ""}
-                    onChange={(event) =>
-                      handleUpdateRoute(editingRouteIndex, {
-                        upstream: {
-                          ...editingRoute.upstream,
-                          apiKey: event.target.value.trim(),
-                        },
-                      })
-                    }
-                    placeholder={t("codexConfig.routeApiKeyPlaceholder", {
-                      defaultValue: "路由 API Key",
-                    })}
-                  />
-                ) : (
-                  <Input
-                    value={editingRoute.upstream.auth.accountId ?? ""}
-                    onChange={(event) =>
-                      handleUpdateRoute(editingRouteIndex, {
-                        upstream: {
-                          ...editingRoute.upstream,
-                          auth: {
-                            ...editingRoute.upstream.auth,
-                            authProvider: "codex_oauth",
-                            accountId: event.target.value.trim(),
-                          },
-                        },
-                      })
-                    }
-                    placeholder={t("codexConfig.routeAccountPlaceholder", {
-                      defaultValue: "托管账号 ID（可选）",
-                    })}
-                  />
-                )}
-                <Input
-                  value={editingRouteModelMapText}
-                  onChange={(event) =>
-                    handleUpdateRoute(editingRouteIndex, {
-                      upstream: {
-                        ...editingRoute.upstream,
-                        modelMap: parseModelMap(event.target.value),
-                      },
-                    })
-                  }
-                  placeholder={t("codexConfig.modelMapPlaceholder", {
-                    defaultValue: "codex模型=上游模型",
-                  })}
-                />
-              </div>
-
-              <div className="flex flex-wrap items-center gap-4 border-t border-border-default pt-3">
-                <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <Switch
-                    checked={editingRouteTextOnly}
-                    onCheckedChange={(checked) =>
-                      handleUpdateRoute(editingRouteIndex, {
-                        capabilities: {
-                          ...editingRoute.capabilities,
-                          textOnly: checked,
-                          inputModalities: checked
-                            ? ["text"]
-                            : ["text", "image"],
-                        },
-                      })
-                    }
-                  />
-                  {t("codexConfig.textOnlyCapability", {
-                    defaultValue: "仅文本",
-                  })}
-                </label>
-                <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <Switch
-                    checked={editingRouteSupportsImage}
-                    onCheckedChange={(checked) =>
-                      handleUpdateRoute(editingRouteIndex, {
-                        capabilities: {
-                          ...editingRoute.capabilities,
-                          textOnly: !checked,
-                          inputModalities: checked
-                            ? ["text", "image"]
-                            : ["text"],
-                        },
-                      })
-                    }
-                  />
-                  {t("codexConfig.imageCapability", { defaultValue: "图文" })}
-                </label>
-                <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <Switch
-                    checked={
-                      editingRoute.capabilities?.supportsReasoning === true
-                    }
-                    onCheckedChange={(checked) =>
-                      handleUpdateRoute(editingRouteIndex, {
-                        capabilities: {
-                          ...editingRoute.capabilities,
-                          supportsReasoning: checked,
-                        },
-                      })
-                    }
-                  />
-                  {t("codexConfig.reasoningCapability", {
-                    defaultValue: "推理",
-                  })}
-                </label>
-              </div>
             </div>
           )}
+        </section>
+      )}
 
-          <DialogFooter>
-            <Button type="button" onClick={() => setEditingRouteIndex(null)}>
-              {t("common.done", { defaultValue: "完成" })}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* 高级选项 —— 模型目录、Codex 菜单映射、协议检测、思考能力、自定义 UA；预设供应商通常无需展开 */}
+      {/* 高级选项只保留手动协议、请求覆盖和模型目录明细。 */}
       {category !== "official" && (
         <Collapsible
           open={advancedExpanded}
@@ -2070,41 +2335,8 @@ export function CodexFormFields({
             </p>
           )}
           <CollapsibleContent className="space-y-3 pt-3">
-            {canEditCatalog && (
-              <div
-                ref={modelMappingSectionRef}
-                className="space-y-2 rounded-md border border-border-default bg-muted/20 p-3"
-              >
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="space-y-1">
-                    <FormLabel>
-                      {t("codexConfig.modelListPrepareTitle", {
-                        defaultValue: "模型目录与上下文",
-                      })}
-                    </FormLabel>
-                    <p className="text-xs leading-relaxed text-muted-foreground">
-                      {t("codexConfig.modelListPrepareHint", {
-                        defaultValue:
-                          "先获取或手动添加模型，再维护上下文窗口和测试 Chat / Responses；此步骤与“在 Codex /model 菜单中显示”开关无关。",
-                      })}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-muted-foreground">
-                      {catalogRows.length > 0
-                        ? `${catalogRows.length} 个已记录模型`
-                        : "尚未记录模型"}
-                    </span>
-                    {renderFetchModelsButton()}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* 上游格式 + Codex 菜单映射 —— 两个平级、相互独立的控件。
-                格式不依赖路由：Responses 原生供应商无需开启路由即可直连；
-                沿用 shouldShowSpeedTest 门控，cloud_provider 保持不可切换；
-                xAI OAuth 托管预设格式固定为 Responses。 */}
+            {/* 上游格式与协议探测沿用 shouldShowSpeedTest 门控，
+                cloud_provider 保持不可切换；xAI OAuth 托管预设格式固定为 Responses。 */}
             {shouldShowSpeedTest && !isXaiOauthPreset && (
               <div className="space-y-3">
                 {/* 上游格式 —— 顶层独立选择，与路由开关解耦 */}
@@ -2233,161 +2465,84 @@ export function CodexFormFields({
                     </div>
                   )}
                   <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-900 dark:text-amber-200">
-                    不确定该选哪个时，可以测试 Chat /
-                    Responses。测试前需要先在“模型目录与上下文”里获取模型列表或手动添加模型；测试会发送真实模型请求，
-                    输出上限为
-                    1024，可能产生少量额度或流量消耗。通过只代表基础协议入口可用，不等于完整
-                    Codex 功能验证。
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button
-                      type="button"
-                      variant="default"
-                      size="sm"
-                      className="gap-1 border border-amber-700 bg-amber-500 text-white shadow-sm hover:bg-amber-600 dark:border-amber-300 dark:bg-amber-500 dark:hover:bg-amber-600"
-                      disabled={isProbingProtocol}
-                      onClick={() => {
-                        setProtocolProbeTone("muted");
-                        setProtocolProbeSummary(
-                          "已打开测试确认框；如果没有看到弹窗，请按 Esc 后重试。",
-                        );
-                        setIsProtocolProbeConfirmOpen(true);
-                      }}
-                    >
-                      {isProbingProtocol ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Route className="h-3.5 w-3.5" />
-                      )}
-                      测试 Chat / Responses
-                    </Button>
-                    {protocolProbeSummary && (
-                      <span
-                        role={
-                          protocolProbeTone === "error" ? "alert" : "status"
-                        }
-                        className={cn(
-                          "text-xs leading-relaxed",
-                          protocolProbeTone === "success" &&
-                            "text-emerald-700 dark:text-emerald-300",
-                          protocolProbeTone === "warning" &&
-                            "text-amber-700 dark:text-amber-300",
-                          protocolProbeTone === "error" && "text-destructive",
-                          protocolProbeTone === "muted" &&
-                            "text-muted-foreground",
-                        )}
-                      >
-                        {protocolProbeSummary}
-                      </span>
-                    )}
+                    上游格式通常由维护预设或主流程的连接验证确定。只有自动识别不正确时才在这里手动覆盖；验证会发送真实模型请求，可能产生少量额度或流量消耗。
                   </div>
                 </div>
+              </div>
+            )}
 
-                {appId === "codex" && (
-                  <div className="flex items-center justify-between gap-4 rounded-md border border-blue-200 bg-blue-50/60 p-3 dark:border-blue-900/60 dark:bg-blue-950/20">
+            {takeoverEnabled &&
+              isChatFormat &&
+              canEditReasoning &&
+              hasLegacyProviderReasoningConfig && (
+                <details
+                  className={cn(
+                    "space-y-3 rounded-md border border-amber-500/30 bg-amber-500/10 p-3",
+                    shouldShowSpeedTest &&
+                      "border-t border-border-default pt-3",
+                  )}
+                >
+                  <summary className="cursor-pointer text-sm font-medium text-foreground">
+                    旧版兼容兜底
+                  </summary>
+                  <div className="space-y-3 pt-2">
                     <div className="space-y-1">
-                      <FormLabel>
-                        {t("codexConfig.localRoutingToggle", {
-                          defaultValue: "在 Codex /model 菜单中显示",
-                        })}
-                      </FormLabel>
                       <p className="text-xs leading-relaxed text-muted-foreground">
-                        {takeoverEnabled
-                          ? t("codexConfig.localRoutingOnHint", {
-                              defaultValue:
-                                "开启后会把“模型目录与上下文”投射到 Codex /model 菜单，并让可见模型名映射到真实上游模型。",
-                            })
-                          : t("codexConfig.localRoutingOffHint", {
-                              defaultValue:
-                                "关闭时仍会保存 /models 列表和上下文窗口，但不改写 Codex /model 菜单；适合 Responses 原生、直接使用真实模型名的 provider。",
-                            })}
+                        这是一份旧 Provider
+                        级推理配置：它会影响所有未单独配置模型推理能力的模型。请优先使用上方“模型推理能力”为每个模型声明能力；这里只保留对既有配置的兼容编辑。
                       </p>
                     </div>
-                    <Switch
-                      checked={takeoverEnabled}
-                      onCheckedChange={onTakeoverEnabledChange}
-                      aria-label={t("codexConfig.localRoutingToggle", {
-                        defaultValue: "在 Codex /model 菜单中显示",
-                      })}
-                    />
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="space-y-1">
+                        <FormLabel>
+                          {t("codexConfig.reasoningModeToggle", {
+                            defaultValue: "支持思考模式",
+                          })}
+                        </FormLabel>
+                        <p className="text-xs leading-relaxed text-muted-foreground">
+                          旧配置：为没有模型级声明的 Chat 模型启用 thinking
+                          开关。
+                        </p>
+                      </div>
+                      <Switch
+                        checked={supportsThinking}
+                        onCheckedChange={handleReasoningThinkingChange}
+                        aria-label={t("codexConfig.reasoningModeToggle", {
+                          defaultValue: "支持思考模式",
+                        })}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-4 border-t border-border-default pt-3">
+                      <div className="space-y-1">
+                        <FormLabel>
+                          {t("codexConfig.reasoningEffortToggle", {
+                            defaultValue: "支持思考等级",
+                          })}
+                        </FormLabel>
+                        <p className="text-xs leading-relaxed text-muted-foreground">
+                          旧配置：为没有模型级声明的 Chat 模型启用 effort
+                          参数转换。
+                        </p>
+                      </div>
+                      <Switch
+                        checked={supportsEffort}
+                        onCheckedChange={handleReasoningEffortChange}
+                        aria-label={t("codexConfig.reasoningEffortToggle", {
+                          defaultValue: "支持思考等级",
+                        })}
+                      />
+                    </div>
                   </div>
-                )}
-              </div>
-            )}
+                </details>
+              )}
+          </CollapsibleContent>
 
-            {takeoverEnabled && isChatFormat && canEditReasoning && (
-              <div
-                className={cn(
-                  "space-y-3",
-                  shouldShowSpeedTest && "border-t border-border-default pt-3",
-                )}
-              >
-                <div className="space-y-1">
-                  <FormLabel>
-                    {t("codexConfig.reasoningGroupTitle", {
-                      defaultValue: "思考能力",
-                    })}
-                  </FormLabel>
-                  <p className="text-xs leading-relaxed text-muted-foreground">
-                    {t("codexConfig.reasoningSectionHint", {
-                      defaultValue:
-                        "预设供应商已自动配置；自定义供应商会按名称/地址自动推断。仅当自动识别不准时才需手动覆盖。",
-                    })}
-                  </p>
-                </div>
-
-                <div className="flex items-center justify-between gap-4">
-                  <div className="space-y-1">
-                    <FormLabel>
-                      {t("codexConfig.reasoningModeToggle", {
-                        defaultValue: "支持思考模式",
-                      })}
-                    </FormLabel>
-                    <p className="text-xs leading-relaxed text-muted-foreground">
-                      {t("codexConfig.reasoningModeHint", {
-                        defaultValue:
-                          "上游 Chat Completions 接口支持开启或关闭 thinking 时启用。Kimi、GLM、Qwen 等通常属于这一类。",
-                      })}
-                    </p>
-                  </div>
-                  <Switch
-                    checked={supportsThinking}
-                    onCheckedChange={handleReasoningThinkingChange}
-                    aria-label={t("codexConfig.reasoningModeToggle", {
-                      defaultValue: "支持思考模式",
-                    })}
-                  />
-                </div>
-
-                <div className="flex items-center justify-between gap-4 border-t border-border-default pt-3">
-                  <div className="space-y-1">
-                    <FormLabel>
-                      {t("codexConfig.reasoningEffortToggle", {
-                        defaultValue: "支持思考等级",
-                      })}
-                    </FormLabel>
-                    <p className="text-xs leading-relaxed text-muted-foreground">
-                      {t("codexConfig.reasoningEffortHint", {
-                        defaultValue:
-                          "上游支持 low/high/max 等思考深度控制时启用。启用后会自动启用思考模式，并把 Codex 的 reasoning.effort 转成上游 Chat 参数。",
-                      })}
-                    </p>
-                  </div>
-                  <Switch
-                    checked={supportsEffort}
-                    onCheckedChange={handleReasoningEffortChange}
-                    aria-label={t("codexConfig.reasoningEffortToggle", {
-                      defaultValue: "支持思考等级",
-                    })}
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* 模型映射 / 模型目录 —— 与「路由接管」解耦，常驻显示（可编辑即渲染）。
+          {/* 模型映射 / 模型目录 —— 与「路由接管」解耦，常驻显示（可编辑即渲染）。
                 填了才生成 catalog：Chat 模式生成兼容路由、原生 Responses 生成
                 model-catalogs.json；留空则不生成。排在自定义 UA 之前。 */}
-            {canEditCatalog && (
+          {catalogMountElement &&
+            canEditCatalog &&
+            createPortal(
               <div
                 className={cn(
                   "space-y-4",
@@ -2456,8 +2611,22 @@ export function CodexFormFields({
                     </div>
 
                     {catalogRows.map((row, index) => {
-                      const probeModel =
-                        catalogRowUpstreamModel(row) || row.model.trim();
+                      const model = row.model.trim();
+                      const probeModel = catalogRowUpstreamModel(row) || model;
+                      const presetCatalogModel =
+                        presetCatalogByModel.get(model) ??
+                        presetCatalogByModel.get(catalogRowUpstreamModel(row));
+                      const supportsImage = catalogSupportsImage(row);
+                      const presetDeclaresInputCapability = Boolean(
+                        presetCatalogModel &&
+                          (presetCatalogModel.inputModalities !== undefined ||
+                            presetCatalogModel.input_modalities !== undefined ||
+                            presetCatalogModel.supportsImage !== undefined ||
+                            presetCatalogModel.supports_image !== undefined ||
+                            presetCatalogModel.vision !== undefined ||
+                            presetCatalogModel.textOnly !== undefined ||
+                            presetCatalogModel.text_only !== undefined),
+                      );
                       const probeBadge = getProtocolProbeBadge(
                         protocolProbeOutcomesByModel[probeModel],
                       );
@@ -2465,7 +2634,7 @@ export function CodexFormFields({
                       return (
                         <div
                           key={row.rowId}
-                          className="grid grid-cols-1 gap-2 md:grid-cols-[88px_1fr_1fr_1fr_132px_76px_36px]"
+                          className="grid grid-cols-1 gap-2 rounded-md border border-transparent p-1 md:grid-cols-[88px_1fr_1fr_1fr_132px_76px_36px]"
                         >
                           <label className="flex h-9 items-center gap-2 text-xs text-muted-foreground">
                             <input
@@ -2634,14 +2803,84 @@ export function CodexFormFields({
                           >
                             <Trash2 className="h-4 w-4" />
                           </Button>
+                          <fieldset
+                            className="col-span-full flex flex-wrap items-center gap-2 border-t border-border-default pt-2 text-xs"
+                            aria-label={`${model || "模型"} 输入能力`}
+                          >
+                            <legend className="mr-1 font-medium">
+                              输入能力
+                            </legend>
+                            <div
+                              className="inline-flex overflow-hidden rounded-md border"
+                              role="radiogroup"
+                              aria-label={`${model || "模型"} 输入能力选择`}
+                            >
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant={supportsImage ? "default" : "ghost"}
+                                className="rounded-none"
+                                aria-pressed={supportsImage}
+                                aria-label={`${model || "模型"} 文本与图像`}
+                                onClick={() =>
+                                  handleUpdateCatalogRow(
+                                    index,
+                                    catalogInputCapabilityPatch(true),
+                                  )
+                                }
+                              >
+                                文本与图像
+                              </Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant={!supportsImage ? "default" : "ghost"}
+                                className="rounded-none border-l"
+                                aria-pressed={!supportsImage}
+                                aria-label={`${model || "模型"} 仅文本`}
+                                onClick={() =>
+                                  handleUpdateCatalogRow(
+                                    index,
+                                    catalogInputCapabilityPatch(false),
+                                  )
+                                }
+                              >
+                                仅文本
+                              </Button>
+                            </div>
+                            <span className="text-muted-foreground">
+                              保存后覆盖当前 Provider 的预设，不需要等待发布。
+                            </span>
+                            {presetDeclaresInputCapability &&
+                            presetCatalogModel ? (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                aria-label={`${model || "模型"} 恢复 CCSM 输入能力预设`}
+                                onClick={() =>
+                                  handleUpdateCatalogRow(
+                                    index,
+                                    catalogInputCapabilityPatch(
+                                      catalogSupportsImage(presetCatalogModel),
+                                    ),
+                                  )
+                                }
+                              >
+                                恢复 CCSM 预设
+                              </Button>
+                            ) : null}
+                          </fieldset>
                         </div>
                       );
                     })}
                   </div>
                 )}
-              </div>
+              </div>,
+              catalogMountElement,
             )}
 
+          <CollapsibleContent className="space-y-3 pt-3">
             <div
               className={cn(
                 "space-y-3",
@@ -2665,6 +2904,52 @@ export function CodexFormFields({
                 />
               </div>
             </div>
+
+            {/* 仅自定义 Provider 可以退出 CCSwitchMulti 的目录管理；维护预设始终投影正确目录。 */}
+            {appId === "codex" &&
+              !isXaiOauthPreset &&
+              allowModelMenuProjectionToggle && (
+                <div className="flex items-center justify-between gap-4 rounded-md border border-blue-200 bg-blue-50/60 p-3 dark:border-blue-900/60 dark:bg-blue-950/20">
+                  <div className="space-y-1.5">
+                    <FormLabel>
+                      {t("codexConfig.localRoutingToggle", {
+                        defaultValue: "在 Codex /model 菜单中显示",
+                      })}
+                    </FormLabel>
+                    <p className="text-xs leading-relaxed text-muted-foreground">
+                      {t("codexConfig.localRoutingDescription", {
+                        defaultValue:
+                          "开启后，CCSwitchMulti 会生成 Codex 启动时加载的模型目录，让这里配置的模型、显示名、上下文窗口和推理档位出现在 /model 中，并把显示名映射到真实上游模型。它不控制 Provider、代理或 MultiRouter 是否可用；仅当你要使用自己维护的 model_catalog_json 时关闭。",
+                      })}
+                    </p>
+                    <p
+                      className={cn(
+                        "text-xs leading-relaxed",
+                        takeoverEnabled
+                          ? "text-muted-foreground"
+                          : "text-amber-700 dark:text-amber-300",
+                      )}
+                    >
+                      {takeoverEnabled
+                        ? t("codexConfig.localRoutingOnHint", {
+                            defaultValue:
+                              "推荐保持开启。模型目录会在下次 Codex 启动时加载。",
+                          })
+                        : t("codexConfig.localRoutingOffHint", {
+                            defaultValue:
+                              "当前已关闭：Provider 和直接指定的真实模型仍可使用，目录数据也会继续保存，但 Codex /model 不再获得这些模型、别名、上下文窗口和推理档位。仅当你要使用自己维护的 model_catalog_json 时关闭。",
+                          })}
+                    </p>
+                  </div>
+                  <Switch
+                    checked={takeoverEnabled}
+                    onCheckedChange={onTakeoverEnabledChange}
+                    aria-label={t("codexConfig.localRoutingToggle", {
+                      defaultValue: "在 Codex /model 菜单中显示",
+                    })}
+                  />
+                </div>
+              )}
           </CollapsibleContent>
         </Collapsible>
       )}

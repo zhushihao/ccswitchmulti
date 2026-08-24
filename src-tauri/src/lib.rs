@@ -5,10 +5,13 @@ mod auto_launch;
 mod claude_desktop_config;
 mod claude_mcp;
 mod claude_plugin;
-mod codex_config;
+pub mod codex_config;
 mod codex_desktop;
+mod codex_guardian;
 pub mod codex_history_migration;
+pub mod codex_multirouter;
 mod codex_state_db;
+pub(crate) mod codex_subagent_profiles;
 mod commands;
 mod config;
 mod database;
@@ -31,6 +34,7 @@ mod prompt;
 mod prompt_files;
 mod provider;
 mod proxy;
+pub mod reasoning_capabilities;
 mod services;
 mod session_manager;
 mod settings;
@@ -41,9 +45,7 @@ mod usage_events;
 mod usage_script;
 
 pub use app_config::{AppType, InstalledSkill, McpApps, McpServer, MultiAppConfig, SkillApps};
-pub use codex_config::{
-    get_codex_auth_path, get_codex_config_path, read_codex_live_settings, write_codex_live_atomic,
-};
+pub use codex_config::{get_codex_auth_path, get_codex_config_path, read_codex_live_settings};
 pub use commands::open_provider_terminal;
 pub use commands::*;
 pub use config::{get_claude_mcp_path, get_claude_settings_path, read_json_file};
@@ -55,8 +57,8 @@ pub use mcp::{
     import_from_claude, import_from_codex, import_from_gemini, import_from_grokbuild,
     remove_server_from_claude, remove_server_from_codex, remove_server_from_gemini,
     remove_server_from_grokbuild, sync_enabled_to_claude, sync_enabled_to_codex,
-    sync_enabled_to_gemini, sync_single_server_to_claude, sync_single_server_to_codex,
-    sync_single_server_to_gemini, sync_single_server_to_grokbuild,
+    sync_enabled_to_codex_with_ownership, sync_enabled_to_gemini, sync_single_server_to_claude,
+    sync_single_server_to_codex, sync_single_server_to_gemini, sync_single_server_to_grokbuild,
 };
 pub use prompt::Prompt;
 pub use provider::{Provider, ProviderMeta};
@@ -419,6 +421,11 @@ pub fn run() {
         .setup(|app| {
             let _ = rustls::crypto::ring::default_provider().install_default();
 
+            // 初始化推理能力库资源目录（随应用打包的 reasoning-capabilities.json）。
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                crate::reasoning_capabilities::init_resource_dir(resource_dir);
+            }
+
             // 预先刷新 Store 覆盖配置，确保后续路径读取正确（日志/数据库等）
             app_store::refresh_app_config_dir_override(app.handle());
             let app_config_dir = crate::config::get_app_config_dir();
@@ -491,14 +498,44 @@ pub fn run() {
             // 也能向前端推送 `usage-log-recorded`。
             // 放在日志系统初始化之后，确保 init 的日志能正常输出。
             usage_events::init(app.handle().clone());
+            // 恢复结果先持久化、再发事件；初始化句柄后，启动前后所有写入
+            // 都可以通知已准备好的 webview，错过事件时仍可用查询命令补拉。
+            crate::services::recovery_outcome::init(app.handle().clone());
 
-            if let Some(previous) = app_exit_monitor::record_startup() {
+            let startup_recovery_classification = {
+                let startup = app_exit_monitor::record_startup_report();
+                if let Some(previous) = startup.previous.as_ref() {
+                    log::warn!(
+                        "检测到上次应用未正常退出: started_at={}, pid={}, crash_log_modified_at={:?}",
+                        previous.marker.started_at,
+                        previous.marker.pid,
+                        previous.crash_log_modified_at
+                    );
+                }
+                log::info!("启动恢复证据分类: {:?}", startup.classification);
+                startup.classification
+            };
+
+            let launch_on_startup = crate::settings::get_settings().launch_on_startup;
+            if let Err(error) = crate::auto_launch::reconcile_auto_launch(launch_on_startup) {
                 log::warn!(
-                    "检测到上次应用未正常退出: started_at={}, pid={}, crash_log_modified_at={:?}",
-                    previous.marker.started_at,
-                    previous.marker.pid,
-                    previous.crash_log_modified_at
+                    "开机自启状态对账失败: desired={launch_on_startup}, error={error}"
                 );
+            }
+
+            // Codex Desktop 的启动是独立的显式设置，绝不能从系统自启设置推导。
+            // 启动失败只记录原因，不能阻断 CCSwitchMulti 自身启动。
+            let launch_codex_desktop_with_ccswitch = crate::settings::get_settings()
+                .launch_codex_desktop_with_ccswitch;
+            match crate::codex_desktop::launch_codex_desktop_with_ccswitch(
+                launch_codex_desktop_with_ccswitch,
+            ) {
+                Ok(true) => log::info!("已按独立设置启动 Codex Desktop"),
+                Ok(false) if launch_codex_desktop_with_ccswitch => {
+                    log::info!("Codex Desktop 已在运行，跳过独立启动")
+                }
+                Ok(false) => {}
+                Err(error) => log::warn!("按独立设置启动 Codex Desktop 失败: {error}"),
             }
 
             // 初始化数据库
@@ -1222,13 +1259,20 @@ pub fn run() {
                 // 检查 Live 配置是否仍处于被接管状态（包含占位符）
                 let live_taken_over = state.proxy_service.detect_takeover_in_live_configs();
 
-                if has_backups || live_taken_over {
+                if (has_backups || live_taken_over)
+                    && startup_recovery_classification.allows_recovery()
+                {
                     log::warn!("检测到上次异常退出（存在接管残留），正在恢复 Live 配置...");
                     if let Err(e) = state.proxy_service.recover_from_crash().await {
                         log::error!("恢复 Live 配置失败: {e}");
                     } else {
                         log::info!("Live 配置已恢复");
                     }
+                } else if has_backups || live_taken_over {
+                    log::info!(
+                        "跳过启动恢复：上次运行分类为 {:?}",
+                        startup_recovery_classification
+                    );
                 }
 
                 // 必须排在 auto-extract 之前：先把历史泄漏进 Gemini 共享片段的凭据
@@ -1366,9 +1410,19 @@ pub fn run() {
             commands::get_current_provider,
             commands::add_provider,
             commands::update_provider,
+            commands::update_codex_subagent_v2,
+            commands::initialize_codex_subagent_v2,
+            commands::reconcile_codex_subagent_v2_profiles,
+            commands::inspect_codex_multirouter_projection,
+            commands::inspect_active_codex_multirouter_projection,
+            commands::retry_codex_multirouter_projection,
+            commands::get_codex_multirouter_revision,
+            commands::preview_codex_multirouter_migration,
+            commands::apply_codex_multirouter_migration,
             commands::delete_provider,
             commands::remove_provider_from_live_config,
             commands::switch_provider,
+            commands::force_repair_and_switch_codex_provider,
             commands::switch_codex_to_official_and_repair_history,
             commands::import_default_config,
             commands::get_claude_desktop_status,
@@ -1387,6 +1441,7 @@ pub fn run() {
             commands::get_init_error,
             commands::get_migration_result,
             commands::get_skills_migration_result,
+            commands::get_last_recovery_outcome,
             commands::get_app_config_path,
             commands::open_app_config_folder,
             commands::get_claude_common_config_snippet,
@@ -1396,6 +1451,16 @@ pub fn run() {
             commands::extract_common_config_snippet,
             commands::read_live_provider_settings,
             commands::get_settings,
+            codex_config::get_codex_subagent_reasoning_capabilities,
+            codex_config::resolve_codex_model_reasoning_capability,
+            codex_config::trigger_codex_model_reasoning_detection,
+            codex_config::inspect_codex_reasoning_capability,
+            codex_config::list_codex_reasoning_capabilities,
+            codex_config::validate_codex_reasoning_provider,
+            codex_config::validate_codex_subagent_v2_provider_candidate,
+            codex_config::export_codex_reasoning_provider,
+            codex_config::get_codex_subagent_profile_statuses,
+            codex_config::preview_codex_subagent_profile,
             commands::save_settings,
             commands::has_codex_unify_history_backup,
             commands::restore_codex_unified_history,
@@ -1410,6 +1475,7 @@ pub fn run() {
             commands::open_log_dir,
             commands::restart_app,
             commands::install_update_and_restart,
+            commands::check_app_update,
             commands::check_app_update_available,
             commands::check_for_updates,
             commands::is_portable_mode,
@@ -1418,6 +1484,8 @@ pub fn run() {
             commands::read_claude_plugin_config,
             commands::apply_claude_plugin_config,
             commands::is_claude_plugin_applied,
+            commands::detect_codex_plugin_registration,
+            commands::repair_codex_plugin_registration,
             commands::apply_claude_onboarding_skip,
             commands::clear_claude_onboarding_skip,
             // Claude MCP management
@@ -1469,6 +1537,7 @@ pub fn run() {
             commands::apply_profile,
             // model list fetch (OpenAI-compatible /v1/models)
             commands::fetch_models_for_config,
+            commands::get_opencode_models,
             commands::probe_codex_chat_for_config,
             commands::probe_codex_responses_for_config,
             // ours: endpoint speed test + custom endpoint management
@@ -1490,6 +1559,12 @@ pub fn run() {
             commands::webdav_sync_download,
             commands::webdav_sync_save_settings,
             commands::webdav_sync_fetch_remote_info,
+            commands::preset_registry_get_settings,
+            commands::preset_registry_save_settings,
+            commands::preset_registry_check_update,
+            commands::preset_registry_apply_update,
+            commands::preset_catalog_get,
+            commands::preset_catalog_resolve,
             commands::s3_test_connection,
             commands::s3_sync_upload,
             commands::s3_sync_download,
@@ -1552,6 +1627,7 @@ pub fn run() {
             commands::get_proxy_status,
             commands::diagnose_codex_multirouter,
             commands::unlock_codex_model_picker,
+            commands::get_codex_guardian_status,
             commands::sync_codex_history_to_multirouter,
             commands::repair_codex_history_visibility,
             commands::list_codex_history_sessions,
@@ -1975,6 +2051,16 @@ async fn enabled_proxy_apps_on_startup(db: &database::Database) -> Vec<&'static 
 }
 
 async fn restore_proxy_state_on_startup(state: &store::AppState) {
+    match state
+        .proxy_service
+        .reconcile_codex_owned_projection_on_startup()
+        .await
+    {
+        Ok(true) => log::info!("✓ 已对账 CCSwitchMulti 自有 Codex 模型目录"),
+        Ok(false) => log::debug!("Codex 未使用 CCSwitchMulti 自有模型目录，跳过启动对账"),
+        Err(e) => log::warn!("启动时对账 Codex 模型目录失败: {e}"),
+    }
+
     match crate::proxy::external_openai_api::load_profile(&state.db) {
         Ok(profile) if profile.enabled => {
             match state.proxy_service.start_external_openai_api().await {
@@ -2012,6 +2098,12 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) {
             }
             Err(e) => {
                 log::error!("✗ 恢复 {app_type} 的代理接管状态失败: {e}");
+                if crate::services::proxy::is_port_ownership_guard_error(&e) {
+                    log::warn!(
+                        "保留 {app_type} 代理状态：端口所有权未确认，跳过关闭接管和破坏性清理"
+                    );
+                    continue;
+                }
                 // 失败时清除该应用的状态，避免下次启动再次尝试
                 if let Err(clear_err) = state
                     .proxy_service

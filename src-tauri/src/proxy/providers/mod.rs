@@ -17,9 +17,12 @@ mod claude;
 mod codex;
 pub(crate) mod codex_chat_common;
 pub mod codex_chat_history;
+pub(crate) mod codex_multi_agent;
 pub mod codex_oauth_auth;
 pub(crate) mod codex_oauth_pool;
+pub(crate) mod codex_reasoning;
 pub(crate) mod codex_responses_sse;
+pub(crate) mod codex_terminal;
 pub mod copilot_auth;
 pub mod copilot_model_map;
 mod gemini;
@@ -61,24 +64,27 @@ pub use claude::{
 };
 pub use codex::CodexAdapter;
 pub use codex::{
-    apply_codex_chat_upstream_model, apply_codex_request_upstream_model,
-    apply_codex_upstream_model, build_codex_route_probe_provider,
-    classify_codex_multirouter_auth_facade, codex_multirouter_needs_plaintext_v2_collaboration,
-    codex_provider_text_only_input, codex_provider_upstream_model,
-    codex_provider_uses_chat_completions, codex_route_persistent_provider,
-    codex_route_target_provider_id, explain_codex_responses_upstream_protocol,
-    inject_codex_chat_prompt_cache_key, is_codex_official_provider,
-    materialize_codex_routed_provider_from_target, provider_needs_responses_namespace_flatten,
-    resolve_codex_cache_config, resolve_codex_catalog_tool_profile,
-    resolve_codex_chat_reasoning_config, resolve_codex_model_routed_provider,
-    resolve_codex_model_routed_providers, should_convert_codex_responses_to_anthropic,
-    should_convert_codex_responses_to_chat, should_convert_codex_responses_to_messages,
-    CodexMultiRouterAuthFacade,
+    apply_codex_chat_upstream_model, apply_codex_native_responses_reasoning_effort,
+    apply_codex_request_upstream_model, apply_codex_upstream_model,
+    build_codex_route_probe_provider, classify_codex_multirouter_auth_facade,
+    codex_multirouter_needs_plaintext_v2_collaboration, codex_provider_text_only_input,
+    codex_provider_upstream_model, codex_provider_uses_chat_completions,
+    codex_route_persistent_provider, codex_route_target_provider_id,
+    explain_codex_responses_upstream_protocol, inject_codex_chat_prompt_cache_key,
+    is_codex_official_provider, materialize_codex_routed_provider_from_target,
+    provider_needs_responses_namespace_flatten, resolve_codex_cache_config,
+    resolve_codex_catalog_tool_profile, resolve_codex_chat_reasoning_config,
+    resolve_codex_model_routed_provider, resolve_codex_model_routed_providers,
+    resolve_codex_v2_raw_passthrough_provider, resolve_codex_v2_routed_provider,
+    should_convert_codex_responses_to_anthropic, should_convert_codex_responses_to_chat,
+    should_convert_codex_responses_to_messages, CodexMultiRouterAuthFacade, ResolvedCodexRoute,
 };
 pub(crate) use codex::{
-    codex_provider_remote_compaction_enabled, codex_route_supports_responses_compaction,
-    is_codex_remote_compact_endpoint, is_codex_responses_endpoint, provider_uses_native_codex_auth,
-    CODEX_ACCOUNT_POOL_ENABLED,
+    codex_provider_remote_compaction_enabled, codex_route_auth_source,
+    codex_route_supports_responses_compaction, codex_route_target_provider_id_from_route,
+    codex_route_uses_official_agent_backend, is_codex_remote_compact_endpoint,
+    is_codex_responses_endpoint, provider_uses_native_codex_auth,
+    resolve_codex_primary_route_from_settings, CODEX_ACCOUNT_POOL_ENABLED,
 };
 pub use gemini::GeminiAdapter;
 

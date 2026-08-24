@@ -5,11 +5,11 @@ use super::{
     codex_chat_common::{
         extract_reasoning_field_text, split_leading_think_block, strip_leading_think_open_tag,
     },
+    codex_terminal::{classify_chat_terminal, ChatTerminalEvidence, TerminalDisposition},
     transform_codex_chat::{
         chat_usage_to_responses_usage, custom_tool_input_from_chat_arguments,
-        response_id_from_chat_id, response_message_item_id, response_status_from_finish_reason,
-        response_tool_call_item_from_chat_name, response_tool_call_item_id_from_chat_name,
-        CodexToolContext,
+        response_id_from_chat_id, response_message_item_id, response_tool_call_item_from_chat_name,
+        response_tool_call_item_id_from_chat_name, CodexToolContext,
     },
 };
 use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
@@ -18,6 +18,11 @@ use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+
+pub(crate) const HOSTED_TOOL_STREAM_RESPONSE_HEADER: &str =
+    "x-cc-switch-hosted-tool-stream-response";
 
 #[derive(Debug, Default)]
 struct TextItemState {
@@ -63,6 +68,41 @@ struct ToolCallState {
     done: bool,
 }
 
+/// A completed Chat tool call observed by the Responses streaming state machine.
+///
+/// This is intentionally a transport-neutral snapshot. The hosted-tool
+/// coordinator can consume it at the argument-finalized boundary without
+/// reaching into the converter's internal accumulation maps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletedChatToolCall {
+    pub(crate) chat_index: usize,
+    pub(crate) call_id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
+}
+
+pub(crate) type ChatSseStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostedToolDiagnosticContext {
+    pub(crate) trace_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) tool: Option<&'static str>,
+}
+
+fn should_log_hosted_tool_not_called(
+    state: &ChatToResponsesState,
+    diagnostic_context: Option<&HostedToolDiagnosticContext>,
+) -> bool {
+    (state.completed || state.finish_reason.is_some())
+        && state.completed_tool_calls().is_empty()
+        && diagnostic_context
+            .and_then(|context| context.tool)
+            .is_some()
+}
+
 #[derive(Debug)]
 struct ChatToResponsesState {
     response_started: bool,
@@ -80,6 +120,9 @@ struct ChatToResponsesState {
     latest_usage: Option<Value>,
     finish_reason: Option<String>,
     tool_context: CodexToolContext,
+    /// 本回合因缺少合法函数名而被丢弃的工具调用数（见 `finalize_tools`）。
+    dropped_tool_calls: usize,
+    response_identity_locked: bool,
 }
 
 impl Default for ChatToResponsesState {
@@ -100,6 +143,8 @@ impl Default for ChatToResponsesState {
             latest_usage: None,
             finish_reason: None,
             tool_context: CodexToolContext::default(),
+            dropped_tool_calls: 0,
+            response_identity_locked: false,
         }
     }
 }
@@ -112,11 +157,97 @@ impl ChatToResponsesState {
         }
     }
 
+    fn completed_tool_calls(&self) -> Vec<CompletedChatToolCall> {
+        self.tools
+            .iter()
+            .filter_map(|(chat_index, state)| {
+                let name = state.name.trim();
+                let call_id = state.call_id.trim();
+                if name.is_empty() || call_id.is_empty() || state.arguments.trim().is_empty() {
+                    return None;
+                }
+                let name = self
+                    .tool_context
+                    .canonical_hosted_tool_chat_name(name)
+                    .unwrap_or(name)
+                    .to_string();
+                Some(CompletedChatToolCall {
+                    chat_index: *chat_index,
+                    call_id: call_id.to_string(),
+                    name,
+                    arguments: state.arguments.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn hosted_tool_calls_ready(&self) -> Option<Vec<CompletedChatToolCall>> {
+        if self.finish_reason.as_deref() != Some("tool_calls") {
+            return None;
+        }
+        let calls = self.completed_tool_calls();
+        if calls.is_empty() || calls.len() != self.tools.len() {
+            return None;
+        }
+        let hosted = calls
+            .into_iter()
+            .filter(|call| self.tool_context.is_hosted_tool_chat_name(&call.name))
+            .collect::<Vec<_>>();
+        if hosted.is_empty() {
+            return None;
+        }
+        Some(hosted)
+    }
+
+    fn finalize_non_hosted_tools(&mut self) -> Vec<Bytes> {
+        self.finalize_tools_filtered(true)
+    }
+
+    fn has_non_hosted_tool_calls(&self) -> bool {
+        self.completed_tool_calls()
+            .iter()
+            .any(|call| !self.tool_context.is_hosted_tool_chat_name(&call.name))
+    }
+
+    fn assistant_message_for_hosted_tools(&self, calls: &[CompletedChatToolCall]) -> Value {
+        let tool_calls = calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut message = json!({
+            "role": "assistant",
+            "tool_calls": tool_calls
+        });
+        if !self.text.text.is_empty() {
+            message["content"] = Value::String(self.text.text.clone());
+        }
+        message
+    }
+
+    fn begin_hosted_continuation(&mut self) {
+        self.tools.clear();
+        self.next_tool_index_to_add = 0;
+        self.finish_reason = None;
+        self.dropped_tool_calls = 0;
+        self.completed = false;
+    }
+
     fn handle_chat_chunk(&mut self, chunk: &Value) -> Vec<Bytes> {
         let mut events = Vec::new();
 
-        if let Some(id) = chunk.get("id").and_then(|v| v.as_str()) {
-            self.response_id = response_id_from_chat_id(Some(id));
+        if !self.response_identity_locked {
+            if let Some(id) = chunk.get("id").and_then(|v| v.as_str()) {
+                self.response_id = response_id_from_chat_id(Some(id));
+            }
         }
         if let Some(model) = chunk.get("model").and_then(|v| v.as_str()) {
             if !model.is_empty() {
@@ -128,6 +259,7 @@ impl ChatToResponsesState {
         }
 
         events.extend(self.ensure_response_started());
+        self.response_identity_locked = true;
 
         if let Some(usage) = chunk.get("usage").filter(|v| !v.is_null()) {
             self.latest_usage = Some(chat_usage_to_responses_usage(Some(usage)));
@@ -150,6 +282,11 @@ impl ChatToResponsesState {
             if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                 if !content.is_empty() {
                     events.extend(self.push_content_delta(content));
+                }
+            }
+            if let Some(refusal) = delta.get("refusal").and_then(|v| v.as_str()) {
+                if !refusal.is_empty() {
+                    events.extend(self.push_content_delta(refusal));
                 }
             }
 
@@ -288,13 +425,12 @@ impl ChatToResponsesState {
             self.reasoning.item_id = item_id.clone();
             self.reasoning.added = true;
 
-            events.push(sse::reasoning_item_added(output_index, &item_id));
-            events.push(sse::reasoning_summary_part_added(output_index, &item_id));
+            events.push(sse::reasoning_text_item_added(output_index, &item_id));
         }
 
         self.reasoning.text.push_str(delta);
         let output_index = self.reasoning.output_index.unwrap_or(0);
-        events.push(sse::reasoning_summary_text_delta(
+        events.push(sse::reasoning_text_delta(
             output_index,
             &self.reasoning.item_id,
             delta,
@@ -332,8 +468,43 @@ impl ChatToResponsesState {
         (!self.reasoning.text.trim().is_empty()).then(|| self.reasoning.text.trim().to_string())
     }
 
+    /// 上游未下发 `index` 时的 key 解析。
+    ///
+    /// `index` 在 OpenAI Chat Completions 协议里是必填字段，但部分第三方网关会省略。
+    /// 缺了它就无法从帧结构上区分「同一调用的 arguments 续帧」和「一个新调用」，
+    /// 所以这里只在**能确证是新调用**时才分配新 key：delta 带非空 `id`，且该 id 与
+    /// 所有已知调用都不同。其余情况一律归入最后一个已知 key（空 map 时为 0），保持
+    /// 既有行为——宁可两个并行调用坍缩成一个，也不能把一个调用的续帧炸成多个 item。
+    fn resolve_tool_key_without_index(&self, tool_call: &Value) -> usize {
+        let last_key = self.tools.keys().next_back().copied();
+
+        let Some(id) = tool_call
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+        else {
+            return last_key.unwrap_or(0);
+        };
+
+        if let Some((key, _)) = self.tools.iter().find(|(_, state)| state.call_id == id) {
+            return *key;
+        }
+
+        // 上游可以先发一个显式 `index: usize::MAX` 再发无 index 的新 id。这段代码
+        // 存在的理由就是应付畸形上游，所以不能用裸 `+1`（debug 下 panic、release 下
+        // 回绕到 0 覆盖已有调用）。溢出时退回并入最后一个已知调用，与本函数
+        // "宁可坍缩也不炸开" 的取向一致。
+        match last_key {
+            Some(key) => key.checked_add(1).unwrap_or(key),
+            None => 0,
+        }
+    }
+
     fn push_tool_call_delta(&mut self, tool_call: &Value, reasoning: Option<&str>) -> Vec<Bytes> {
-        let chat_index = tool_call.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let chat_index = match tool_call.get("index").and_then(|v| v.as_u64()) {
+            Some(index) => index as usize,
+            None => self.resolve_tool_key_without_index(tool_call),
+        };
         let id_delta = tool_call
             .get("id")
             .and_then(|v| v.as_str())
@@ -383,9 +554,10 @@ impl ChatToResponsesState {
         }
 
         let is_custom_tool = self.tool_context.is_custom_tool_chat_name(&current_name);
+        let is_hosted_tool = self.tool_context.is_hosted_tool_chat_name(&current_name);
         let mut events = Vec::new();
 
-        if !args_delta.is_empty() && !is_custom_tool {
+        if !args_delta.is_empty() && !is_custom_tool && !is_hosted_tool {
             if let Some(output_index) = output_index {
                 events.push(sse::function_call_arguments_delta(
                     output_index,
@@ -427,6 +599,13 @@ impl ChatToResponsesState {
                 &state.name,
                 &self.tool_context,
             );
+
+            if self.tool_context.is_hosted_tool_chat_name(&state.name) {
+                // Hosted calls are consumed by the proxy coordinator. Do not
+                // expose them as ordinary client-executed function calls.
+                self.next_tool_index_to_add += 1;
+                continue;
+            }
 
             let item = response_tool_call_item_from_chat_name(
                 &state.item_id,
@@ -483,6 +662,19 @@ impl ChatToResponsesState {
             })
     }
 
+    /// 本回合最终产出里可被 Codex 识别的工具调用 item 数量。
+    fn emitted_tool_call_count(&self) -> usize {
+        self.output_items
+            .iter()
+            .filter(|(_, item)| {
+                matches!(
+                    item.get("type").and_then(|v| v.as_str()),
+                    Some("function_call" | "custom_tool_call" | "tool_search_call")
+                )
+            })
+            .count()
+    }
+
     fn finalize(&mut self) -> Vec<Bytes> {
         if self.completed {
             return Vec::new();
@@ -494,13 +686,29 @@ impl ChatToResponsesState {
         events.extend(self.finalize_text());
         events.extend(self.finalize_tools());
 
-        let status = response_status_from_finish_reason(self.finish_reason.as_deref());
-        let mut response = self.base_response(status, self.completed_output_items());
-        if status == "incomplete" {
-            response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+        let terminal = classify_chat_terminal(
+            self.finish_reason.as_deref(),
+            ChatTerminalEvidence {
+                has_final_message: !self.text.text.trim().is_empty(),
+                valid_tool_calls: self.emitted_tool_call_count(),
+                dropped_tool_calls: self.dropped_tool_calls,
+            },
+        );
+        if let TerminalDisposition::Failed { code, message } = &terminal {
+            events.push(self.failed_event(message.clone(), Some((*code).to_string())));
+            return events;
         }
 
-        events.push(sse::response_completed(&response));
+        let mut response = self.base_response(terminal.status(), self.completed_output_items());
+        if let TerminalDisposition::Incomplete { reason } = terminal {
+            response["incomplete_details"] = json!({ "reason": reason });
+        }
+
+        if response["status"] == "incomplete" {
+            events.push(sse::response_incomplete(&response));
+        } else {
+            events.push(sse::response_completed(&response));
+        }
         self.completed = true;
         events
     }
@@ -513,7 +721,7 @@ impl ChatToResponsesState {
         let output_index = self.reasoning.output_index.unwrap_or(0);
         let item_id = self.reasoning.item_id.clone();
         let text = self.reasoning.text.clone();
-        let (events, item) = sse::reasoning_close(output_index, &item_id, &text);
+        let (events, item) = sse::reasoning_text_close(output_index, &item_id, &text);
         self.output_items.push((output_index, item));
         self.reasoning.done = true;
         events
@@ -534,10 +742,22 @@ impl ChatToResponsesState {
     }
 
     fn finalize_tools(&mut self) -> Vec<Bytes> {
+        self.finalize_tools_filtered(false)
+    }
+
+    fn finalize_tools_filtered(&mut self, non_hosted_only: bool) -> Vec<Bytes> {
         let mut events = Vec::new();
         let keys: Vec<usize> = self.tools.keys().copied().collect();
 
         for key in keys {
+            if non_hosted_only
+                && self
+                    .tools
+                    .get(&key)
+                    .is_some_and(|state| self.tool_context.is_hosted_tool_chat_name(&state.name))
+            {
+                continue;
+            }
             let mut add_event: Option<Bytes> = None;
             if self.tools.get(&key).map(|state| state.done).unwrap_or(true) {
                 continue;
@@ -545,16 +765,35 @@ impl ChatToResponsesState {
 
             // Skip tool calls with missing names (defensive: some models generate
             // tool call deltas without providing a valid function name)
+            // 纯空白名同样对应不到任何已发布工具，必须与空名同等对待——否则它会
+            // 伪装成"本回合还有工具调用"，绕过下面 finalize 里的失败判据。
             let has_bad_name = self
                 .tools
                 .get(&key)
-                .map(|state| state.name.is_empty())
+                .map(|state| state.name.trim().is_empty())
                 .unwrap_or(true);
             if has_bad_name {
+                let (call_id_empty, args_bytes) = self
+                    .tools
+                    .get(&key)
+                    .map(|state| (state.call_id.is_empty(), state.arguments.len()))
+                    .unwrap_or((true, 0));
                 if let Some(state) = self.tools.get_mut(&key) {
                     state.done = true;
                 }
-                log::warn!("[Codex] Skipping streaming tool call with missing name");
+                self.dropped_tool_calls += 1;
+                // 只记结构信息：arguments 内容可能包含用户代码，且前端日志出口是
+                // allowlist 脱敏，新字段不进白名单就不会被处理，因此只输出字节数。
+                log::warn!(
+                    "[Codex] dropped streaming tool call: model={} chat_index={} \
+                     call_id_empty={} args_bytes={} finish_reason={} tools_total={}",
+                    self.model,
+                    key,
+                    call_id_empty,
+                    args_bytes,
+                    self.finish_reason.as_deref().unwrap_or("<none>"),
+                    self.tools.len()
+                );
                 continue;
             }
 
@@ -763,9 +1002,8 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
 
                         let data = data_parts.join("\n");
                         if data.trim() == "[DONE]" {
-                            for event in state.finalize() {
-                                yield Ok(event);
-                            }
+                            // Chat's [DONE] sentinel closes the SSE transport. It
+                            // does not carry the model's terminal semantics.
                             continue;
                         }
 
@@ -821,6 +1059,161 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
     }
 }
 
+/// Convert Chat SSE to Responses SSE while allowing the proxy to execute
+/// hosted tool calls between upstream rounds. Hosted tool output items are
+/// intentionally withheld from the client; ordinary text continues through
+/// the same response lifecycle before and after the tool round.
+pub(crate) fn create_responses_sse_stream_from_chat_with_hosted_loop<F, Fut>(
+    initial_stream: ChatSseStream,
+    tool_context: CodexToolContext,
+    diagnostic_context: Option<HostedToolDiagnosticContext>,
+    mut on_hosted_tools: F,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send
+where
+    F: FnMut(Vec<CompletedChatToolCall>, Value) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Option<ChatSseStream>, String>> + Send,
+{
+    async_stream::stream! {
+        let mut current_stream = initial_stream;
+        let mut state = ChatToResponsesState::with_tool_context(tool_context);
+        let mut buffer = String::new();
+        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut stream_failed = false;
+
+        'rounds: loop {
+            while let Some(chunk) = current_stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        crate::proxy::sse::append_utf8_safe(
+                            &mut buffer,
+                            &mut utf8_remainder,
+                            &bytes,
+                        );
+
+                        while let Some(block) = take_sse_block(&mut buffer) {
+                            if block.trim().is_empty() {
+                                continue;
+                            }
+                            let mut event_name: Option<String> = None;
+                            let mut data_parts: Vec<String> = Vec::new();
+                            for line in block.lines() {
+                                if let Some(event) = strip_sse_field(line, "event") {
+                                    event_name = Some(event.trim().to_string());
+                                }
+                                if let Some(data) = strip_sse_field(line, "data") {
+                                    data_parts.push(data.to_string());
+                                }
+                            }
+                            if data_parts.is_empty() {
+                                continue;
+                            }
+                            let data = data_parts.join("\n");
+                            if data.trim() == "[DONE]" {
+                                // Transport closure is classified only after an
+                                // explicit finish_reason has been observed.
+                                continue;
+                            }
+                            let chunk: Value = match serde_json::from_str(&data) {
+                                Ok(value) => value,
+                                Err(_) => continue,
+                            };
+                            if event_name.as_deref() == Some("error") || chunk.get("error").is_some() {
+                                let (message, error_type) = extract_chat_sse_error(&chunk);
+                                yield Ok(state.failed_event(message, error_type));
+                                stream_failed = true;
+                                break;
+                            }
+
+                            let events = state.handle_chat_chunk(&chunk);
+                            for event in events {
+                                yield Ok(event);
+                            }
+
+                            if let Some(calls) = state.hosted_tool_calls_ready() {
+                                if state.has_non_hosted_tool_calls() {
+                                    for event in state.finalize_non_hosted_tools() {
+                                        yield Ok(event);
+                                    }
+                                }
+                                let assistant = state.assistant_message_for_hosted_tools(&calls);
+                                match on_hosted_tools(calls, assistant).await {
+                                    Ok(Some(next_stream)) => {
+                                        state.begin_hosted_continuation();
+                                        current_stream = next_stream;
+                                        buffer.clear();
+                                        utf8_remainder.clear();
+                                        continue 'rounds;
+                                    }
+                                    Ok(None) => {
+                                        yield Ok(state.failed_event(
+                                            "Hosted tool coordinator ended without a continuation stream".to_string(),
+                                            Some("hosted_tool_continuation_missing".to_string()),
+                                        ));
+                                        stream_failed = true;
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        yield Ok(state.failed_event(
+                                            error,
+                                            Some("hosted_tool_coordinator_failed".to_string()),
+                                        ));
+                                        stream_failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if stream_failed {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        yield Ok(state.failed_event(
+                            format!("Stream error: {error}"),
+                            Some("stream_error".to_string()),
+                        ));
+                        stream_failed = true;
+                        break;
+                    }
+                }
+            }
+
+            if should_log_hosted_tool_not_called(&state, diagnostic_context.as_ref()) {
+                if let Some(context) = diagnostic_context.as_ref() {
+                    crate::proxy::providers::hosted_tools::bridge::log_hosted_tool_not_called(
+                        context.trace_id.as_deref(),
+                        &context.session_id,
+                        &context.model,
+                        &context.provider,
+                        context.tool.expect("checked above"),
+                        true,
+                    );
+                }
+            }
+
+            if stream_failed || state.completed {
+                break;
+            }
+            if state.finish_reason.is_some() {
+                for event in state.finalize() {
+                    yield Ok(event);
+                }
+            } else if state.has_substantive_output() {
+                yield Ok(state.failed_event(
+                    "Upstream Chat Completions stream ended after partial output but before sending finish_reason".to_string(),
+                    Some("stream_truncated".to_string()),
+                ));
+            } else {
+                yield Ok(state.failed_event(
+                    "Upstream Chat Completions stream ended before sending finish_reason".to_string(),
+                    Some("stream_truncated".to_string()),
+                ));
+            }
+            break;
+        }
+    }
+}
+
 fn extract_chat_sse_error(value: &Value) -> (String, Option<String>) {
     let error = value.get("error").unwrap_or(value);
     let message = error
@@ -863,6 +1256,158 @@ mod tests {
         String::from_utf8(bytes.concat()).unwrap()
     }
 
+    #[tokio::test]
+    async fn hosted_tool_stream_pauses_executes_and_continues_same_response() {
+        let context = super::super::transform_codex_chat::build_codex_tool_context_from_request(
+            &json!({ "tools": [{ "type": "web_search" }] }),
+        );
+        let initial = vec![
+            Ok(Bytes::from_static(b"data: {\"id\":\"chatcmpl_hosted\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\"}}]}}]}\n\n")),
+            Ok(Bytes::from_static(b"data: {\"id\":\"chatcmpl_hosted\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"query\\\":\\\"rust\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")),
+        ];
+        let continuation = vec![
+            Bytes::from_static(b"data: {\"id\":\"chatcmpl_final\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n"),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ];
+        let initial_stream: ChatSseStream = Box::pin(stream::iter(initial));
+        let output = create_responses_sse_stream_from_chat_with_hosted_loop(
+            initial_stream,
+            context,
+            None,
+            move |calls, assistant| {
+                let continuation = continuation.clone();
+                async move {
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0].name, "web_search");
+                    assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+                    let next = continuation.into_iter().map(Ok::<Bytes, std::io::Error>);
+                    Ok(Some(Box::pin(stream::iter(next)) as ChatSseStream))
+                }
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let output = String::from_utf8(
+            output
+                .into_iter()
+                .map(|item| item.unwrap())
+                .collect::<Vec<_>>()
+                .concat(),
+        )
+        .unwrap();
+
+        assert!(output.contains("done"));
+        assert!(output.contains("response.completed"));
+        assert!(!output.contains("function_call_arguments"));
+        assert!(!output.contains("web_search"));
+    }
+
+    #[test]
+    fn completed_stream_without_tool_call_requires_hosted_tool_diagnostic() {
+        let mut state = ChatToResponsesState::with_tool_context(CodexToolContext::default());
+        state.completed = true;
+        let diagnostic_context = HostedToolDiagnosticContext {
+            trace_id: Some("trace".to_string()),
+            session_id: "session".to_string(),
+            model: "qwen3.8".to_string(),
+            provider: "provider".to_string(),
+            tool: Some("web_search"),
+        };
+
+        assert!(should_log_hosted_tool_not_called(
+            &state,
+            Some(&diagnostic_context)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mixed_hosted_and_ordinary_streaming_tools_execute_hosted_and_emit_ordinary() {
+        let context =
+            super::super::transform_codex_chat::build_codex_tool_context_from_request(&json!({
+                "tools": [
+                    { "type": "web_search" },
+                    { "type": "function", "function": { "name": "image_gen__imagegen" } }
+                ]
+            }));
+        let chunks = vec![
+            Ok(Bytes::from_static(b"data: {\"id\":\"chatcmpl_mixed\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_hosted\",\"type\":\"function\",\"function\":{\"name\":\"web_search\"}},{\"index\":1,\"id\":\"call_fn\",\"type\":\"function\",\"function\":{\"name\":\"image_gen__imagegen\"}}]}}]}\n\n")),
+            Ok(Bytes::from_static(b"data: {\"id\":\"chatcmpl_mixed\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}},{\"index\":1,\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")),
+        ];
+        let continuation = vec![
+            Bytes::from_static(b"data: {\"id\":\"chatcmpl_mixed_final\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"search complete\"},\"finish_reason\":\"stop\"}]}\n\n"),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ];
+        let stream: ChatSseStream = Box::pin(stream::iter(chunks));
+        let output = create_responses_sse_stream_from_chat_with_hosted_loop(
+            stream,
+            context,
+            None,
+            move |calls, assistant| {
+                let continuation = continuation.clone();
+                async move {
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0].name, "web_search");
+                    assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 1);
+                    let next = continuation.into_iter().map(Ok::<Bytes, std::io::Error>);
+                    Ok(Some(Box::pin(stream::iter(next)) as ChatSseStream))
+                }
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let output = String::from_utf8(
+            output
+                .into_iter()
+                .map(|item| item.unwrap())
+                .collect::<Vec<_>>()
+                .concat(),
+        )
+        .unwrap();
+
+        assert!(output.contains("search complete"));
+        assert!(output.contains("\"name\":\"image_gen__imagegen\""));
+        assert!(output.contains("response.function_call_arguments.done"));
+        assert!(output.contains("response.completed"));
+        assert!(!output.contains("mixed_hosted_tool_calls"));
+        assert!(!output.contains("\"name\":\"web_search\""));
+    }
+
+    #[tokio::test]
+    async fn image_gen_alias_is_normalized_when_hosted_image_tool_is_declared() {
+        let context = super::super::transform_codex_chat::build_codex_tool_context_from_request(
+            &json!({ "tools": [{ "type": "image_generation" }] }),
+        );
+        let chunks = vec![
+            Ok(Bytes::from_static(b"data: {\"id\":\"chatcmpl_image_alias\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_image\",\"type\":\"function\",\"function\":{\"name\":\"image_gen\"}}]}}]}\n\n")),
+            Ok(Bytes::from_static(b"data: {\"id\":\"chatcmpl_image_alias\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"prompt\\\":\\\"test\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")),
+        ];
+        let stream: ChatSseStream = Box::pin(stream::iter(chunks));
+        let output = create_responses_sse_stream_from_chat_with_hosted_loop(
+            stream,
+            context,
+            None,
+            |calls, assistant| async move {
+                assert_eq!(calls[0].name, "generate_image");
+                assert_eq!(
+                    assistant["tool_calls"][0]["function"]["name"],
+                    "generate_image"
+                );
+                Ok(None)
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let output = String::from_utf8(
+            output
+                .into_iter()
+                .map(|item| item.unwrap())
+                .collect::<Vec<_>>()
+                .concat(),
+        )
+        .unwrap();
+        assert!(output.contains("hosted_tool_continuation_missing"));
+    }
+
     fn parse_sse_events(output: &str) -> Vec<Value> {
         output
             .split("\n\n")
@@ -900,9 +1445,12 @@ mod tests {
         ])
         .await;
 
-        assert!(output.contains("event: response.reasoning_summary_part.added"));
-        assert!(output.contains("event: response.reasoning_summary_text.delta"));
-        assert!(output.contains("event: response.reasoning_summary_text.done"));
+        assert!(output.contains("event: response.reasoning_text.delta"));
+        assert!(output.contains("event: response.reasoning_text.done"));
+        assert!(output.contains(
+            "\"content\":[{\"type\":\"reasoning_text\",\"text\":\"Need context. Now answer. \"}]"
+        ));
+        assert!(!output.contains("event: response.reasoning_summary_text.delta"));
         assert!(output.contains("Need context. Now answer. "));
         assert!(output.contains("\"type\":\"reasoning\""));
         assert!(output.contains("\"text\":\"Done\""));
@@ -922,7 +1470,9 @@ mod tests {
         ])
         .await;
 
-        assert!(output.contains("event: response.reasoning_summary_text.delta"));
+        assert!(output.contains("event: response.reasoning_text.delta"));
+        assert!(output.contains("event: response.reasoning_text.done"));
+        assert!(!output.contains("event: response.reasoning_summary_text.delta"));
         assert!(output.contains("Need context."));
         assert!(output.contains("\"text\":\"pong\""));
         assert!(output.contains("\"reasoning_tokens\":3"));
@@ -1032,6 +1582,139 @@ mod tests {
         assert_eq!(items[0]["call_id"], "call_valid");
         assert_eq!(items[0]["arguments"], r#"{"cmd":"date"}"#);
         assert!(!output.contains("call_missing"));
+    }
+
+    /// #4341：上游只给出畸形工具调用时，丢弃后本回合一个工具调用都不剩，
+    /// Codex 会把它当成正常完成而静默收尾。此时必须如实报错。
+    #[tokio::test]
+    async fn dropped_only_tool_call_emits_failed_without_completed() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_drop\",\"model\":\"kimi-k3\",\"choices\":[{\"delta\":{\"content\":\"让我继续处理这个文件\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_drop\",\"model\":\"kimi-k3\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_bad\",\"type\":\"function\",\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.failed"));
+        assert!(output.contains("upstream_tool_call_dropped"));
+        assert!(!output.contains("event: response.completed"));
+        // 已经推给客户端的文本增量不受影响，用户仍能看到模型说了什么。
+        assert!(output.contains("让我继续处理这个文件"));
+    }
+
+    /// `finish_reason=length`（token 截断）时工具调用往往只到一半就没了 name。
+    /// 这不是"上游发了畸形数据"，而是截断——归因必须是 incomplete，不能报成
+    /// tool_call_dropped，否则诊断信息本身就是错的。
+    #[tokio::test]
+    async fn truncated_turn_stays_incomplete_instead_of_failed() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_trunc\",\"model\":\"kimi-k3\",\"choices\":[{\"delta\":{\"content\":\"我来看看\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_trunc\",\"model\":\"kimi-k3\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_cut\",\"type\":\"function\",\"function\":{\"arguments\":\"{\\\"pa\"}}]},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.incomplete"));
+        assert!(output.contains("\"status\":\"incomplete\""));
+        assert!(!output.contains("event: response.completed"));
+        assert!(!output.contains("event: response.failed"));
+    }
+
+    /// 纯空白函数名对应不到任何已发布工具，必须与空名同等对待，
+    /// 否则它会伪装成"本回合还有工具调用"而绕过判据。
+    #[tokio::test]
+    async fn whitespace_only_tool_name_is_dropped() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_ws\",\"model\":\"kimi-k3\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_ws\",\"type\":\"function\",\"function\":{\"name\":\"   \",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.failed"));
+        assert!(output.contains("upstream_tool_call_dropped"));
+        assert!(!output.contains("event: response.completed"));
+    }
+
+    /// 纯文本回合（从未出现过工具调用增量）不受判据影响。
+    #[tokio::test]
+    async fn text_only_turn_still_completes() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_text\",\"model\":\"kimi-k3\",\"choices\":[{\"delta\":{\"content\":\"完成了\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.completed"));
+        assert!(!output.contains("event: response.failed"));
+    }
+
+    /// 上游省略 `index` 时，两个 id 不同的调用不得坍缩成一个。
+    #[tokio::test]
+    async fn missing_index_with_distinct_ids_keeps_calls_separate() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_noidx\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_noidx\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        let events = parse_sse_events(&output);
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let items = completed["response"]["output"].as_array().unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["call_id"], "call_a");
+        assert_eq!(items[0]["name"], "read_file");
+        assert_eq!(items[0]["arguments"], r#"{"path":"a.txt"}"#);
+        assert_eq!(items[1]["call_id"], "call_b");
+        assert_eq!(items[1]["name"], "exec_command");
+        assert_eq!(items[1]["arguments"], r#"{"cmd":"ls"}"#);
+    }
+
+    /// 上游省略 `index` 时，不带 id 的 arguments 续帧必须归入同一个调用，
+    /// 不能被当成新调用炸成多个 item。
+    #[tokio::test]
+    async fn missing_index_argument_fragments_stay_in_one_call() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_frag\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_frag\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"type\":\"function\",\"function\":{\"arguments\":\"\\\"a.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        let events = parse_sse_events(&output);
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let items = completed["response"]["output"].as_array().unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["call_id"], "call_a");
+        assert_eq!(items[0]["arguments"], r#"{"path":"a.txt"}"#);
+    }
+
+    /// 上游省略 `index` 且重复下发同一个 id（部分网关每帧重复整个头部）时，
+    /// 不得被判成新调用。
+    #[tokio::test]
+    async fn missing_index_repeated_same_id_stays_in_one_call() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_rep\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_rep\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\\\"a.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        let events = parse_sse_events(&output);
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let items = completed["response"]["output"].as_array().unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["call_id"], "call_a");
+        assert_eq!(items[0]["arguments"], r#"{"path":"a.txt"}"#);
     }
 
     #[tokio::test]
@@ -1244,6 +1927,98 @@ mod tests {
         assert!(output.contains("stream_truncated"));
         assert!(!output.contains("event: response.completed"));
         assert!(!output.contains("\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"));
+    }
+
+    #[tokio::test]
+    async fn terminal_semantics_done_without_finish_reason_emits_failed() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_done_only\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.failed"), "got: {output}");
+        assert!(output.contains("finish_reason"), "got: {output}");
+        assert!(
+            !output.contains("event: response.completed"),
+            "got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_semantics_empty_tool_calls_emits_failed() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_empty_tools\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.failed"), "got: {output}");
+        assert!(
+            output.contains("upstream_tool_call_missing"),
+            "got: {output}"
+        );
+        assert!(
+            !output.contains("event: response.completed"),
+            "got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_semantics_reasoning_only_stop_emits_failed() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_reasoning_only\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"reasoning_content\":\"Need another tool.\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.failed"), "got: {output}");
+        assert!(
+            output.contains("upstream_final_output_missing"),
+            "got: {output}"
+        );
+        assert!(
+            !output.contains("event: response.completed"),
+            "got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_semantics_content_filter_emits_incomplete() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_filtered\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(
+            output.contains("event: response.incomplete"),
+            "got: {output}"
+        );
+        assert!(
+            output.contains("\"reason\":\"content_filter\""),
+            "got: {output}"
+        );
+        assert!(
+            !output.contains("event: response.completed"),
+            "got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_semantics_refusal_is_a_final_message() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_refusal\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"refusal\":\"I cannot help with that.\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(
+            output.contains("event: response.completed"),
+            "got: {output}"
+        );
+        assert!(output.contains("I cannot help with that."), "got: {output}");
+        assert!(!output.contains("event: response.failed"), "got: {output}");
     }
 
     #[tokio::test]

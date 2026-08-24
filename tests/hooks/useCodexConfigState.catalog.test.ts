@@ -76,4 +76,78 @@ describe("useCodexConfigState catalog load", () => {
       },
     ]);
   });
+
+  it("reloads camelCase image-support booleans from the DB SSOT without modalities", () => {
+    const initialData = {
+      settingsConfig: {
+        auth: {},
+        config: "",
+        modelCatalog: {
+          models: [
+            { model: "vision-camel", supportsImage: true },
+            { model: "text-camel", supportsImage: false },
+          ],
+        },
+      },
+    };
+
+    const { result } = renderHook(() => useCodexConfigState({ initialData }));
+
+    expect(result.current.codexCatalogModels).toEqual([
+      { model: "vision-camel", supportsImage: true },
+      { model: "text-camel", supportsImage: false },
+    ]);
+  });
+
+  it("reloads snake_case and legacy image-support booleans as camelCase without modalities", () => {
+    const initialData = {
+      settingsConfig: {
+        auth: {},
+        config: "",
+        modelCatalog: {
+          models: [
+            { model: "vision-snake", supports_image: true },
+            { model: "text-snake", supports_image: false },
+            { model: "vision-legacy", vision: true },
+          ],
+        },
+      },
+    };
+
+    const { result } = renderHook(() => useCodexConfigState({ initialData }));
+
+    expect(result.current.codexCatalogModels).toEqual([
+      { model: "vision-snake", supportsImage: true },
+      { model: "text-snake", supportsImage: false },
+      { model: "vision-legacy", supportsImage: true },
+    ]);
+  });
+
+  it("preserves per-model reasoning capability while loading an existing provider", () => {
+    const reasoning = {
+      supported: true as const,
+      supportedEfforts: ["low", "high", "max"] as const,
+      defaultEffort: "high" as const,
+      disableAllowed: false,
+      upstream: {
+        format: "string" as const,
+        parameter: "reasoning_effort",
+        effortMap: { low: "low", high: "high", max: "max" },
+      },
+      source: "builtin" as const,
+    };
+    const initialData = {
+      settingsConfig: {
+        auth: {},
+        config: "",
+        modelCatalog: {
+          models: [{ model: "deepseek-v4-pro", reasoning }],
+        },
+      },
+    };
+
+    const { result } = renderHook(() => useCodexConfigState({ initialData }));
+
+    expect(result.current.codexCatalogModels[0].reasoning).toEqual(reasoning);
+  });
 });

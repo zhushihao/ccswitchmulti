@@ -2,19 +2,23 @@
 //!
 //! 负责将请求转发到上游Provider，支持故障转移
 
-use super::hyper_client::ProxyResponse;
+use super::hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES};
 use super::providers::{
     hosted_tools::bridge::{
         append_tool_outputs_to_chat_request, execute_hosted_tool_calls, scan_hosted_tool_calls,
-        HostedToolCallScan, HostedToolLoopConfig, HOSTED_TOOL_LOOP_HEADER,
-        MAX_HOSTED_TOOL_ITERATIONS,
+        HostedToolCall, HostedToolCallKind, HostedToolCallScan, HostedToolLoopConfig,
+        HOSTED_TOOL_LOOP_HEADER, MAX_HOSTED_TOOL_ITERATIONS,
     },
     hosted_tools::openai_client::OpenAiHostedToolClient,
+    streaming_codex_chat::{
+        create_responses_sse_stream_from_chat_with_hosted_loop, ChatSseStream,
+        CompletedChatToolCall, HOSTED_TOOL_STREAM_RESPONSE_HEADER,
+    },
     transform_codex_chat::CodexToolContext,
 };
 use super::{
     body_filter::filter_private_params_with_whitelist,
-    content_encoding::{decompress_body, get_content_encoding},
+    content_encoding::{decompress_body_with_limit, get_content_encoding},
     error::*,
     failover_switch::FailoverSwitchManager,
     json_canonical::{canonicalize_value, short_value_hash},
@@ -44,8 +48,8 @@ use crate::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
-use http::Extensions;
-use serde_json::Value;
+use http::{Extensions, StatusCode};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -59,7 +63,16 @@ const CODEX_RESPONSES_LITE_FALLBACK_TTL: Duration = Duration::from_secs(24 * 60 
 ///
 /// Codex 端 `request_max_retries` 是从客户端重新 POST；这里是在代理内直接复用
 /// 已转换好的请求体重试，减少不稳定网络下“一次 send 失败就整轮失败”的概率。
-const UPSTREAM_TRANSPORT_RETRY_LIMIT: usize = 2;
+// Keep pre-dispatch/connect failures inside CCSM long enough that a short TLS or edge outage
+// does not consume Codex's own five reconnect attempts. `ForwardFailed` is restricted below to
+// failures for which no upstream execution is possible; ambiguous in-flight requests remain
+// `ResponsePending` and never enter this loop.
+const UPSTREAM_TRANSPORT_RETRY_LIMIT: usize = 5;
+/// 真实上游在尚未建立成功响应时明确返回 429，等价于拒绝接收本次采样请求，
+/// 因而可以安全重放同一份 headers/body。次数与 Codex 默认流恢复预算对齐。
+const CODEX_RATE_LIMIT_RETRY_LIMIT: usize = 5;
+const CODEX_RATE_LIMIT_MAX_SINGLE_DELAY: Duration = Duration::from_secs(60);
+const CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET: Duration = Duration::from_secs(180);
 
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
@@ -203,6 +216,37 @@ fn provider_requests_codex_account_pool(provider: &Provider) -> bool {
         .unwrap_or(false)
 }
 
+fn materialize_codex_account_pool_candidate(
+    provider: &Provider,
+    entry: &super::providers::codex_oauth_auth::CodexAccountPoolEntry,
+    credential_generation: u64,
+) -> Provider {
+    let mut candidate = provider.clone();
+    candidate.settings_config["codexPoolCredentialGeneration"] = Value::from(credential_generation);
+    if entry.account_id == NATIVE_CODEX_ACCOUNT_ID {
+        candidate.settings_config["codexNativeAuthPassthrough"] = Value::Bool(true);
+        candidate.settings_config["codexPoolAccountId"] =
+            Value::String(NATIVE_CODEX_ACCOUNT_ID.to_string());
+        if let Some(meta) = candidate.meta.as_mut() {
+            meta.provider_type = None;
+            meta.auth_binding = None;
+        }
+    } else {
+        candidate.settings_config["codexNativeAuthPassthrough"] = Value::Bool(false);
+        candidate.settings_config["codexPoolAccountId"] = Value::String(entry.account_id.clone());
+        let meta = candidate.meta.get_or_insert_with(Default::default);
+        meta.provider_type = Some("codex_oauth".to_string());
+        meta.auth_binding = Some(crate::provider::AuthBinding {
+            source: crate::provider::AuthBindingSource::ManagedAccount,
+            auth_provider: Some("codex_oauth".to_string()),
+            account_id: Some(entry.account_id.clone()),
+        });
+    }
+    candidate.id = format!("{}::account::{}", candidate.id, entry.account_id);
+    candidate.name = format!("{} [{}]", candidate.name, entry.account_id);
+    candidate
+}
+
 fn provider_codex_pool_account(provider: &Provider) -> Option<(&str, u64)> {
     let account_id = provider
         .settings_config
@@ -262,9 +306,23 @@ impl RequestForwarder {
         &self,
         app_type: &AppType,
         provider: &Provider,
+        body: &Value,
     ) -> Result<Provider, ProxyError> {
         if !matches!(app_type, AppType::Codex) {
             return Ok(provider.clone());
+        }
+        if codex_provider_has_v2_routing(provider) {
+            return self
+                .resolve_codex_v2_route(provider, body)?
+                .map(super::providers::ResolvedCodexRoute::into_effective_provider)
+                .ok_or_else(|| {
+                    ProxyError::ConfigError(format!(
+                        "Codex MultiRouter v2 did not resolve model `{}`",
+                        body.get("model")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                    ))
+                });
         }
         let Some(target_provider_id) = super::providers::codex_route_target_provider_id(provider)
         else {
@@ -289,6 +347,91 @@ impl RequestForwarder {
                 &target_provider,
             ),
         )
+    }
+
+    fn resolve_codex_v2_route(
+        &self,
+        provider: &Provider,
+        body: &Value,
+    ) -> Result<Option<super::providers::ResolvedCodexRoute>, ProxyError> {
+        if !codex_provider_has_v2_routing(provider) {
+            return Ok(None);
+        }
+        let providers = self.load_codex_v2_target_providers(provider)?;
+        super::providers::resolve_codex_v2_routed_provider(provider, body, &providers).map_err(
+            |error| {
+                ProxyError::ConfigError(format!(
+                    "Codex MultiRouter v2 编译失败 [{}]: {}",
+                    error.code, error.message
+                ))
+            },
+        )
+    }
+
+    fn resolve_codex_v2_raw_route(
+        &self,
+        provider: &Provider,
+        body: &Value,
+        explicit_route_id: Option<&str>,
+    ) -> Result<Option<super::providers::ResolvedCodexRoute>, ProxyError> {
+        if !codex_provider_has_v2_routing(provider) {
+            return Ok(None);
+        }
+        let providers = self.load_codex_v2_target_providers(provider)?;
+        super::providers::resolve_codex_v2_raw_passthrough_provider(
+            provider,
+            body,
+            &providers,
+            explicit_route_id,
+        )
+        .map_err(|error| {
+            ProxyError::ConfigError(format!(
+                "Codex MultiRouter v2 raw 编译失败 [{}]: {}",
+                error.code, error.message
+            ))
+        })
+    }
+
+    fn load_codex_v2_target_providers(
+        &self,
+        provider: &Provider,
+    ) -> Result<HashMap<String, Provider>, ProxyError> {
+        let routes = provider
+            .settings_config
+            .pointer("/codexRouting/routes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ProxyError::ConfigError(
+                    "Codex MultiRouter v2 routing.routes is not an array".to_string(),
+                )
+            })?;
+        let mut providers = HashMap::new();
+        for target_provider_id in routes
+            .iter()
+            .filter_map(|route| route.get("targetProviderId"))
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            if providers.contains_key(target_provider_id) {
+                continue;
+            }
+            let target_provider = self
+                .router
+                .get_provider_by_id(target_provider_id, AppType::Codex.as_str())
+                .map_err(|error| {
+                    ProxyError::ConfigError(format!(
+                        "读取 Codex MultiRouter v2 目标供应商 '{target_provider_id}' 失败: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    ProxyError::ConfigError(format!(
+                        "Codex MultiRouter v2 引用了不存在的目标供应商 '{target_provider_id}'"
+                    ))
+                })?;
+            providers.insert(target_provider_id.to_string(), target_provider);
+        }
+        Ok(providers)
     }
 
     async fn expand_codex_account_pool(
@@ -392,34 +535,11 @@ impl RequestForwarder {
             }
             for pool_candidate in &entries {
                 let entry = &pool_candidate.entry;
-                let mut candidate = provider.clone();
-                candidate.settings_config["codexPoolCredentialGeneration"] =
-                    Value::from(pool_candidate.credential_generation);
-                if entry.account_id == NATIVE_CODEX_ACCOUNT_ID {
-                    candidate.settings_config["codexNativeAuthPassthrough"] = Value::Bool(true);
-                    candidate.settings_config["codexPoolAccountId"] =
-                        Value::String(NATIVE_CODEX_ACCOUNT_ID.to_string());
-                    if let Some(meta) = candidate.meta.as_mut() {
-                        meta.provider_type = None;
-                        meta.auth_binding = None;
-                        meta.api_format = Some("openai_responses".to_string());
-                    }
-                } else {
-                    candidate.settings_config["codexNativeAuthPassthrough"] = Value::Bool(false);
-                    candidate.settings_config["codexPoolAccountId"] =
-                        Value::String(entry.account_id.clone());
-                    let meta = candidate.meta.get_or_insert_with(Default::default);
-                    meta.provider_type = Some("codex_oauth".to_string());
-                    meta.api_format = Some("openai_responses".to_string());
-                    meta.auth_binding = Some(crate::provider::AuthBinding {
-                        source: crate::provider::AuthBindingSource::ManagedAccount,
-                        auth_provider: Some("codex_oauth".to_string()),
-                        account_id: Some(entry.account_id.clone()),
-                    });
-                }
-                candidate.id = format!("{}::account::{}", candidate.id, entry.account_id);
-                candidate.name = format!("{} [{}]", candidate.name, entry.account_id);
-                expanded.push(candidate);
+                expanded.push(materialize_codex_account_pool_candidate(
+                    &provider,
+                    entry,
+                    pool_candidate.credential_generation,
+                ));
             }
         }
         expanded
@@ -897,7 +1017,7 @@ impl RequestForwarder {
                 Err(error) => {
                     self.record_codex_pool_attempt(provider, classify_codex_pool_attempt(&error))
                         .await;
-                    let category = self.categorize_proxy_error(&error, &provider);
+                    let category = self.categorize_proxy_error(&error, provider);
                     if matches!(category, ErrorCategory::NonRetryable) {
                         self.router
                             .release_permit_neutral(
@@ -1024,7 +1144,9 @@ impl RequestForwarder {
             );
         let attempt_providers = route_attempt_providers
             .iter()
-            .map(|provider| self.materialize_codex_forward_attempt_provider(app_type, provider))
+            .map(|provider| {
+                self.materialize_codex_forward_attempt_provider(app_type, provider, &body)
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| ForwardError {
                 error,
@@ -2039,6 +2161,19 @@ impl RequestForwarder {
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
 
+        if should_project_codex_agent_messages_for_provider(app_type, provider, endpoint) {
+            let projected =
+                super::providers::codex_multi_agent::project_codex_agent_messages_for_third_party(
+                    &mut mapped_body,
+                )?;
+            if projected > 0 {
+                log::debug!(
+                    "[CodexRouter] Projected {projected} plaintext agent message(s) for third-party provider={} route",
+                    provider.id
+                );
+            }
+        }
+
         // Grok Build exposes a stable client-side model profile in config.toml.
         // Route requests to the provider's real upstream model before applying
         // the optional Responses -> Chat/Anthropic bridge.
@@ -2296,6 +2431,14 @@ impl RequestForwarder {
         // 转换请求体（如果需要）
         let request_prepare_started_at = std::time::Instant::now();
         let mut codex_chat_tool_context: Option<CodexToolContext> = None;
+        let client_requested_streaming =
+            is_streaming_request(&effective_endpoint, &mapped_body, headers);
+        let hosted_tool_loop_allowed = !codex_responses_to_chat
+            || should_enable_hosted_tool_loop(
+                &mapped_body,
+                client_requested_streaming,
+                &codex_router_provider.settings_config,
+            );
         let mut request_body = if codex_responses_to_chat || codex_responses_to_messages {
             let mut mapped_body = mapped_body;
             let explicit_prompt_cache_key = mapped_body
@@ -2325,11 +2468,16 @@ impl RequestForwarder {
             }
             if let Some(context) = codex_chat_tool_context.as_mut() {
                 context.apply_hosted_tool_switches(
-                    hosted_tool_bridge_enabled(&codex_router_provider.settings_config, "webSearch"),
-                    hosted_tool_bridge_enabled(
-                        &codex_router_provider.settings_config,
-                        "imageGeneration",
-                    ),
+                    hosted_tool_loop_allowed
+                        && hosted_tool_bridge_enabled(
+                            &codex_router_provider.settings_config,
+                            "webSearch",
+                        ),
+                    hosted_tool_loop_allowed
+                        && hosted_tool_bridge_enabled(
+                            &codex_router_provider.settings_config,
+                            "imageGeneration",
+                        ),
                 );
             }
             let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning_text_only_and_cache(
@@ -2338,6 +2486,17 @@ impl RequestForwarder {
                 text_only_override,
                 Some(&cache_config),
             )?;
+            // 转换函数内部会重建一份 CodexToolContext，因此上面的
+            // apply_hosted_tool_switches 不会作用到真正发给上游的 Chat body。
+            // 这里按同一份 context 的开关同步移除被禁用的 hosted tool 定义，
+            // 保证模型可见工具与 hosted tool loop 接管范围一致（避免
+            // streaming auto 下模型调用 web_search 得到 unsupported call）。
+            if let Some(context) = codex_chat_tool_context.as_ref() {
+                super::providers::transform_codex_chat::apply_hosted_tool_switches_to_chat_body(
+                    &mut chat_body,
+                    context,
+                );
+            }
             super::providers::inject_codex_chat_prompt_cache_key(
                 provider,
                 &mut chat_body,
@@ -2421,6 +2580,10 @@ impl RequestForwarder {
         } else {
             let mut mapped_body = mapped_body;
             if matches!(app_type, AppType::Codex) {
+                super::providers::apply_codex_native_responses_reasoning_effort(
+                    provider,
+                    &mut mapped_body,
+                )?;
                 super::providers::apply_codex_request_upstream_model(provider, &mut mapped_body);
             }
             mapped_body
@@ -2500,25 +2663,37 @@ impl RequestForwarder {
             codex_responses_to_chat,
             codex_responses_to_messages,
         ) {
-            super::providers::openai_compat::normalize_codex_responses_passthrough_request_for_transport(
-                request_body,
-                codex_responses_lite_requested,
+            let normalized =
+                super::providers::openai_compat::normalize_codex_responses_passthrough_request_for_transport(
+                    request_body,
+                    codex_responses_lite_requested,
+                );
+            // 第三方原生 Responses 上游（DeepSeek 等）要求 reasoning 历史以
+            // reasoning_text content 回传；official 的 summary/encrypted_content
+            // 回放字段必须在这里转成可读 content 或丢弃，否则上游 400。
+            super::providers::openai_compat::normalize_third_party_responses_reasoning_items(
+                normalized,
             )
         } else {
             request_body
         };
-        if should_make_codex_v2_collaboration_plaintext(
+        request_body = normalize_lm_studio_responses_request(
             app_type,
-            codex_router_provider,
-            normalize_codex_oauth_responses,
-        ) {
-            let changed =
-                super::providers::openai_compat::make_codex_v2_collaboration_messages_plaintext(
-                    &mut request_body,
-                );
+            provider,
+            endpoint,
+            !needs_transform
+                && !codex_responses_to_chat
+                && !codex_responses_to_messages
+                && !codex_responses_to_anthropic,
+            request_body,
+        );
+        if should_make_codex_v2_agents_plaintext(app_type, codex_router_provider) {
+            let changed = super::providers::openai_compat::make_codex_v2_agents_messages_plaintext(
+                &mut request_body,
+            );
             if changed > 0 {
                 log::debug!(
-                    "[CodexRouter] Kept {changed} V2 collaboration message parameter(s) plaintext for cross-provider delivery"
+                    "[CodexRouter] Kept {changed} V2 agents message parameter(s) plaintext for cross-provider delivery"
                 );
             }
         }
@@ -2557,8 +2732,9 @@ impl RequestForwarder {
                     image_generation: context.hosted_image_generation_config().cloned(),
                 });
         let hosted_tool_loop_config = hosted_tool_loop_config.filter(|config| !config.is_empty());
-        let hosted_tools_forced_non_stream =
-            codex_responses_to_chat && hosted_tool_loop_config.is_some();
+        let hosted_tools_forced_non_stream = codex_responses_to_chat
+            && hosted_tool_loop_config.is_some()
+            && !client_requested_streaming;
         if hosted_tools_forced_non_stream {
             if let Some(obj) = filtered_body.as_object_mut() {
                 obj.insert("stream".to_string(), serde_json::json!(false));
@@ -2598,6 +2774,8 @@ impl RequestForwarder {
 
         let codex_chat_request_shape =
             codex_responses_to_chat.then(|| summarize_codex_chat_request_shape(&filtered_body));
+        let hosted_chat_tool_projection =
+            codex_responses_to_chat.then(|| summarize_hosted_chat_tool_projection(&filtered_body));
         if let Some(trace_id) = codex_trace_id.as_deref() {
             let mut fields = vec![
                 ("trace", trace_id.to_string()),
@@ -2654,6 +2832,9 @@ impl RequestForwarder {
             }
             if let Some(shape) = codex_chat_request_shape.as_ref() {
                 fields.push(("request_shape", shape.clone()));
+            }
+            if let Some(projection) = hosted_chat_tool_projection.as_ref() {
+                fields.push(("hosted_tool_projection", projection.clone()));
             }
             super::codex_router_log::append_event("request_prepared", &fields);
         }
@@ -3229,8 +3410,6 @@ impl RequestForwarder {
                 ProxyError::Internal(format!("Failed to serialize request body: {e}"))
             })?
         };
-        let mut request_bytes_len = body_bytes.len();
-
         // 确保 content-type 存在
         if !ordered_headers.contains_key(http::header::CONTENT_TYPE) {
             ordered_headers.insert(
@@ -3276,8 +3455,24 @@ impl RequestForwarder {
                     "Failed to serialize cached Responses-Lite fallback body: {error}"
                 ))
             })?;
-            request_bytes_len = body_bytes.len();
         }
+
+        let zstd_compress_codex_official_upstream = should_zstd_compress_codex_official_upstream(
+            app_type,
+            method,
+            &url,
+            is_codex_oauth || codex_official_auth_passthrough,
+            needs_transform
+                || codex_responses_to_chat
+                || codex_responses_to_messages
+                || codex_responses_to_anthropic,
+        );
+        body_bytes = encode_codex_official_upstream_body(
+            &mut ordered_headers,
+            body_bytes,
+            zstd_compress_codex_official_upstream,
+        )?;
+        let request_bytes_len = body_bytes.len();
 
         // 日志目标 URL 的脱敏分两种情形：
         // - 有已知密钥(log_secrets 非空)：记录脱敏后的完整 URL，剥 userinfo/query
@@ -3354,11 +3549,12 @@ impl RequestForwarder {
         // 在 headers/body 被移动之前捕获一份重放工厂，交给下游转换层做
         // 有界重连（见 providers::streaming_retry）。工厂只是重放同一
         // HTTP 请求；是否重试、重试多少次由转换层根据下游状态决定。
-        let stream_reconnect = if request_is_streaming
-            && matches!(
-                resolved_claude_api_format.as_deref(),
-                Some("openai_responses")
-            ) {
+        let stream_reconnect = if should_create_responses_stream_reconnector(
+            app_type,
+            endpoint,
+            request_is_streaming,
+            resolved_claude_api_format.as_deref(),
+        ) {
             let first_byte_timeout = if self.streaming_first_byte_timeout.is_zero() {
                 timeout
             } else {
@@ -3482,10 +3678,16 @@ impl RequestForwarder {
             }
         };
 
-        let mut response = send_upstream_request_with_transport_retry(adapter.name(), || {
-            send_upstream_request(ordered_headers.clone(), body_bytes.clone())
-        })
-        .await
+        let send_once = || {
+            send_upstream_request_with_transport_retry(adapter.name(), || {
+                send_upstream_request(ordered_headers.clone(), body_bytes.clone())
+            })
+        };
+        let mut response = if matches!(app_type, AppType::Codex) {
+            send_codex_request_with_rate_limit_retry(adapter.name(), send_once).await
+        } else {
+            send_once().await
+        }
         .inspect_err(|err| {
             if let Some(trace_id) = codex_trace_id.as_deref() {
                 let transport = if is_socks_proxy || !preserve_exact_header_case {
@@ -3587,6 +3789,11 @@ impl RequestForwarder {
                         "Failed to serialize Responses-Lite fallback body: {error}"
                     ))
                 })?;
+                let retry_body_bytes = encode_codex_official_upstream_body(
+                    &mut retry_headers,
+                    retry_body_bytes,
+                    zstd_compress_codex_official_upstream,
+                )?;
                 response = send_upstream_request(retry_headers, retry_body_bytes)
                     .await
                     .inspect_err(|err| {
@@ -3662,45 +3869,203 @@ impl RequestForwarder {
             let response = if let Some(config) = hosted_tool_loop_config.as_ref() {
                 let hosted_tool_client =
                     resolve_hosted_tool_client(self.app_handle.as_ref(), provider, headers).await;
-                run_hosted_tool_chat_loop(
-                    response,
-                    &mut filtered_body,
-                    config,
-                    &hosted_tool_client,
-                    |body| {
+                if request_is_streaming && codex_responses_to_chat {
+                    let context = codex_chat_tool_context.clone().ok_or_else(|| {
+                        ProxyError::Internal("missing Codex tool context".to_string())
+                    })?;
+                    let request_state = Arc::new(tokio::sync::Mutex::new(filtered_body.clone()));
+                    let original_stream_options = filtered_body.get("stream_options").cloned();
+                    let callback_trace_id = codex_trace_id.clone();
+                    let callback_model = request_model_for_log.clone();
+                    let callback_provider_id = provider.id.clone();
+                    let callback_method = method.to_owned();
+                    let callback_extensions = (*extensions).clone();
+                    let callback_non_streaming_timeout = self.non_streaming_timeout;
+                    let callback_streaming_first_byte_timeout = self.streaming_first_byte_timeout;
+                    let callback_session_id = self.session_id.clone();
+                    let callback_provider_config = (*config).clone();
+                    let mut hosted_rounds = 0usize;
+                    let callback = move |calls: Vec<CompletedChatToolCall>, assistant| {
+                        let request_state = request_state.clone();
+                        let original_stream_options = original_stream_options.clone();
+                        let config = callback_provider_config.clone();
+                        let hosted_tool_client = hosted_tool_client.clone();
+                        let trace_id = callback_trace_id.clone();
                         let headers = ordered_headers.clone();
-                        let body_bytes = serde_json::to_vec(body).map_err(|e| {
-                            ProxyError::Internal(format!(
-                                "Failed to serialize hosted tool loop request body: {e}"
-                            ))
-                        });
-                        let trace_id = codex_trace_id.clone();
-                        let session_id = self.session_id.clone();
-                        let model = request_model_for_log.clone();
-                        let provider_id = provider.id.clone();
+                        let method = callback_method.clone();
+                        let url = url.clone();
+                        let extensions = callback_extensions.clone();
+                        let target_for_log = target_for_log.clone();
+                        let upstream_proxy_url = upstream_proxy_url.clone();
+                        let timeout = timeout;
+                        let non_streaming_timeout = callback_non_streaming_timeout;
+                        let streaming_first_byte_timeout = callback_streaming_first_byte_timeout;
+                        let is_socks_proxy = is_socks_proxy;
+                        let preserve_exact_header_case = preserve_exact_header_case;
+                        let session_id = callback_session_id.clone();
+                        let model = callback_model.clone();
+                        let provider_id = callback_provider_id.clone();
+                        hosted_rounds += 1;
+                        let round = hosted_rounds;
                         async move {
-                            let body_bytes = body_bytes?;
-                            let body_len = body_bytes.len();
+                            if round > MAX_HOSTED_TOOL_ITERATIONS {
+                                return Err(
+                                    "hosted tool loop reached maximum streaming rounds".to_string()
+                                );
+                            }
+                            let hosted_calls = calls
+                                .iter()
+                                .filter_map(|call| {
+                                    let kind = match call.name.as_str() {
+                                        "web_search" => HostedToolCallKind::WebSearch,
+                                        "generate_image" => HostedToolCallKind::ImageGeneration,
+                                        _ => return None,
+                                    };
+                                    Some(HostedToolCall {
+                                        kind,
+                                        id: call.call_id.clone(),
+                                        arguments: call.arguments.clone(),
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            let tool_messages = execute_hosted_tool_calls(
+                                &hosted_calls,
+                                &config,
+                                &hosted_tool_client,
+                                trace_id.as_deref(),
+                            )
+                            .await;
+                            let body_bytes = {
+                                let mut body = request_state.lock().await;
+                                let chat_response = json!({
+                                    "choices": [{ "message": assistant }]
+                                });
+                                if !append_tool_outputs_to_chat_request(
+                                    &mut body,
+                                    &chat_response,
+                                    tool_messages,
+                                ) {
+                                    return Err(
+                                        "hosted tool loop could not append assistant/tool messages"
+                                            .to_string(),
+                                    );
+                                }
+                                body["stream"] = serde_json::json!(true);
+                                if let Some(options) = original_stream_options {
+                                    body["stream_options"] = options;
+                                }
+                                serde_json::to_vec(&*body).map_err(|error| error.to_string())?
+                            };
                             if let Some(trace_id) = trace_id.as_deref() {
                                 super::codex_router_log::append_event(
-                                    "hosted_tool_loop_upstream_send",
+                                    "hosted_tool_stream_continuation",
                                     &[
                                         ("trace", trace_id.to_string()),
-                                        ("session", session_id.clone()),
-                                        ("model", model.clone()),
-                                        ("provider", provider_id.clone()),
-                                        ("request_bytes", body_len.to_string()),
+                                        ("session", session_id),
+                                        ("model", model),
+                                        ("provider", provider_id),
+                                        ("round", round.to_string()),
                                     ],
                                 );
                             }
-                            let send = send_upstream_request(headers, body_bytes);
-                            send.await
+                            let response = send_forwarder_upstream_request(
+                                method,
+                                url,
+                                target_for_log,
+                                headers,
+                                extensions,
+                                body_bytes,
+                                timeout,
+                                true,
+                                non_streaming_timeout,
+                                streaming_first_byte_timeout,
+                                is_socks_proxy,
+                                preserve_exact_header_case,
+                                upstream_proxy_url.as_deref(),
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                            Ok(Some(Box::pin(
+                                response
+                                    .bytes_stream()
+                                    .map(|item| item.map_err(|error| std::io::Error::other(error))),
+                            ) as ChatSseStream))
                         }
-                    },
-                    codex_trace_id.as_deref(),
-                    hosted_tools_forced_non_stream,
-                )
-                .await?
+                    };
+                    let mut response_headers = response.headers().clone();
+                    response_headers.insert(
+                        http::header::CONTENT_TYPE,
+                        http::HeaderValue::from_static("text/event-stream"),
+                    );
+                    response_headers.insert(
+                        http::HeaderName::from_static(HOSTED_TOOL_STREAM_RESPONSE_HEADER),
+                        http::HeaderValue::from_static("true"),
+                    );
+                    response_headers.remove(http::header::CONTENT_LENGTH);
+                    response_headers.remove(http::header::CONTENT_ENCODING);
+                    let initial_stream: ChatSseStream = Box::pin(response.bytes_stream());
+                    let hosted_tool_diagnostic_context =
+                        super::providers::streaming_codex_chat::HostedToolDiagnosticContext {
+                            trace_id: codex_trace_id.clone(),
+                            session_id: self.session_id.clone(),
+                            model: request_model_for_log.clone(),
+                            provider: provider.id.clone(),
+                            tool: hosted_tool_choice_name(&filtered_body),
+                        };
+                    let stream = create_responses_sse_stream_from_chat_with_hosted_loop(
+                        initial_stream,
+                        context,
+                        Some(hosted_tool_diagnostic_context),
+                        callback,
+                    );
+                    ProxyResponse::streamed(StatusCode::OK, response_headers, stream)
+                } else {
+                    let hosted_tool_choice = hosted_tool_choice_name(&filtered_body);
+                    run_hosted_tool_chat_loop(
+                        response,
+                        &mut filtered_body,
+                        config,
+                        &hosted_tool_client,
+                        |body| {
+                            let headers = ordered_headers.clone();
+                            let body_bytes = serde_json::to_vec(body).map_err(|e| {
+                                ProxyError::Internal(format!(
+                                    "Failed to serialize hosted tool loop request body: {e}"
+                                ))
+                            });
+                            let trace_id = codex_trace_id.clone();
+                            let session_id = self.session_id.clone();
+                            let model = request_model_for_log.clone();
+                            let provider_id = provider.id.clone();
+                            async move {
+                                let body_bytes = body_bytes?;
+                                let body_len = body_bytes.len();
+                                if let Some(trace_id) = trace_id.as_deref() {
+                                    super::codex_router_log::append_event(
+                                        "hosted_tool_loop_upstream_send",
+                                        &[
+                                            ("trace", trace_id.to_string()),
+                                            ("session", session_id.clone()),
+                                            ("model", model.clone()),
+                                            ("provider", provider_id.clone()),
+                                            ("request_bytes", body_len.to_string()),
+                                        ],
+                                    );
+                                }
+                                let send = send_upstream_request(headers, body_bytes);
+                                send.await
+                            }
+                        },
+                        codex_trace_id.as_deref(),
+                        hosted_tools_forced_non_stream,
+                        hosted_tool_choice,
+                        &self.session_id,
+                        &request_model_for_log,
+                        &provider.id,
+                        false,
+                    )
+                    .await?
+                }
             } else {
                 response
             };
@@ -3791,13 +4156,24 @@ impl RequestForwarder {
             .is_some();
         let codex_router_configured =
             matches!(app_type, AppType::Codex) && codex_provider_has_routing_config(provider);
-        let routed_provider =
-            if matches!(app_type, AppType::Codex) && !provider_is_resolved_codex_route {
-                resolve_codex_raw_passthrough_route_provider(provider, route_body)
-            } else {
-                None
-            };
-        let routed_provider = if let Some(route_provider) = routed_provider {
+        let v2_routed_provider = if matches!(app_type, AppType::Codex)
+            && !provider_is_resolved_codex_route
+            && codex_provider_has_v2_routing(provider)
+        {
+            self.resolve_codex_v2_raw_route(provider, route_body, None)?
+                .map(super::providers::ResolvedCodexRoute::into_effective_provider)
+        } else {
+            None
+        };
+        let legacy_routed_provider = if matches!(app_type, AppType::Codex)
+            && !provider_is_resolved_codex_route
+            && !codex_provider_has_v2_routing(provider)
+        {
+            resolve_codex_raw_passthrough_route_provider(provider, route_body)
+        } else {
+            None
+        };
+        let legacy_routed_provider = if let Some(route_provider) = legacy_routed_provider {
             if let Some(target_provider_id) =
                 super::providers::codex_route_target_provider_id(&route_provider)
             {
@@ -3826,6 +4202,7 @@ impl RequestForwarder {
         } else {
             None
         };
+        let routed_provider = v2_routed_provider.or(legacy_routed_provider);
         let codex_route_missed = codex_router_configured
             && !provider_is_resolved_codex_route
             && routed_provider.is_none();
@@ -4544,7 +4921,7 @@ impl RequestForwarder {
         let headers = response.headers().clone();
         let body_timeout = self.non_streaming_timeout;
         let body = super::response_grace::await_with_response_grace(
-            response.bytes(),
+            response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES),
             body_timeout,
             super::response_grace::RESPONSE_PENDING_GRACE,
             || {
@@ -4569,12 +4946,14 @@ impl RequestForwarder {
         let status = response.status();
         let headers = response.headers().clone();
         let encoding = get_content_encoding(&headers);
-        let raw = response.bytes().await?;
+        let raw = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?;
         let decoded = match encoding {
-            Some(encoding) => match decompress_body(&encoding, &raw) {
-                Ok(Some(decompressed)) => decompressed,
-                _ => raw.to_vec(),
-            },
+            Some(encoding) => {
+                match decompress_body_with_limit(&encoding, &raw, MAX_RESPONSE_BODY_BYTES) {
+                    Ok(Some(decompressed)) => decompressed,
+                    _ => raw.to_vec(),
+                }
+            }
             None => raw.to_vec(),
         };
 
@@ -4594,12 +4973,14 @@ impl RequestForwarder {
         let status = response.status();
         let headers = response.headers().clone();
         let encoding = get_content_encoding(&headers);
-        let raw = response.bytes().await?;
+        let raw = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?;
         let decoded = match encoding {
-            Some(encoding) => match decompress_body(&encoding, &raw) {
-                Ok(Some(decompressed)) => decompressed,
-                _ => raw.to_vec(),
-            },
+            Some(encoding) => {
+                match decompress_body_with_limit(&encoding, &raw, MAX_RESPONSE_BODY_BYTES) {
+                    Ok(Some(decompressed)) => decompressed,
+                    _ => raw.to_vec(),
+                }
+            }
             None => raw.to_vec(),
         };
 
@@ -5787,6 +6168,72 @@ fn hosted_tool_bridge_enabled(settings: &Value, tool: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Decide whether the buffered Chat hosted-tool loop owns this request.
+///
+/// 非流式请求始终接管。流式请求默认也接管（`hostedTools.streamingAuto.enabled`
+/// 默认 true），让第三方模型在流式 auto 下也能用官方 web_search / image_generation；
+/// 代价是该请求会被缓冲（强制 stream=false），可能重新触发 Qwen 长上下文
+/// blank-thinking 回归——若复发，把 `hostedTools.streamingAuto.enabled` 设为 false
+/// 即可回退到「流式 auto 不接管、托管工具从投影中省略」的旧行为。
+/// 显式 tool_choice 指向 hosted tool 时无论开关都接管（调用方明确要这个桥）。
+fn should_enable_hosted_tool_loop(
+    request: &Value,
+    client_requested_streaming: bool,
+    settings: &Value,
+) -> bool {
+    if !client_requested_streaming {
+        return true;
+    }
+
+    // 显式 tool_choice 指向 hosted tool：调用方明确要这个桥，始终接管。
+    let Some(choice) = request.get("tool_choice").and_then(Value::as_object) else {
+        // 非显式（auto / 字符串 tool_choice）：由 streamingAuto 开关决定。
+        return hosted_tool_streaming_auto_enabled(settings);
+    };
+    let choice_type = choice.get("type").and_then(Value::as_str);
+    if matches!(choice_type, Some("web_search" | "image_generation")) {
+        return true;
+    }
+    choice_type == Some("function")
+        && matches!(
+            choice.get("name").and_then(Value::as_str),
+            Some("web_search" | "generate_image")
+        )
+}
+
+/// 返回显式要求执行的 CCSM hosted tool 名称。
+///
+/// 只识别 `web_search`/`image_generation` 这两个 CCSM 自有工具；普通
+/// `auto`、`required` 或用户自定义 function 不应触发“未调用”诊断。
+fn hosted_tool_choice_name(body: &Value) -> Option<&'static str> {
+    let choice = body.get("tool_choice")?.as_object()?;
+    let choice_type = choice.get("type").and_then(Value::as_str)?;
+    match choice_type {
+        "web_search" => Some("web_search"),
+        "image_generation" => Some("generate_image"),
+        "function" => match choice.get("name").and_then(Value::as_str).or_else(|| {
+            choice
+                .get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+        }) {
+            Some("web_search") => Some("web_search"),
+            Some("generate_image" | "image_generation" | "image_gen") => Some("generate_image"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 读取流式 auto 下是否接管 hosted tool loop；未配置时默认开启。
+fn hosted_tool_streaming_auto_enabled(settings: &Value) -> bool {
+    settings
+        .pointer("/hostedTools/streamingAuto/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
 /// 解析 hosted tool 调用凭据：优先显式 API Key，再回退请求自带的 Codex OAuth，最后用 CCSM 托管 OAuth。
 async fn resolve_hosted_tool_client(
     app_handle: Option<&tauri::AppHandle>,
@@ -5800,7 +6247,7 @@ async fn resolve_hosted_tool_client(
         return Ok(client);
     }
 
-    if let Some((token, account_id)) = source_codex_oauth_credentials(source_headers) {
+    if let Some((token, account_id)) = source_codex_oauth_credentials(provider, source_headers) {
         return Ok(OpenAiHostedToolClient::from_codex_oauth(token, account_id));
     }
 
@@ -5839,13 +6286,23 @@ async fn resolve_hosted_tool_client(
     )
 }
 
-/// 从当前 Codex 请求头提取 native OAuth 凭据，避免为 hosted tools 单独配置 API Key。
-fn source_codex_oauth_credentials(headers: &http::HeaderMap) -> Option<(String, Option<String>)> {
+/// 仅从本机官方 Codex 路由的请求头提取 native OAuth 凭据。
+///
+/// 第三方 Provider 的 `Authorization` 可能是 API key，也可能只是
+/// `PROXY_MANAGED` 这个本地代理占位符，不能把它当成 ChatGPT OAuth
+/// 转发给 hosted tools。第三方路由应继续回退到 CCSM 托管 OAuth。
+fn source_codex_oauth_credentials(
+    provider: &Provider,
+    headers: &http::HeaderMap,
+) -> Option<(String, Option<String>)> {
+    if !super::providers::provider_uses_native_codex_auth(provider) {
+        return None;
+    }
     let authorization = headers
         .get(http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())?;
     let token = authorization.strip_prefix("Bearer ")?.trim();
-    if token.is_empty() {
+    if token.is_empty() || token.eq_ignore_ascii_case(PROXY_AUTH_PLACEHOLDER) {
         return None;
     }
     let account_id = headers
@@ -5865,8 +6322,10 @@ fn source_codex_oauth_credentials(headers: &http::HeaderMap) -> Option<(String, 
 /// - `send_chat_request`: 复用 forwarder 已完成认证/代理/超时配置的发送闭包。
 /// - `trace_id`: 可选 Codex 路由 trace id，只写脱敏诊断日志。
 /// - `force_response_header`: 原始请求可能是流式，强制非流式上游时需要标记给 handler。
+///
 /// 返回:
 /// - 最终 Chat response，仍交给现有 Chat→Responses 转换器处理。
+///
 /// 副作用:
 /// - 可能调用 OpenAI hosted tools，并可能向同一第三方 Chat 上游追加多轮请求。
 async fn run_hosted_tool_chat_loop<F, Fut>(
@@ -5877,6 +6336,11 @@ async fn run_hosted_tool_chat_loop<F, Fut>(
     mut send_chat_request: F,
     trace_id: Option<&str>,
     force_response_header: bool,
+    hosted_tool_choice: Option<&'static str>,
+    session_id: &str,
+    model: &str,
+    provider_id: &str,
+    streaming: bool,
 ) -> Result<ProxyResponse, ProxyError>
 where
     F: FnMut(&Value) -> Fut,
@@ -5903,6 +6367,16 @@ where
 
         let calls = match scan_hosted_tool_calls(&chat_response) {
             HostedToolCallScan::NoToolCalls => {
+                if let Some(tool) = hosted_tool_choice {
+                    super::providers::hosted_tools::bridge::log_hosted_tool_not_called(
+                        trace_id,
+                        session_id,
+                        model,
+                        provider_id,
+                        tool,
+                        streaming,
+                    );
+                }
                 return Ok(ProxyResponse::buffered(status, headers, body_bytes));
             }
             HostedToolCallScan::ContainsUnsupportedToolCalls => {
@@ -5938,8 +6412,10 @@ where
 ///
 /// 参数:
 /// - `response`: 待消费的上游响应。
+///
 /// 返回:
 /// - HTTP 状态、已清理实体头的 headers，以及明文字节。
+///
 /// 副作用:
 /// - 消费 response body；如果执行了解压，会移除 content-encoding/content-length。
 async fn read_decoded_proxy_response(
@@ -5948,15 +6424,17 @@ async fn read_decoded_proxy_response(
     let status = response.status();
     let mut headers = response.headers().clone();
     let encoding = get_content_encoding(&headers);
-    let raw = response.bytes().await?;
+    let raw = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?;
     let decoded = match encoding {
-        Some(encoding) => match decompress_body(&encoding, &raw) {
-            Ok(Some(decompressed)) => {
-                strip_proxy_response_entity_headers(&mut headers);
-                Bytes::from(decompressed)
+        Some(encoding) => {
+            match decompress_body_with_limit(&encoding, &raw, MAX_RESPONSE_BODY_BYTES) {
+                Ok(Some(decompressed)) => {
+                    strip_proxy_response_entity_headers(&mut headers);
+                    Bytes::from(decompressed)
+                }
+                _ => raw,
             }
-            _ => raw,
-        },
+        }
         None => raw,
     };
 
@@ -6002,6 +6480,20 @@ fn should_retry_without_codex_responses_lite_header(
                 )
             })
             .unwrap_or(false)
+}
+
+/// 原生 Codex `/responses` 直通与 Claude 的 Responses 转换都能在未产生语义输出
+/// 前安全重连。其它端点即使是 streaming，也不能假定遵守 Responses SSE 语义。
+fn should_create_responses_stream_reconnector(
+    app_type: &AppType,
+    endpoint: &str,
+    request_is_streaming: bool,
+    resolved_claude_api_format: Option<&str>,
+) -> bool {
+    request_is_streaming
+        && (resolved_claude_api_format == Some("openai_responses")
+            || (matches!(app_type, AppType::Codex)
+                && super::providers::is_codex_responses_endpoint(endpoint)))
 }
 
 /// 生成 Codex Responses-Lite fallback 的能力缓存 key。
@@ -6174,23 +6666,141 @@ where
     }
 }
 
+/// 对真实上游 HTTP 429 做有界、可等待的同请求重放。
+///
+/// 这里与 `ResponsePending` 严格分离：只有已经拿到上游明确 HTTP 429 的请求才会
+/// 进入本循环；请求是否到达上游仍不确定的 send/header/body timeout 继续禁止重放。
+/// HTTP 429 表示服务端拒绝处理当前请求，因此复用完全相同的 headers/body 不会重复
+/// 已开始的模型采样或工具调用。明确的订阅/余额耗尽则立即交回外层账号池或路由降级，
+/// 避免在同一账号上等待和空转。
+async fn send_codex_request_with_rate_limit_retry<F, Fut>(
+    app_tag: &str,
+    mut send: F,
+) -> Result<ProxyResponse, ProxyError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ProxyResponse, ProxyError>>,
+{
+    let mut retry_count = 0usize;
+    let mut total_delay = Duration::ZERO;
+
+    loop {
+        let response = send().await?;
+        if response.status() != http::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(response);
+        }
+
+        let mut response_headers = response.headers().clone();
+        let retry_after = parse_retry_after_delay(&response_headers);
+        let body_text = read_decoded_error_body(response).await?;
+        let terminal_quota = is_terminal_codex_quota_429(body_text.as_deref());
+
+        if terminal_quota || retry_count >= CODEX_RATE_LIMIT_RETRY_LIMIT {
+            return Ok(rebuild_consumed_error_response(
+                http::StatusCode::TOO_MANY_REQUESTS,
+                &mut response_headers,
+                body_text,
+            ));
+        }
+
+        let requested_delay = retry_after.unwrap_or_else(|| codex_rate_limit_backoff(retry_count));
+        let remaining_budget = CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET.saturating_sub(total_delay);
+        if remaining_budget.is_zero() {
+            return Ok(rebuild_consumed_error_response(
+                http::StatusCode::TOO_MANY_REQUESTS,
+                &mut response_headers,
+                body_text,
+            ));
+        }
+        let delay = requested_delay
+            .min(CODEX_RATE_LIMIT_MAX_SINGLE_DELAY)
+            .min(remaining_budget);
+        log::warn!(
+            "[{app_tag}] 上游明确返回 HTTP 429，CCSM 将重发同一 Codex 请求 {}/{}（等待 {}ms，Retry-After={}）",
+            retry_count + 1,
+            CODEX_RATE_LIMIT_RETRY_LIMIT,
+            delay.as_millis(),
+            retry_after
+                .map(|value| format!("{}ms", value.as_millis()))
+                .unwrap_or_else(|| "missing".to_string())
+        );
+        tokio::time::sleep(delay).await;
+        total_delay += delay;
+        retry_count += 1;
+    }
+}
+
+fn parse_retry_after_delay(headers: &http::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(http::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let delay = retry_at.signed_duration_since(chrono::Utc::now());
+    delay.to_std().ok()
+}
+
+fn codex_rate_limit_backoff(retry_count: usize) -> Duration {
+    Duration::from_secs(1u64 << retry_count.min(5))
+}
+
+fn is_terminal_codex_quota_429(body: Option<&str>) -> bool {
+    let Some(body) = body else {
+        return false;
+    };
+    let normalized = body.to_ascii_lowercase();
+    [
+        "usage_limit_reached",
+        "insufficient_quota",
+        "billing_hard_limit_reached",
+        "the usage limit has been reached",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn rebuild_consumed_error_response(
+    status: http::StatusCode,
+    headers: &mut http::HeaderMap,
+    body: Option<String>,
+) -> ProxyResponse {
+    headers.remove(http::header::CONTENT_ENCODING);
+    headers.remove(http::header::CONTENT_LENGTH);
+    ProxyResponse::buffered(
+        status,
+        headers.clone(),
+        Bytes::from(body.unwrap_or_default()),
+    )
+}
+
 fn upstream_transport_retry_backoff(attempt: usize) -> Duration {
     match attempt {
         0 => Duration::from_millis(200),
         1 => Duration::from_millis(600),
-        _ => Duration::from_millis(1500),
+        2 => Duration::from_millis(1500),
+        3 => Duration::from_millis(3000),
+        _ => Duration::from_millis(6000),
     }
 }
 
 /// 读取并解压上游错误响应体，保留可读错误摘要给日志、fallback 判断和客户端。
 async fn read_decoded_error_body(response: ProxyResponse) -> Result<Option<String>, ProxyError> {
     let encoding = get_content_encoding(response.headers());
-    let raw = response.bytes().await?;
+    let raw = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?;
     let decoded = match encoding {
-        Some(encoding) => match decompress_body(&encoding, &raw) {
-            Ok(Some(decompressed)) => decompressed,
-            _ => raw.to_vec(),
-        },
+        Some(encoding) => {
+            match decompress_body_with_limit(&encoding, &raw, MAX_RESPONSE_BODY_BYTES) {
+                Ok(Some(decompressed)) => decompressed,
+                _ => raw.to_vec(),
+            }
+        }
         None => raw.to_vec(),
     };
     Ok(String::from_utf8(decoded).ok())
@@ -6262,15 +6872,16 @@ fn should_preserve_exact_header_case(
 ///
 /// 参数:
 /// - `app_type`: 当前客户端应用类型，只有 Codex Desktop/CLI 请求需要该兼容层。
-/// - `provider`: 已经由 MultiRouter 解析后的 effective provider。
+/// - `provider`: 已经由 MultiRouter 或顶层切换解析后的 effective provider。
 /// - `url`: forwarder 最终要访问的上游 URL。
 /// - `needs_transform`: 是否已经走了 Claude/Anthropic 转换管线。
 /// - `codex_responses_to_chat`: 是否已经被改写到 Chat Completions 上游。
 /// - `codex_responses_to_messages`: 是否已经被改写到 Messages 上游。
 ///   返回:
-/// - `true` 表示需要在透传前补齐 ChatGPT Codex backend 的必填字段。
+/// - `true` 表示需要在透传前投影成 ChatGPT Codex backend 接受的回放形态。
 ///   副作用:
-/// - 无。该函数只读入参，用来把修复范围限制在 official managed Codex OAuth。
+/// - 无。该函数只读入参，用来把修复范围限制在 managed Codex OAuth 或内置
+///   native-auth OpenAI Official 到 ChatGPT Codex Responses 的真实 transport。
 fn should_normalize_codex_oauth_responses_passthrough_body(
     app_type: &AppType,
     provider: &Provider,
@@ -6280,7 +6891,7 @@ fn should_normalize_codex_oauth_responses_passthrough_body(
     codex_responses_to_messages: bool,
 ) -> bool {
     matches!(app_type, AppType::Codex)
-        && provider.is_codex_oauth()
+        && (provider.is_codex_oauth() || super::providers::is_codex_official_provider(provider))
         && !needs_transform
         && !codex_responses_to_chat
         && !codex_responses_to_messages
@@ -6315,6 +6926,54 @@ fn should_normalize_codex_responses_passthrough_control_messages(
         && !codex_responses_to_chat
         && !codex_responses_to_messages
         && super::providers::is_codex_responses_endpoint(endpoint)
+}
+
+fn normalize_lm_studio_responses_request(
+    app_type: &AppType,
+    provider: &Provider,
+    endpoint: &str,
+    native_responses: bool,
+    request_body: Value,
+) -> Value {
+    if !matches!(app_type, AppType::Codex)
+        || !native_responses
+        || !super::providers::is_codex_responses_endpoint(endpoint)
+        || !is_lm_studio_provider(provider)
+    {
+        return request_body;
+    }
+
+    let Value::Object(mut body) = request_body else {
+        return request_body;
+    };
+    let text = body
+        .entry("text".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Value::Object(text) = text {
+        text.entry("format".to_string())
+            .or_insert_with(|| serde_json::json!({"type": "text"}));
+    }
+
+    Value::Object(body)
+}
+
+fn is_lm_studio_provider(provider: &Provider) -> bool {
+    if provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.provider_type.as_deref())
+        .is_some_and(|provider_type| provider_type.eq_ignore_ascii_case("lmstudio"))
+    {
+        return true;
+    }
+
+    [&provider.id, &provider.name].into_iter().any(|identity| {
+        identity
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .collect::<String>()
+            .eq_ignore_ascii_case("lmstudio")
+    })
 }
 
 /// 判断 URL 是否指向 ChatGPT 的 Codex Responses backend。
@@ -6373,18 +7032,24 @@ fn should_force_identity_encoding(
 }
 
 fn map_reqwest_send_error(error: reqwest::Error) -> ProxyError {
+    // `reqwest::Error::to_string()` 常常只留下 "error sending request"；真正能区分
+    // TLS/HTTP2/连接复用/对端断开的原因在 source 链。先移除 URL，再展开 source 链，
+    // 既保留可操作的网络诊断，又不会把带 query 的上游地址写进 router 日志或客户端错误。
+    let error_without_url = error.without_url();
     map_reqwest_send_error_class(
-        error.is_connect(),
-        error.is_timeout(),
-        error.is_request(),
-        error.without_url().to_string(),
+        error_without_url.is_connect(),
+        error_without_url.is_timeout(),
+        error_without_url.is_builder(),
+        error_without_url.is_request(),
+        error_chain_message(&error_without_url),
     )
 }
 
 fn map_reqwest_send_error_class(
     is_connect: bool,
     is_timeout: bool,
-    is_request: bool,
+    is_builder: bool,
+    _is_request: bool,
     detail: String,
 ) -> ProxyError {
     if is_connect {
@@ -6393,7 +7058,7 @@ fn map_reqwest_send_error_class(
     } else if is_timeout {
         // 超时发生在请求发出后，无法确定上游是否已经开始处理，不能自动重发。
         ProxyError::ResponsePending(format!("上游响应等待超时（请求可能已在处理中）: {detail}"))
-    } else if is_request {
+    } else if is_builder {
         // 请求构造阶段失败，没有发出任何字节。
         ProxyError::ForwardFailed(format!("上游请求构造失败: {detail}"))
     } else {
@@ -6569,6 +7234,47 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 
+fn should_zstd_compress_codex_official_upstream(
+    app_type: &AppType,
+    method: &http::Method,
+    upstream_url: &str,
+    official_auth: bool,
+    transformed: bool,
+) -> bool {
+    matches!(app_type, AppType::Codex)
+        && method == http::Method::POST
+        && official_auth
+        && !transformed
+        && is_chatgpt_codex_responses_upstream_url(upstream_url)
+}
+
+/// Encode the final JSON entity exactly as the official Codex transport does.
+///
+/// The local handler must decode the incoming entity before it can normalize or
+/// route the JSON. Official Responses requests are compressed again only after
+/// those transformations are complete, so retries can clone one immutable wire
+/// body and `content-encoding` always describes the bytes actually sent.
+fn encode_codex_official_upstream_body(
+    headers: &mut http::HeaderMap,
+    body: Vec<u8>,
+    enabled: bool,
+) -> Result<Vec<u8>, ProxyError> {
+    if !enabled || body.is_empty() {
+        return Ok(body);
+    }
+
+    let encoded = zstd::stream::encode_all(std::io::Cursor::new(body), 0).map_err(|error| {
+        ProxyError::Internal(format!("Failed to compress request body: {error}"))
+    })?;
+    headers.insert(
+        http::header::CONTENT_ENCODING,
+        http::HeaderValue::from_static("zstd"),
+    );
+    headers.remove(http::header::CONTENT_LENGTH);
+    headers.remove(http::header::TRANSFER_ENCODING);
+    Ok(encoded)
+}
+
 /// 生成 Codex Responses->Chat 出站请求的脱敏形态摘要。
 ///
 /// 该摘要只记录顶层字段名、对象/数组形态和工具计数，不记录消息正文、工具参数、
@@ -6636,6 +7342,32 @@ fn summarize_codex_chat_request_shape(body: &Value) -> String {
     parts.join(";")
 }
 
+/// 生成 hosted 工具在最终 Chat 出站 body 中的脱敏投影摘要。
+///
+/// 只允许记录 CCSM 自己托管的固定工具名，不记录自定义函数名、描述、参数或消息正文。
+/// 该字段用于区分“工具没有投影给上游”和“上游看到了工具但没有发起调用”。
+fn summarize_hosted_chat_tool_projection(body: &Value) -> String {
+    let mut hosted_names = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.pointer("/function/name").and_then(Value::as_str)?;
+            matches!(name, "web_search" | "generate_image").then_some(name)
+        })
+        .collect::<Vec<_>>();
+    hosted_names.sort_unstable();
+    hosted_names.dedup();
+    format!(
+        "hosted_tools=[{}];hosted_tool_choice={}",
+        hosted_names.join(","),
+        body.get("tool_choice")
+            .map(value_for_shape_log)
+            .unwrap_or_else(|| "absent".to_string())
+    )
+}
+
 /// 把 JSON 值压缩成不含正文内容的形态描述。
 fn value_for_shape_log(value: &Value) -> String {
     match value {
@@ -6674,6 +7406,13 @@ fn build_forward_attempt_providers_preserving_codex_router_context(
                 .get("codexResolvedRouteId")
                 .is_none()
         {
+            if codex_provider_has_v2_routing(provider) {
+                // v2 must load the latest target Providers before compiling. Keep the parent
+                // router intact here; RequestForwarder::materialize_codex_forward_attempt_provider
+                // performs the state-aware resolution immediately after this expansion step.
+                expanded.push(provider.clone());
+                continue;
+            }
             let routes = super::providers::resolve_codex_model_routed_providers(provider, body);
             if routes.is_empty() {
                 expanded.push(provider.clone());
@@ -6817,14 +7556,37 @@ fn codex_provider_has_routing_config(provider: &Provider) -> bool {
         || provider.settings_config.get("modelRoutes").is_some()
 }
 
-fn should_make_codex_v2_collaboration_plaintext(
-    app_type: &AppType,
-    router_provider: &Provider,
-    official_oauth_request: bool,
-) -> bool {
+fn codex_provider_has_v2_routing(provider: &Provider) -> bool {
+    provider
+        .settings_config
+        .pointer("/codexRouting/schemaVersion")
+        .and_then(Value::as_u64)
+        == Some(2)
+}
+
+/// 判断本次 Codex 请求是否应把非保留 `agents.*` V2 协作工具的 `message.encrypted`
+/// 剥离为明文投递。
+///
+/// 只要 Router 含启用的第三方/来源歧义路由（`codex_multirouter_needs_plaintext_v2_collaboration`），
+/// 无论父出站是官方 OAuth 还是第三方中转，都必须剥离：第三方中转背后的官方 backend
+/// 仍会按 schema 加密 `message`，不剥离则 child 收到不可解密的 Fernet 密文。
+/// 纯官方 Router 与非 Router provider 返回 false，行为不变。
+fn should_make_codex_v2_agents_plaintext(app_type: &AppType, router_provider: &Provider) -> bool {
     matches!(app_type, AppType::Codex)
-        && official_oauth_request
         && super::providers::codex_multirouter_needs_plaintext_v2_collaboration(router_provider)
+}
+
+fn should_project_codex_agent_messages_for_provider(
+    app_type: &AppType,
+    provider: &Provider,
+    endpoint: &str,
+) -> bool {
+    // Managed Codex OAuth routes are OpenAI-owned even when their request-local
+    // route id/category does not match the built-in `codex-official` seed.
+    matches!(app_type, AppType::Codex)
+        && super::providers::is_codex_responses_endpoint(endpoint)
+        && !provider.is_codex_oauth()
+        && !super::providers::is_codex_official_provider(provider)
 }
 
 /// 判断 effective base_url 是否精确指向当前 CC Switch 代理入口。
@@ -6970,7 +7732,11 @@ fn codex_raw_route_is_official(route: &Value) -> bool {
     if codex_raw_route_auth_source(route).is_some_and(|source| {
         matches!(
             source,
-            "managed_codex_oauth" | "managed_account" | "chatgpt"
+            "native_codex_auth"
+                | "managed_codex_oauth"
+                | "managed_account"
+                | "account_pool"
+                | "chatgpt"
         )
     }) {
         return true;
@@ -7007,20 +7773,24 @@ fn codex_raw_route_string<'a>(route: &'a Value, keys: &[&str]) -> Option<&'a str
 
 /// 读取 route 的 auth.source，并兼容 managed account 的 authProvider。
 fn codex_raw_route_auth_source(route: &Value) -> Option<&str> {
-    let upstream = route.get("upstream").unwrap_or(route);
-    let auth = upstream.get("auth").or_else(|| route.get("auth"))?;
-    if auth
-        .get("authProvider")
-        .or_else(|| auth.get("auth_provider"))
-        .and_then(Value::as_str)
-        .is_some_and(|provider| provider.eq_ignore_ascii_case("codex_oauth"))
-    {
-        return Some("managed_codex_oauth");
-    }
-    auth.get("source")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|source| !source.is_empty())
+    super::providers::codex_route_auth_source(route).or_else(|| {
+        let upstream_auth = route.get("upstream").and_then(|value| value.get("auth"));
+        [
+            route.get("authPolicy"),
+            route.get("auth_policy"),
+            upstream_auth,
+            route.get("auth"),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|auth| {
+            auth.get("authProvider")
+                .or_else(|| auth.get("auth_provider"))
+                .and_then(Value::as_str)
+                .is_some_and(|provider| provider.eq_ignore_ascii_case("codex_oauth"))
+        })
+        .then_some("managed_codex_oauth")
+    })
 }
 
 /// 重建 raw passthrough 的上游请求头。
@@ -7250,7 +8020,8 @@ fn codex_realtime_multipart_field_name(headers: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::provider::LocalProxyRequestOverrides;
+    use crate::provider::{LocalProxyRequestOverrides, ProviderMeta};
+    use crate::proxy::providers::codex_oauth_auth::CodexAccountPoolEntry;
     use axum::http::header::{HeaderValue, ACCEPT};
     use axum::http::HeaderMap;
     use bytes::Bytes;
@@ -7297,51 +8068,6 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_v2_collaboration_rewrite_requires_mixed_router_and_official_parent() {
-        let mut mixed = test_provider_with_type(None);
-        mixed.settings_config = json!({
-            "codexRouting": {
-                "enabled": true,
-                "routes": [
-                    {"enabled": true, "upstream": {"auth": {"source": "managed_codex_oauth"}}},
-                    {"enabled": true, "upstream": {"auth": {"source": "provider_config"}}}
-                ]
-            }
-        });
-        assert!(should_make_codex_v2_collaboration_plaintext(
-            &AppType::Codex,
-            &mixed,
-            true
-        ));
-        assert!(!should_make_codex_v2_collaboration_plaintext(
-            &AppType::Codex,
-            &mixed,
-            false
-        ));
-        assert!(!should_make_codex_v2_collaboration_plaintext(
-            &AppType::Claude,
-            &mixed,
-            true
-        ));
-
-        let mut official_only = test_provider_with_type(None);
-        official_only.settings_config = json!({
-            "codexRouting": {
-                "enabled": true,
-                "routes": [{
-                    "enabled": true,
-                    "upstream": {"auth": {"source": "native_codex_auth"}}
-                }]
-            }
-        });
-        assert!(!should_make_codex_v2_collaboration_plaintext(
-            &AppType::Codex,
-            &official_only,
-            true
-        ));
-    }
-
-    #[test]
     fn codex_account_pool_requires_an_explicit_router_marker() {
         let native = test_codex_official_provider();
         assert!(!provider_requests_codex_account_pool(&native));
@@ -7349,6 +8075,36 @@ mod tests {
         let mut pooled = test_codex_official_provider();
         pooled.settings_config[CODEX_ACCOUNT_POOL_ENABLED] = Value::Bool(true);
         assert!(provider_requests_codex_account_pool(&pooled));
+    }
+
+    #[test]
+    fn account_pool_auth_materialization_does_not_override_resolved_protocol() {
+        let mut provider = test_provider_with_type(None);
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        provider.settings_config = json!({
+            "apiFormat": "openai_chat",
+            "codexAccountPool": true
+        });
+        let entry = CodexAccountPoolEntry {
+            account_id: "managed-account".to_string(),
+            enabled: true,
+            reserve_percent: 5.0,
+        };
+
+        let managed = materialize_codex_account_pool_candidate(&provider, &entry, 7);
+
+        assert_eq!(
+            managed
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.api_format.as_deref()),
+            Some("openai_chat"),
+            "auth ownership must not rewrite the compiler-resolved protocol"
+        );
+        assert_eq!(managed.settings_config["apiFormat"], "openai_chat");
     }
 
     #[test]
@@ -7669,6 +8425,34 @@ mod tests {
         assert!(!key_a.contains("secret"));
     }
 
+    #[test]
+    fn native_codex_responses_streams_get_reconnect_factory() {
+        assert!(should_create_responses_stream_reconnector(
+            &AppType::Codex,
+            "/v1/responses",
+            true,
+            None,
+        ));
+        assert!(should_create_responses_stream_reconnector(
+            &AppType::Claude,
+            "/v1/messages",
+            true,
+            Some("openai_responses"),
+        ));
+        assert!(!should_create_responses_stream_reconnector(
+            &AppType::Codex,
+            "/v1/responses",
+            false,
+            None,
+        ));
+        assert!(!should_create_responses_stream_reconnector(
+            &AppType::Codex,
+            "/v1/models",
+            true,
+            None,
+        ));
+    }
+
     // 验证短期负缓存命中期间有效，过期后会自动删除并允许下一次重新带头探测。
     #[test]
     fn codex_responses_lite_fallback_cache_expires() {
@@ -7722,6 +8506,42 @@ mod tests {
         assert!(summary.contains("stream_options=object(keys=[include_usage])"));
         assert!(!summary.contains("secret prompt"));
         assert!(!summary.contains("read_secret"));
+    }
+
+    #[test]
+    fn hosted_chat_tool_projection_only_reports_ccsm_owned_tools_and_choice_shape() {
+        let body = json!({
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "secret description",
+                        "parameters": {"type": "object"}
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "user_owned_tool",
+                        "parameters": {"type": "object"}
+                    }
+                }
+            ],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "web_search"}
+            }
+        });
+
+        let summary = summarize_hosted_chat_tool_projection(&body);
+
+        assert_eq!(
+            summary,
+            "hosted_tools=[web_search];hosted_tool_choice=object(keys=[function,type])"
+        );
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("user_owned_tool"));
     }
 
     #[test]
@@ -7964,7 +8784,11 @@ mod tests {
         };
 
         let effective = forwarder
-            .materialize_codex_forward_attempt_provider(&AppType::Codex, &route_attempts[0])
+            .materialize_codex_forward_attempt_provider(
+                &AppType::Codex,
+                &route_attempts[0],
+                &json!({ "model": "deepseek-v4-flash" }),
+            )
             .expect("materialize target provider");
 
         assert_eq!(
@@ -7980,6 +8804,267 @@ mod tests {
             effective.settings_config["codexResolvedTargetProviderId"],
             "deepseek-target"
         );
+    }
+
+    #[test]
+    fn v2_forwarder_reads_provider_protocol_again_for_each_request() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let mut target = Provider::with_id(
+            "qwen-target".to_string(),
+            "Qwen Target".to_string(),
+            json!({
+                "base_url": "https://qwen.example/v1",
+                "modelCatalog": {"models": [{"model": "qwen3.8"}]}
+            }),
+            None,
+        );
+        target.meta = Some(ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("codex", &target)
+            .expect("save chat target");
+        let forwarder = RequestForwarder {
+            router: Arc::new(ProviderRouter::new(db.clone())),
+            status: Arc::new(RwLock::new(ProxyStatus::default())),
+            current_providers: Arc::new(RwLock::new(HashMap::new())),
+            gemini_shadow: Arc::new(GeminiShadowStore::new()),
+            codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            failover_manager: Arc::new(FailoverSwitchManager::new(db.clone())),
+            app_handle: None,
+            current_provider_id_at_start: String::new(),
+            session_id: String::new(),
+            session_client_provided: false,
+            preserve_codex_client_originator: false,
+            rectifier_config: RectifierConfig::default(),
+            optimizer_config: OptimizerConfig::default(),
+            copilot_optimizer_config: CopilotOptimizerConfig::default(),
+            codex_responses_lite_fallbacks: Arc::new(RwLock::new(HashMap::new())),
+            non_streaming_timeout: Duration::ZERO,
+            streaming_first_byte_timeout: Duration::ZERO,
+            max_attempts: 1,
+        };
+        let mut router = test_provider_with_type(None);
+        router.id = "codex-multirouter".to_string();
+        router.settings_config = json!({
+            "codexRouting": {
+                "schemaVersion": 2,
+                "enabled": true,
+                "defaultRouteId": "qwen",
+                "routes": [{
+                    "id": "qwen",
+                    "enabled": true,
+                    "targetProviderId": "qwen-target",
+                    "modelSelection": {"mode": "all"},
+                    "authPolicy": {"source": "provider_config"}
+                }]
+            }
+        });
+        let body = json!({"model": "qwen3.8"});
+
+        let chat = forwarder
+            .materialize_codex_forward_attempt_provider(&AppType::Codex, &router, &body)
+            .expect("materialize chat request");
+        let chat_fingerprint = chat.settings_config["codexRoutingDependencyFingerprint"]
+            .as_str()
+            .expect("chat fingerprint")
+            .to_string();
+        assert!(
+            crate::proxy::providers::should_convert_codex_responses_to_chat(&chat, "/v1/responses")
+        );
+
+        target.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("codex", &target)
+            .expect("update target to responses");
+        let responses = forwarder
+            .materialize_codex_forward_attempt_provider(&AppType::Codex, &router, &body)
+            .expect("materialize responses request");
+
+        assert!(
+            !crate::proxy::providers::should_convert_codex_responses_to_chat(
+                &responses,
+                "/v1/responses"
+            )
+        );
+        assert_ne!(
+            chat_fingerprint,
+            responses.settings_config["codexRoutingDependencyFingerprint"]
+        );
+    }
+
+    #[test]
+    fn materialized_official_route_keeps_mixed_router_plaintext_delivery_policy() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let official_target = test_codex_official_provider();
+        db.save_provider("codex", &official_target)
+            .expect("save official target provider");
+
+        let mut router = test_provider_with_type(None);
+        router.id = "codex-multirouter".to_string();
+        router.settings_config = json!({
+            "codexRouting": {
+                "enabled": true,
+                "routes": [
+                    {
+                        "id": "official",
+                        "enabled": true,
+                        "targetProviderId": official_target.id,
+                        "match": { "models": ["gpt-5.6-sol"] },
+                        "upstream": {
+                            "apiFormat": "openai_responses",
+                            "auth": { "source": "native_codex_auth" }
+                        }
+                    },
+                    {
+                        "id": "qwen",
+                        "enabled": true,
+                        "match": { "models": ["qwen3.6"] },
+                        "upstream": {
+                            "apiFormat": "openai_chat",
+                            "auth": { "source": "provider_config" }
+                        }
+                    }
+                ]
+            }
+        });
+
+        let route_attempts = build_forward_attempt_providers_preserving_codex_router_context(
+            &AppType::Codex,
+            &[router],
+            &json!({ "model": "gpt-5.6-sol" }),
+        );
+        let forwarder = RequestForwarder {
+            router: Arc::new(ProviderRouter::new(db.clone())),
+            status: Arc::new(RwLock::new(ProxyStatus::default())),
+            current_providers: Arc::new(RwLock::new(HashMap::new())),
+            gemini_shadow: Arc::new(GeminiShadowStore::new()),
+            codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            failover_manager: Arc::new(FailoverSwitchManager::new(db)),
+            app_handle: None,
+            current_provider_id_at_start: String::new(),
+            session_id: String::new(),
+            session_client_provided: false,
+            preserve_codex_client_originator: false,
+            rectifier_config: RectifierConfig::default(),
+            optimizer_config: OptimizerConfig::default(),
+            copilot_optimizer_config: CopilotOptimizerConfig::default(),
+            codex_responses_lite_fallbacks: Arc::new(RwLock::new(HashMap::new())),
+            non_streaming_timeout: Duration::ZERO,
+            streaming_first_byte_timeout: Duration::ZERO,
+            max_attempts: 1,
+        };
+
+        let effective = forwarder
+            .materialize_codex_forward_attempt_provider(
+                &AppType::Codex,
+                &route_attempts[0],
+                &json!({ "model": "gpt-5.6-sol" }),
+            )
+            .expect("materialize official target provider");
+
+        assert_eq!(
+            effective
+                .settings_config
+                .get("codexRouterPlaintextV2Collaboration")
+                .and_then(Value::as_bool),
+            Some(true),
+            "retry-layer route materialization must preserve the mixed-router plaintext policy"
+        );
+    }
+
+    #[test]
+    fn agents_plaintext_rewrite_requires_codex_mixed_router() {
+        let mut mixed = test_provider_with_type(None);
+        mixed.settings_config = json!({
+            "codexRouting": {
+                "enabled": true,
+                "routes": [
+                    {"enabled": true, "upstream": {"auth": {"source": "managed_codex_oauth"}}},
+                    {"enabled": true, "upstream": {"auth": {"source": "provider_config"}}}
+                ]
+            }
+        });
+        assert!(should_make_codex_v2_agents_plaintext(
+            &AppType::Codex,
+            &mixed
+        ));
+        // 第三方父（官方中转）也必须剥离 message.encrypted，否则中转背后的
+        // 官方 backend 会按 schema 加密 message，child 收到不可解密的 Fernet 密文。
+        assert!(should_make_codex_v2_agents_plaintext(
+            &AppType::Codex,
+            &mixed
+        ));
+        assert!(!should_make_codex_v2_agents_plaintext(
+            &AppType::Claude,
+            &mixed
+        ));
+
+        // 纯第三方 Router：所有路由都非官方，第三方父同样需要明文投递。
+        let mut third_party_only = test_provider_with_type(None);
+        third_party_only.settings_config = json!({
+            "codexRouting": {
+                "enabled": true,
+                "routes": [
+                    {"enabled": true, "upstream": {"auth": {"source": "provider_config"}}}
+                ]
+            }
+        });
+        assert!(should_make_codex_v2_agents_plaintext(
+            &AppType::Codex,
+            &third_party_only
+        ));
+
+        let mut official_only = test_provider_with_type(None);
+        official_only.settings_config = json!({
+            "codexRouting": {
+                "enabled": true,
+                "routes": [{
+                    "enabled": true,
+                    "upstream": {"auth": {"source": "native_codex_auth"}}
+                }]
+            }
+        });
+        assert!(!should_make_codex_v2_agents_plaintext(
+            &AppType::Codex,
+            &official_only
+        ));
+    }
+
+    #[test]
+    fn agent_message_projection_runs_only_for_third_party_codex_responses() {
+        let third_party = test_provider_with_type(None);
+        assert!(should_project_codex_agent_messages_for_provider(
+            &AppType::Codex,
+            &third_party,
+            "/v1/responses"
+        ));
+        assert!(!should_project_codex_agent_messages_for_provider(
+            &AppType::Claude,
+            &third_party,
+            "/v1/responses"
+        ));
+        assert!(!should_project_codex_agent_messages_for_provider(
+            &AppType::Codex,
+            &third_party,
+            "/v1/chat/completions"
+        ));
+
+        let official = test_codex_official_provider();
+        assert!(!should_project_codex_agent_messages_for_provider(
+            &AppType::Codex,
+            &official,
+            "/v1/responses"
+        ));
+
+        let managed_official = test_provider_with_type(Some("codex_oauth"));
+        assert!(!should_project_codex_agent_messages_for_provider(
+            &AppType::Codex,
+            &managed_official,
+            "/v1/responses"
+        ));
     }
 
     #[tokio::test]
@@ -8207,6 +9292,78 @@ mod tests {
     }
 
     #[test]
+    fn official_codex_responses_wire_body_is_zstd_encoded() {
+        let original = br#"{"model":"gpt-5.6-luna","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"diagnostic"}]}]}"#
+            .repeat(256);
+        let mut headers = HeaderMap::new();
+
+        let encoded = encode_codex_official_upstream_body(
+            &mut headers,
+            original.clone(),
+            /* enabled */ true,
+        )
+        .expect("encode official request");
+
+        assert_eq!(
+            headers
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("zstd")
+        );
+        assert_ne!(encoded, original);
+        assert_eq!(
+            zstd::stream::decode_all(std::io::Cursor::new(encoded))
+                .expect("decode official request"),
+            original
+        );
+    }
+
+    #[test]
+    fn non_official_upstream_wire_body_remains_uncompressed() {
+        let original = br#"{"model":"deepseek-v4-flash","input":[]}"#.to_vec();
+        let mut headers = HeaderMap::new();
+
+        let encoded = encode_codex_official_upstream_body(
+            &mut headers,
+            original.clone(),
+            /* enabled */ false,
+        )
+        .expect("prepare third-party request");
+
+        assert!(!headers.contains_key(http::header::CONTENT_ENCODING));
+        assert_eq!(encoded, original);
+    }
+
+    #[test]
+    fn official_codex_responses_request_selects_zstd() {
+        assert!(should_zstd_compress_codex_official_upstream(
+            &AppType::Codex,
+            &http::Method::POST,
+            "https://chatgpt.com/backend-api/codex/responses",
+            /* official_auth */ true,
+            /* transformed */ false,
+        ));
+    }
+
+    #[test]
+    fn third_party_or_transformed_responses_request_does_not_select_zstd() {
+        assert!(!should_zstd_compress_codex_official_upstream(
+            &AppType::Codex,
+            &http::Method::POST,
+            "https://api.deepseek.com/v1/responses",
+            /* official_auth */ true,
+            /* transformed */ false,
+        ));
+        assert!(!should_zstd_compress_codex_official_upstream(
+            &AppType::Codex,
+            &http::Method::POST,
+            "https://chatgpt.com/backend-api/codex/responses",
+            /* official_auth */ true,
+            /* transformed */ true,
+        ));
+    }
+
+    #[test]
     fn codex_oauth_responses_passthrough_normalizer_is_scoped() {
         let codex_oauth = test_provider_with_type(Some("codex_oauth"));
         let regular = test_provider_with_type(None);
@@ -8258,6 +9415,25 @@ mod tests {
             official_url,
             false,
             true,
+            false
+        ));
+    }
+
+    #[test]
+    fn native_openai_official_responses_uses_the_same_replay_normalizer() {
+        // Switching the top-level Codex provider back from DeepSeek/Qwen uses
+        // the built-in native-auth OpenAI Official provider, not a provider
+        // whose meta.provider_type is codex_oauth. It still targets the same
+        // ChatGPT Codex Responses backend, so third-party reasoning/content
+        // history must cross the same target-transport replay boundary.
+        let native_official = test_codex_official_provider();
+
+        assert!(should_normalize_codex_oauth_responses_passthrough_body(
+            &AppType::Codex,
+            &native_official,
+            "https://chatgpt.com/backend-api/codex/responses",
+            false,
+            false,
             false
         ));
     }
@@ -8337,6 +9513,63 @@ mod tests {
                 false
             )
         );
+    }
+
+    #[test]
+    fn lm_studio_native_responses_adds_missing_text_format() {
+        let mut lm_studio = test_provider_with_type(Some("lmstudio"));
+        lm_studio.id = "lmstudio".to_string();
+        lm_studio.name = "LM Studio".to_string();
+
+        let normalized = normalize_lm_studio_responses_request(
+            &AppType::Codex,
+            &lm_studio,
+            "/v1/responses",
+            true,
+            json!({"model": "local-model", "text": {"verbosity": "low"}}),
+        );
+
+        assert_eq!(normalized["text"]["verbosity"], "low");
+        assert_eq!(normalized["text"]["format"], json!({"type": "text"}));
+    }
+
+    #[test]
+    fn lm_studio_responses_preserves_explicit_format_and_scope() {
+        let mut lm_studio = test_provider_with_type(Some("lmstudio"));
+        lm_studio.name = "LM Studio".to_string();
+        let explicit_format = json!({
+            "type": "json_schema",
+            "name": "answer",
+            "schema": {"type": "object"}
+        });
+
+        let explicit = normalize_lm_studio_responses_request(
+            &AppType::Codex,
+            &lm_studio,
+            "/responses",
+            true,
+            json!({"text": {"format": explicit_format.clone()}}),
+        );
+        assert_eq!(explicit["text"]["format"], explicit_format);
+
+        let unrelated = test_provider_with_type(None);
+        let unrelated_body = normalize_lm_studio_responses_request(
+            &AppType::Codex,
+            &unrelated,
+            "/responses",
+            true,
+            json!({"text": {"verbosity": "low"}}),
+        );
+        assert!(unrelated_body["text"].get("format").is_none());
+
+        let transformed = normalize_lm_studio_responses_request(
+            &AppType::Codex,
+            &lm_studio,
+            "/responses",
+            false,
+            json!({"text": {"verbosity": "low"}}),
+        );
+        assert!(transformed["text"].get("format").is_none());
     }
 
     #[test]
@@ -8467,7 +9700,10 @@ mod tests {
             .expect("response should be buffered");
 
         assert_eq!(
-            prepared.bytes().await.unwrap(),
+            prepared
+                .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+                .await
+                .unwrap(),
             Bytes::from_static(b"{\"ok\":true}")
         );
     }
@@ -8512,7 +9748,10 @@ mod tests {
             .expect("stream should be primed");
 
         assert_eq!(
-            prepared.bytes().await.unwrap(),
+            prepared
+                .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+                .await
+                .unwrap(),
             Bytes::from_static(b"firstsecond")
         );
     }
@@ -8590,7 +9829,10 @@ mod tests {
             .await
             .expect("normal first SSE event should be replayed");
 
-        let body = prepared.bytes().await.unwrap();
+        let body = prepared
+            .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("response.created"));
         assert!(String::from_utf8_lossy(&body).contains("response.completed"));
     }
@@ -8966,7 +10208,8 @@ mod tests {
     }
 
     #[test]
-    fn source_codex_oauth_credentials_reads_request_bearer() {
+    fn source_codex_oauth_credentials_reads_native_codex_request_bearer() {
+        let provider = test_codex_official_provider();
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
@@ -8975,10 +10218,150 @@ mod tests {
         headers.insert("chatgpt-account-id", HeaderValue::from_static("acct_1"));
 
         let (token, account_id) =
-            source_codex_oauth_credentials(&headers).expect("oauth credentials");
+            source_codex_oauth_credentials(&provider, &headers).expect("oauth credentials");
 
         assert_eq!(token, "token-from-codex");
         assert_eq!(account_id.as_deref(), Some("acct_1"));
+    }
+
+    #[test]
+    fn source_codex_oauth_credentials_rejects_proxy_placeholder() {
+        let provider = test_codex_official_provider();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer PROXY_MANAGED"),
+        );
+
+        assert!(source_codex_oauth_credentials(&provider, &headers).is_none());
+    }
+
+    #[test]
+    fn source_codex_oauth_credentials_does_not_reuse_third_party_bearer() {
+        let provider = test_provider_with_type(None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer third-party-api-key"),
+        );
+
+        assert!(source_codex_oauth_credentials(&provider, &headers).is_none());
+    }
+
+    #[test]
+    fn streaming_auto_tool_choice_enables_hosted_loop_by_default() {
+        let request = serde_json::json!({
+            "stream": true,
+            "tool_choice": "auto",
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}}
+            ]
+        });
+
+        // 默认（未配置 streamingAuto）：流式 auto 也接管 hosted loop，
+        // 让第三方模型在流式下能用官方 web_search / image_generation。
+        let default_settings = serde_json::json!({});
+        assert!(should_enable_hosted_tool_loop(
+            &request,
+            true,
+            &default_settings
+        ));
+    }
+
+    #[test]
+    fn hosted_tool_choice_name_only_matches_explicit_ccsm_tools() {
+        assert_eq!(
+            hosted_tool_choice_name(&serde_json::json!({
+                "tool_choice": {"type": "web_search"}
+            })),
+            Some("web_search")
+        );
+        assert_eq!(
+            hosted_tool_choice_name(&serde_json::json!({
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "web_search"}
+                }
+            })),
+            Some("web_search")
+        );
+        assert_eq!(
+            hosted_tool_choice_name(&serde_json::json!({
+                "tool_choice": "auto"
+            })),
+            None
+        );
+        assert_eq!(
+            hosted_tool_choice_name(&serde_json::json!({
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "lookup"}
+                }
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn streaming_auto_disabled_via_settings_omits_hosted_loop() {
+        let request = serde_json::json!({
+            "stream": true,
+            "tool_choice": "auto",
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}}
+            ]
+        });
+
+        // 显式关闭 streamingAuto：回退到「流式 auto 不接管」，托管工具从投影省略，
+        // 用于规避 Qwen 长上下文 blank-thinking 回归。
+        let disabled_settings = serde_json::json!({
+            "hostedTools": { "streamingAuto": { "enabled": false } }
+        });
+        assert!(!should_enable_hosted_tool_loop(
+            &request,
+            true,
+            &disabled_settings
+        ));
+
+        // 关闭后，显式 tool_choice 指向 hosted tool 仍接管（调用方明确要这个桥）。
+        let explicit_request = serde_json::json!({
+            "stream": true,
+            "tool_choice": {"type": "web_search"},
+            "tools": [{"type": "web_search"}]
+        });
+        assert!(should_enable_hosted_tool_loop(
+            &explicit_request,
+            true,
+            &disabled_settings
+        ));
+    }
+
+    #[test]
+    fn explicit_hosted_tool_choice_may_use_buffered_hosted_loop() {
+        for hosted_type in ["web_search", "image_generation"] {
+            let request = serde_json::json!({
+                "stream": true,
+                "tool_choice": {"type": hosted_type},
+                "tools": [{"type": hosted_type}]
+            });
+
+            let settings = serde_json::json!({});
+            assert!(should_enable_hosted_tool_loop(&request, true, &settings));
+        }
+    }
+
+    #[test]
+    fn non_streaming_auto_request_keeps_hosted_tool_loop() {
+        let request = serde_json::json!({
+            "stream": false,
+            "tool_choice": "auto",
+            "tools": [{"type": "web_search"}]
+        });
+
+        let settings = serde_json::json!({});
+        assert!(should_enable_hosted_tool_loop(&request, false, &settings));
     }
 
     /// 验证 hosted web_search loop 会消费第一轮工具调用、回灌 tool output 并返回最终 Chat 响应。
@@ -9059,6 +10442,11 @@ mod tests {
             },
             None,
             true,
+            None,
+            "session",
+            "deepseek-v4-flash",
+            "provider",
+            false,
         )
         .await
         .expect("hosted web_search loop should finish");
@@ -9067,8 +10455,13 @@ mod tests {
         assert!(final_response
             .headers()
             .contains_key(HOSTED_TOOL_LOOP_HEADER));
-        let final_body = serde_json::from_slice::<Value>(&final_response.bytes().await.unwrap())
-            .expect("final chat response json");
+        let final_body = serde_json::from_slice::<Value>(
+            &final_response
+                .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .expect("final chat response json");
         assert_eq!(
             final_body["choices"][0]["message"]["content"],
             "Search was unavailable."
@@ -9171,6 +10564,11 @@ mod tests {
             },
             None,
             true,
+            None,
+            "session",
+            "kimi-k3",
+            "provider",
+            false,
         )
         .await
         .expect("hosted image_generation loop should finish");
@@ -9179,8 +10577,13 @@ mod tests {
         assert!(final_response
             .headers()
             .contains_key(HOSTED_TOOL_LOOP_HEADER));
-        let final_body = serde_json::from_slice::<Value>(&final_response.bytes().await.unwrap())
-            .expect("final chat response json");
+        let final_body = serde_json::from_slice::<Value>(
+            &final_response
+                .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .expect("final chat response json");
         assert_eq!(
             final_body["choices"][0]["message"]["content"],
             "Image generation was unavailable."
@@ -9598,8 +11001,13 @@ mod tests {
 
     #[test]
     fn reqwest_connect_timeout_is_forward_failed_not_response_pending() {
-        let err =
-            map_reqwest_send_error_class(true, true, false, "error_sending_request".to_string());
+        let err = map_reqwest_send_error_class(
+            true,
+            true,
+            false,
+            true,
+            "error_sending_request".to_string(),
+        );
 
         assert!(matches!(
             err,
@@ -9609,11 +11017,28 @@ mod tests {
 
     #[test]
     fn reqwest_in_flight_timeout_stays_response_pending() {
-        let err = map_reqwest_send_error_class(false, true, false, "late result".to_string());
+        let err = map_reqwest_send_error_class(false, true, false, true, "late result".to_string());
 
         assert!(matches!(
             err,
             ProxyError::ResponsePending(message) if message.contains("上游响应等待超时")
+        ));
+    }
+
+    #[test]
+    fn reqwest_send_request_disconnect_is_not_treated_as_pre_send_build_failure() {
+        let err = map_reqwest_send_error_class(
+            false,
+            false,
+            false,
+            true,
+            "client_error (SendRequest): connection_closed_before_message_completed".to_string(),
+        );
+
+        assert!(matches!(
+            err,
+            ProxyError::ResponsePending(message)
+                if message.contains("connection_closed_before_message_completed")
         ));
     }
 
@@ -10160,6 +11585,31 @@ mod tests {
         assert_eq!(
             resolved.settings_config["codexResolvedRouteMatched"], false,
             "空 body 的 GPT-Live 端点不是模型显式命中"
+        );
+    }
+
+    #[test]
+    fn raw_passthrough_recognizes_v2_auth_policy_for_custom_official_target() {
+        let provider = provider_with_settings(json!({
+            "codexRouting": {
+                "schemaVersion": 2,
+                "enabled": true,
+                "routes": [{
+                    "id": "official-custom-id",
+                    "enabled": true,
+                    "targetProviderId": "desktop-account-provider",
+                    "modelSelection": {"mode": "all"},
+                    "authPolicy": {"source": "native_codex_auth"}
+                }]
+            }
+        }));
+
+        let resolved = resolve_codex_raw_passthrough_route_provider(&provider, &json!({}))
+            .expect("v2 native auth route must own raw official endpoints");
+
+        assert_eq!(
+            resolved.settings_config["codexResolvedRouteId"],
+            "official-custom-id"
         );
     }
 
@@ -10756,5 +12206,127 @@ mod tests {
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             UPSTREAM_TRANSPORT_RETRY_LIMIT + 1
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upstream_transport_retry_survives_five_safe_connect_failures() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+
+        let result = send_upstream_request_with_transport_retry("test", || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 5 {
+                    Err(ProxyError::ForwardFailed(
+                        "上游连接失败: unexpected EOF during handshake".to_string(),
+                    ))
+                } else {
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::OK,
+                        http::HeaderMap::new(),
+                        Bytes::new(),
+                    ))
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_rate_limit_retry_recovers_same_request_after_transient_429() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+
+        let result = send_codex_request_with_rate_limit_retry("test", || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::TOO_MANY_REQUESTS,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(
+                            br#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#,
+                        ),
+                    ))
+                } else {
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::OK,
+                        http::HeaderMap::new(),
+                        Bytes::new(),
+                    ))
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_rate_limit_retry_honors_retry_after_seconds() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let started_at = tokio::time::Instant::now();
+
+        let result = send_codex_request_with_rate_limit_retry("test", || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    let mut headers = http::HeaderMap::new();
+                    headers.insert(http::header::RETRY_AFTER, "17".parse().unwrap());
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::TOO_MANY_REQUESTS,
+                        headers,
+                        Bytes::from_static(br#"{"error":{"type":"rate_limit_exceeded"}}"#),
+                    ))
+                } else {
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::OK,
+                        http::HeaderMap::new(),
+                        Bytes::new(),
+                    ))
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            Duration::from_secs(17)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_rate_limit_retry_does_not_spin_on_usage_limit_reached() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+
+        let result = send_codex_request_with_rate_limit_retry("test", || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ProxyResponse::buffered(
+                    http::StatusCode::TOO_MANY_REQUESTS,
+                    http::HeaderMap::new(),
+                    Bytes::from_static(
+                        br#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#,
+                    ),
+                ))
+            }
+        })
+        .await;
+
+        assert_eq!(
+            result.unwrap().status(),
+            http::StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

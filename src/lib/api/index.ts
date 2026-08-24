@@ -1,6 +1,11 @@
 export type { AppId } from "./types";
 export { providersApi, universalProvidersApi } from "./providers";
 export { settingsApi } from "./settings";
+export type {
+  RecoveryOutcome,
+  RecoveryOutcomeKind,
+  RepairableCodexPlugin,
+} from "./settings";
 export { backupsApi } from "./settings";
 export { mcpApi } from "./mcp";
 export { profilesApi } from "./profiles";
@@ -13,10 +18,22 @@ export { proxyApi } from "./proxy";
 export { openclawApi } from "./openclaw";
 export { sessionsApi } from "./sessions";
 export { workspaceApi } from "./workspace";
+export { codexSubagentV2Api } from "./codexSubagentV2";
 export * as configApi from "./config";
 export * as authApi from "./auth";
 export * as copilotApi from "./copilot";
-export type { ProviderSwitchEvent } from "./providers";
+export type {
+  CodexMultiRouterGeneratedProviderSummary,
+  CodexMultiRouterMigrationApplyOutcome,
+  CodexMultiRouterMigrationDiff,
+  CodexMultiRouterMigrationPreview,
+  CodexRoutingProjectionCapabilitySources,
+  CodexRoutingProjectionRouteDiagnostic,
+  CodexRoutingProjectionState,
+  CodexRoutingProjectionStatus,
+  ProviderDeleteOutcome,
+  ProviderSwitchEvent,
+} from "./providers";
 export type { Prompt } from "./prompts";
 export type { Profile, ProfilePayload, ProfilesResponse } from "./profiles";
 export type {

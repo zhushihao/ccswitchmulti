@@ -1,4 +1,4 @@
-import type { SessionMessage } from "@/types";
+﻿import type { SessionMessage } from "@/types";
 
 export interface ProxyConfig {
   listen_address: string;
@@ -124,8 +124,10 @@ export interface CodexRouterLogEvent {
   actualProtocol: string | null;
   responsesToChat: boolean | null;
   responsesToMessages: boolean | null;
+  tool: string | null;
   status: string | null;
   error: string | null;
+  reason: string | null;
   line: string;
 }
 
@@ -137,9 +139,19 @@ export interface CodexRouterLogDiagnostics {
   hasRecentRequest: boolean;
   latestRequestAt: string | null;
   latestError: string | null;
+  latestHostedToolWarning: string | null;
   recentEvents: CodexRouterLogEvent[];
 }
 
+export interface CodexGuardianStatus {
+  active: boolean;
+  codexRunning: boolean;
+  cdpAvailable: boolean;
+  injectedTargetCount: number;
+  injected: boolean;
+  lastEvent: string;
+  message: string;
+}
 export interface CodexModelPickerUnlockResult {
   attemptedPorts: number[];
   debugPort: number | null;
@@ -414,6 +426,7 @@ export interface GlobalProxyConfig {
   listenAddress: string;
   listenPort: number;
   enableLogging: boolean;
+  codexRespectSystemProxy?: boolean;
 }
 
 // 应用级代理配置（每个 app 独立）

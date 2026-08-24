@@ -7,6 +7,44 @@ import type {
 } from "@/types";
 import type { AppId } from "./types";
 
+export interface RepairableCodexPlugin {
+  id: string;
+  name: string;
+  version: string;
+  manifestPath: string;
+  sourcePath: string;
+  marketplacePath: string;
+  repairAction?: "registerMarketplace" | "enableAndRegister" | "enable";
+}
+
+export type RecoveryOutcomeKind =
+  | "noPreviousRun"
+  | "uncleanExit"
+  | "confirmedCrash"
+  | "activePreviousInstance"
+  | "plannedRestartOrUpdate"
+  | "healthyBackupRestored"
+  | "livePreservedProviderRepaired"
+  | "providerOnlyRestored"
+  | "userBackupCandidateFound"
+  | "unrecoverableUserTables"
+  | "concurrentModificationDeferred"
+  | "pluginRegistrationRepairAvailable"
+  | "pluginRegistrationRepairCompleted"
+  | "pluginRegistrationRepairFailed"
+  | "portOwnedByCompatibleInstance"
+  | "portOwnedByUnknownOwner";
+
+export interface RecoveryOutcome {
+  kind: RecoveryOutcomeKind;
+  appType?: string;
+  keptFields: string[];
+  lostFields: string[];
+  nextStep?: string;
+  timestamp: string;
+  details?: string;
+}
+
 export interface ConfigTransferResult {
   success: boolean;
   message: string;
@@ -304,6 +342,21 @@ export const settingsApi = {
   async openLogDir(): Promise<boolean> {
     return await invoke("open_log_dir");
   },
+
+  async detectCodexPluginRegistration(): Promise<RepairableCodexPlugin[]> {
+    return await invoke("detect_codex_plugin_registration");
+  },
+
+  async repairCodexPluginRegistration(
+    pluginId: string,
+  ): Promise<RepairableCodexPlugin> {
+    return await invoke("repair_codex_plugin_registration", { pluginId });
+  },
+
+  /** 查询最近一次恢复结果，弥补启动阶段事件订阅的竞态。 */
+  async getLastRecoveryOutcome(): Promise<RecoveryOutcome | null> {
+    return await invoke("get_last_recovery_outcome");
+  },
 };
 
 /** 单处工具安装的诊断信息（多处安装冲突检测）。字段对应后端 ToolInstallation。 */
@@ -351,6 +404,12 @@ export interface BackupEntry {
   createdAt: string;
 }
 
+export interface DatabaseRestoreResult {
+  success: boolean;
+  safetyBackupId: string;
+  warning?: string;
+}
+
 export const backupsApi = {
   async createDbBackup(): Promise<string> {
     return await invoke("create_db_backup");
@@ -360,7 +419,7 @@ export const backupsApi = {
     return await invoke("list_db_backups");
   },
 
-  async restoreDbBackup(filename: string): Promise<string> {
+  async restoreDbBackup(filename: string): Promise<DatabaseRestoreResult> {
     return await invoke("restore_db_backup", { filename });
   },
 

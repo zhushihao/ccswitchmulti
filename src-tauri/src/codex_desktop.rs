@@ -6,15 +6,18 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-const DEFAULT_CODEX_DEBUG_PORT: u16 = 9229;
-const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DEFAULT_CODEX_DEBUG_PORT: u16 = 9229;
+pub(crate) const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 const MODEL_PICKER_PATCH_KEY: &str = "__ccSwitchCodexAppCompatibilityV5";
 const REMEMBERED_CODEX_DESKTOP_EXECUTABLE_FILENAME: &str = "codex-desktop-executable.json";
+#[cfg(any(target_os = "macos", test))]
+const CODEX_DESKTOP_BUNDLE_IDENTIFIER: &str = "com.openai.codex";
 /// Codex App 历史目录与模型兼容层安装命令的执行结果。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,7 +40,7 @@ pub struct CodexModelPickerUnlockResult {
 
 /// renderer 脚本返回的新版历史目录同步证据。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct CodexAppCompatibilityEvidence {
+pub(crate) struct CodexAppCompatibilityEvidence {
     history_sync_requested: bool,
     history_catalog_complete: Option<bool>,
     history_catalog_count: Option<usize>,
@@ -46,7 +49,7 @@ struct CodexAppCompatibilityEvidence {
 /// 注入脚本需要的模型目录投影，避免把整个 catalog 私有字段泄漏到 renderer。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CodexModelCatalogProjection {
+pub(crate) struct CodexModelCatalogProjection {
     default_model: Option<String>,
     model_names: Vec<String>,
     models: Vec<Value>,
@@ -61,20 +64,26 @@ impl CodexModelCatalogProjection {
             models: Vec::new(),
         }
     }
+
+    /// 返回本次 renderer 注入实际使用的目录指纹。
+    pub(crate) fn fingerprint(&self) -> String {
+        let payload = serde_json::to_vec(self).unwrap_or_default();
+        format!("{:x}", Sha256::digest(payload))
+    }
 }
 
 /// Chrome DevTools Protocol `/json` 返回的页面 target 摘要。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-struct CdpTarget {
-    id: String,
+pub(crate) struct CdpTarget {
+    pub(crate) id: String,
     #[serde(rename = "type")]
-    target_type: String,
+    pub(crate) target_type: String,
     #[serde(default)]
-    title: String,
+    pub(crate) title: String,
     #[serde(default)]
-    url: String,
+    pub(crate) url: String,
     #[serde(default, rename = "webSocketDebuggerUrl")]
-    web_socket_debugger_url: Option<String>,
+    pub(crate) web_socket_debugger_url: Option<String>,
 }
 
 /// 尝试为当前或新启动的 Codex App 安装 renderer 兼容层。
@@ -172,12 +181,32 @@ pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult,
     }))
 }
 
+/// 在用户显式开启的“随 CCSwitchMulti 启动 Codex Desktop”设置下启动 Codex。
+///
+/// 这个入口不属于系统自启注册流程；调用方必须先读取独立设置。已有 Codex
+/// 主进程时保持幂等，不重复拉起或干扰现有会话。
+pub(crate) fn launch_codex_desktop_with_ccswitch(enabled: bool) -> Result<bool, String> {
+    let codex_running = detect_running_codex_main_process().is_some();
+    if !should_launch_codex_desktop_with_ccswitch(enabled, codex_running) {
+        return Ok(false);
+    }
+
+    let executable =
+        resolve_codex_executable().ok_or_else(codex_desktop_executable_not_found_message)?;
+    launch_codex_with_debug_port(&executable, DEFAULT_CODEX_DEBUG_PORT)?;
+    Ok(true)
+}
+
+fn should_launch_codex_desktop_with_ccswitch(enabled: bool, codex_running: bool) -> bool {
+    enabled && !codex_running
+}
+
 /// 返回当前平台的 Desktop 可执行文件发现失败说明，避免 Windows-only 文案误导 macOS/Linux 用户。
 fn codex_desktop_executable_not_found_message() -> String {
     let platform_sources = if cfg!(target_os = "windows") {
         "running Desktop process, remembered Desktop path, MSIX/Appx package metadata and manifest, App Paths registry entries, PATH commands, and common local install folders"
     } else if cfg!(target_os = "macos") {
-        "running Desktop process, remembered Desktop path, /Applications, ~/Applications, and Spotlight-discovered Codex.app bundles"
+        "running Desktop process, remembered Desktop path, /Applications, ~/Applications, and Spotlight-discovered com.openai.codex bundles (Codex.app or ChatGPT.app)"
     } else if cfg!(target_os = "linux") {
         "running Desktop process, remembered Desktop path, PATH entries for Codex/Codex.AppImage, .desktop entries with absolute Exec paths, and common AppImage or /opt install folders"
     } else {
@@ -189,7 +218,8 @@ fn codex_desktop_executable_not_found_message() -> String {
 }
 
 /// 从 cc-switch 生成的 catalog 中读取模型名和 renderer 需要的最小描述。
-fn load_cc_switch_model_catalog_projection() -> Result<CodexModelCatalogProjection, String> {
+pub(crate) fn load_cc_switch_model_catalog_projection(
+) -> Result<CodexModelCatalogProjection, String> {
     let catalog_path = crate::codex_config::get_codex_model_catalog_path();
     let default_model = read_current_codex_default_model();
     let mut candidates = Vec::new();
@@ -326,9 +356,6 @@ fn project_codex_model_descriptor(entry: &Value, model_name: &str) -> Value {
         );
     }
     object.insert("hidden".to_string(), Value::Bool(false));
-    object
-        .entry("defaultReasoningEffort".to_string())
-        .or_insert_with(|| Value::String("medium".to_string()));
     Value::Object(object)
 }
 
@@ -345,7 +372,7 @@ fn read_current_codex_default_model() -> Option<String> {
 }
 
 /// 在候选 CDP 端口中寻找 Codex renderer 并安装模型白名单补丁。
-async fn try_inject_on_candidate_ports(
+pub(crate) async fn try_inject_on_candidate_ports(
     catalog: &CodexModelCatalogProjection,
     ports: &[u16],
 ) -> Option<CodexModelPickerUnlockResult> {
@@ -401,7 +428,7 @@ async fn try_inject_on_candidate_ports(
 }
 
 /// 生成去重后的 CDP 端口探测列表。
-fn candidate_debug_ports(preferred: u16) -> Vec<u16> {
+pub(crate) fn candidate_debug_ports(preferred: u16) -> Vec<u16> {
     let mut ports = vec![preferred, DEFAULT_CODEX_DEBUG_PORT, 9222, 9223, 9230, 9231];
     ports.sort_unstable();
     ports.dedup();
@@ -409,7 +436,7 @@ fn candidate_debug_ports(preferred: u16) -> Vec<u16> {
 }
 
 /// 查询 CDP 页面 target。
-async fn list_cdp_targets(debug_port: u16) -> Result<Vec<CdpTarget>, String> {
+pub(crate) async fn list_cdp_targets(debug_port: u16) -> Result<Vec<CdpTarget>, String> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(CDP_HTTP_TIMEOUT)
@@ -440,7 +467,7 @@ async fn list_cdp_targets(debug_port: u16) -> Result<Vec<CdpTarget>, String> {
 /// 共享调试端口如 9222 可能属于 Chrome 或其它 Electron 应用，必须看到 Codex
 /// 标识才注入；CCSwitchMulti 自己启动的默认 9229 允许在标题还没初始化时退回
 /// 到第一个 page target。
-fn pick_codex_page_targets(
+pub(crate) fn pick_codex_page_targets(
     targets: &[CdpTarget],
     debug_port: u16,
 ) -> Result<Vec<CdpTarget>, String> {
@@ -475,7 +502,7 @@ fn target_matches_codex_desktop(target: &CdpTarget) -> bool {
 }
 
 /// 使用 CDP 同时安装新文档脚本并立即 patch 当前页面。
-async fn install_script(
+pub(crate) async fn install_script(
     websocket_url: &str,
     script: &str,
 ) -> Result<CodexAppCompatibilityEvidence, String> {
@@ -612,92 +639,88 @@ fn cdp_command_result(response: Value, method: &str) -> Result<Value, String> {
     }
 }
 
-/// 构造 renderer 注入脚本：触发新版本地历史目录同步，并修复模型白名单和缓存。
-fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> String {
-    let payload = serde_json::to_string(catalog).unwrap_or_else(|_| "{}".to_string());
-    format!(
-        r#"
-(async () => {{
-  const payload = {payload};
-  const patchKey = "{MODEL_PICKER_PATCH_KEY}";
-  const state = window[patchKey] || {{}};
-  state.payload = payload;
-  state.requestIds = state.requestIds || new Set();
-  state.modulePromises = state.modulePromises || new Map();
-  state.failures = state.failures || [];
-  window[patchKey] = state;
-
-  const reasoningEfforts = () => ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({{ reasoningEffort, description: `${{reasoningEffort}} effort` }}));
-  const modelNames = () => Array.from(new Set([payload.defaultModel, ...(payload.modelNames || [])].filter((name) => typeof name === "string" && name.trim()).map((name) => name.trim())));
-  const descriptorFor = (name) => {{
+/// 模型目录 patch 的可执行 JavaScript 核心。
+///
+/// 这段逻辑会同时嵌入 Codex renderer，并由 QuickJS 回归直接执行。任何字段写入都必须
+/// 先通过明确的模型门特征；不能把 React Fiber、Intl context 或普通 API 对象当成模型
+/// 容器遍历和改写。
+fn model_picker_patch_core_script() -> &'static str {
+    r#"
+  const currentPayload = () => state.payload || {};
+  const modelNames = () => {
+    const payload = currentPayload();
+    return Array.from(new Set([payload.defaultModel, ...(payload.modelNames || [])].filter((name) => typeof name === "string" && name.trim()).map((name) => name.trim())));
+  };
+  const descriptorFor = (name) => {
+    const payload = currentPayload();
     const existing = (payload.models || []).find((model) => model && model.model === name);
-    return {{
+    return {
       model: name,
       id: name,
       slug: name,
       name,
       displayName: name,
       hidden: false,
-      defaultReasoningEffort: "medium",
-      supportedReasoningEfforts: reasoningEfforts(),
-      ...(existing || {{}}),
+      ...(existing || {}),
       hidden: false,
-    }};
-  }};
+    };
+  };
   const stringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
   const modelArray = (value, allowEmpty = false) => Array.isArray(value) && (allowEmpty || value.length > 0) && value.every((item) => item && typeof item === "object" && typeof item.model === "string");
-  const patchModelNameArray = (models) => {{
+  const patchModelNameArray = (models) => {
     if (!stringArray(models)) return false;
     let changed = false;
-    for (const name of modelNames()) {{
-      if (!models.includes(name)) {{
+    for (const name of modelNames()) {
+      if (!models.includes(name)) {
         models.push(name);
         changed = true;
-      }}
-    }}
+      }
+    }
     return changed;
-  }};
-  const patchModelArray = (models, allowEmpty = false) => {{
+  };
+  const patchModelArray = (models, allowEmpty = false) => {
     if (!modelArray(models, allowEmpty)) return false;
     const names = modelNames();
     const existing = new Map(models.map((model) => [model.model, model]));
     let changed = false;
-    for (const model of models) {{
-      if (names.includes(model.model) && model.hidden !== false) {{
+    for (const model of models) {
+      if (names.includes(model.model) && model.hidden !== false) {
         model.hidden = false;
         changed = true;
-      }}
-    }}
-    for (const name of names) {{
-      if (!existing.has(name)) {{
+      }
+    }
+    for (const name of names) {
+      if (!existing.has(name)) {
         models.push(descriptorFor(name));
         changed = true;
-      }}
-    }}
+      }
+    }
     return changed;
-  }};
-  const removeHiddenNames = (container, key) => {{
+  };
+  const removeHiddenNames = (container, key) => {
     if (!Array.isArray(container?.[key])) return false;
     const names = new Set(modelNames());
     const before = container[key].length;
     container[key] = container[key].filter((name) => !names.has(name));
     return before !== container[key].length;
-  }};
-  const patchNameSet = (setLike) => {{
+  };
+  const patchNameSet = (setLike) => {
     if (!(setLike instanceof Set)) return false;
     let changed = false;
-    for (const name of modelNames()) {{
-      if (!setLike.has(name)) {{
+    for (const name of modelNames()) {
+      if (!setLike.has(name)) {
         setLike.add(name);
         changed = true;
-      }}
-    }}
+      }
+    }
     return changed;
-  }};
-  const patchModelContainer = (value) => {{
+  };
+  const patchModelContainer = (value) => {
     if (!value || typeof value !== "object") return false;
-    let changed = false;
     const looksLikeModelGate = "availableModels" in value || "available_models" in value || "useHiddenModels" in value || "use_hidden_models" in value || "defaultModel" in value || "default_model" in value;
+    if (!looksLikeModelGate) return false;
+
+    let changed = false;
     if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value || "available_models" in value)) changed = true;
     if (patchModelNameArray(value.models)) changed = true;
     if (patchModelArray(value.data)) changed = true;
@@ -713,37 +736,43 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     if (patchModelNameArray(value.available_models)) changed = true;
     if (removeHiddenNames(value, "hiddenModels")) changed = true;
     if (removeHiddenNames(value, "hidden_models")) changed = true;
-    if (looksLikeModelGate && value.useHiddenModels !== false) {{
+    if ("useHiddenModels" in value && value.useHiddenModels !== false) {
       value.useHiddenModels = false;
       changed = true;
-    }}
-    if (looksLikeModelGate && value.use_hidden_models !== false) {{
+    }
+    if ("use_hidden_models" in value && value.use_hidden_models !== false) {
       value.use_hidden_models = false;
       changed = true;
-    }}
-    if (typeof value.default_model === "string" && modelNames().length && !modelNames().includes(value.default_model)) {{
+    }
+    if ("default_model" in value && typeof value.default_model === "string" && modelNames().length && !modelNames().includes(value.default_model)) {
       value.default_model = modelNames()[0];
       changed = true;
-    }}
-    if (value.defaultModel == null && modelNames().length > 0) {{
+    }
+    if ("defaultModel" in value && value.defaultModel == null && modelNames().length > 0) {
       value.defaultModel = descriptorFor(modelNames()[0]);
       changed = true;
-    }}
+    }
     return changed;
-  }};
-  const patchObjectGraph = (root, visited = new WeakSet(), depth = 0) => {{
-    if (!root || typeof root !== "object" || visited.has(root) || depth > 5) return false;
-    visited.add(root);
-    let changed = patchModelContainer(root);
-    if (root instanceof Element || root === window || root === document || root === document.body || root === document.documentElement) return changed;
-    for (const key of Object.keys(root)) {{
-      if (["ownerDocument", "parentElement", "parentNode", "children", "childNodes"].includes(key)) continue;
-      try {{
-        if (patchObjectGraph(root[key], visited, depth + 1)) changed = true;
-      }} catch {{}}
-    }}
-    return changed;
-  }};
+  };
+"#
+}
+
+/// 构造 renderer 注入脚本：触发新版本地历史目录同步，并修复模型白名单和缓存。
+fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> String {
+    let payload = serde_json::to_string(catalog).unwrap_or_else(|_| "{}".to_string());
+    let model_patch_core = model_picker_patch_core_script();
+    format!(
+        r#"
+(async () => {{
+  const payload = {payload};
+  const patchKey = "{MODEL_PICKER_PATCH_KEY}";
+  const state = window[patchKey] || {{}};
+  state.payload = payload;
+  state.requestIds = state.requestIds || new Set();
+  state.modulePromises = state.modulePromises || new Map();
+  state.failures = state.failures || [];
+  window[patchKey] = state;
+{model_patch_core}
   const patchStatsigConfig = (config) => {{
     const value = config?.value;
     if (!value || typeof value !== "object") return config;
@@ -849,8 +878,13 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     if (Array.isArray(result) && patchModelArray(result, true)) changed = true;
     if (Array.isArray(result?.data) && patchModelArray(result.data, true)) changed = true;
     if (Array.isArray(result?.models) && patchModelArray(result.models, true)) changed = true;
+    if (Array.isArray(result?.result) && patchModelArray(result.result, true)) changed = true;
+    if (Array.isArray(result?.result?.data) && patchModelArray(result.result.data, true)) changed = true;
+    if (Array.isArray(result?.result?.models) && patchModelArray(result.result.models, true)) changed = true;
+    if (Array.isArray(result?.pages?.[0]?.data) && patchModelArray(result.pages[0].data, true)) changed = true;
+    if (Array.isArray(result?.message?.result?.data) && patchModelArray(result.message.result.data, true)) changed = true;
+    if (Array.isArray(result?.message?.result?.models) && patchModelArray(result.message.result.models, true)) changed = true;
     if (patchModelContainer(result)) changed = true;
-    if (patchObjectGraph(result)) changed = true;
     return changed;
   }};
   const patchAppServerResult = (method, result) => {{
@@ -913,16 +947,6 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
       try {{ patchMcpModelResponseData(event?.data); }} catch (error) {{ state.failures.push(String(error?.message || error)); }}
     }}, true);
   }};
-  const installResponsePatch = () => {{
-    if (state.responsePatchInstalled || typeof Response === "undefined") return;
-    state.responsePatchInstalled = true;
-    const originalJson = Response.prototype.json;
-    Response.prototype.json = async function ccSwitchPatchedResponseJson(...args) {{
-      const data = await originalJson.apply(this, args);
-      try {{ patchModelContainer(data); patchObjectGraph(data); }} catch (error) {{ state.failures.push(String(error?.message || error)); }}
-      return data;
-    }};
-  }};
   const reactFiberKeys = (element) => Object.keys(element || {{}}).filter((key) => key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance") || key.startsWith("__reactProps"));
   // Codex app-server 会根据 requires_openai_auth 暴露 OAuth 状态；旧配置或缓存状态
   // 可能把 renderer 留在非 chatgpt 模式，这里只修复前端 context，不改请求路由。
@@ -948,15 +972,12 @@ fn build_model_picker_unlock_script(catalog: &CodexModelCatalogProjection) -> St
     }}
   }};
   const patchReactState = () => {{
-    const visited = new WeakSet();
     const nodes = [document.body, ...document.querySelectorAll("button, [role='menu'], [role='dialog'], [data-radix-popper-content-wrapper]")].filter(Boolean);
     for (const node of nodes.slice(0, 220)) {{
       spoofChatGPTAuthMethod(node);
-      for (const key of reactFiberKeys(node)) patchObjectGraph(node[key], visited);
     }}
   }};
   const run = async () => {{
-    installResponsePatch();
     installMessagePatch();
     await installAppServerPatch();
     void triggerLocalThreadCatalogSync();
@@ -1032,12 +1053,15 @@ Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'ChatGPT.exe
 "#;
 
 /// 查找 Codex Desktop 主进程路径；已运行但未开放 CDP 时不能原地注入。
-fn detect_running_codex_main_process() -> Option<PathBuf> {
+pub(crate) fn detect_running_codex_main_process() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
         let script = DETECT_CODEX_MAIN_PROCESS_SCRIPT;
         let output = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .ok()?;
         if !output.status.success() {
@@ -1135,18 +1159,18 @@ fn is_codex_desktop_executable_path(path: &Path) -> bool {
     })
 }
 
-/// 非 Windows 平台沿用文件名级别的 Desktop shell 校验。
-#[cfg(not(target_os = "windows"))]
+/// macOS 统一壳可能叫 Codex 或 ChatGPT；必须回到 bundle 元数据校验身份与实际主程序。
+#[cfg(target_os = "macos")]
+fn is_codex_desktop_executable_path(path: &Path) -> bool {
+    macos_codex_bundle_for_executable(path).is_some()
+}
+
+/// Linux 等平台沿用文件名级别的 Desktop shell 校验。
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn is_codex_desktop_executable_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(is_codex_desktop_executable_name)
-}
-
-/// 判断路径文件名是否是当前平台的 Desktop shell，而不是小写 CLI/app-server。
-#[cfg(target_os = "macos")]
-fn is_codex_desktop_executable_name(name: &str) -> bool {
-    name == "Codex"
 }
 
 /// 判断路径文件名是否是当前平台的 Desktop shell，而不是小写 CLI/app-server。
@@ -1231,36 +1255,42 @@ fn remember_codex_desktop_executable_at(
     Ok(executable)
 }
 
-/// macOS 上通过 System Events 找到运行中的 Codex.app，再解析 bundle 内部二进制。
+/// macOS 上通过稳定 bundle identifier 找到运行中的 Codex/ChatGPT 统一壳。
 #[cfg(target_os = "macos")]
 fn detect_running_macos_codex_main_process() -> Option<PathBuf> {
-    let script = r#"
+    let script = format!(
+        r#"
 tell application "System Events"
-  set matches to application processes whose name is "Codex"
+  set matches to application processes whose bundle identifier is "{}"
   if (count of matches) is 0 then return ""
   try
     return POSIX path of (application file of item 1 of matches)
   end try
 end tell
-"#;
+"#,
+        CODEX_DESKTOP_BUNDLE_IDENTIFIER
+    );
     if let Some(bundle) = command_stdout_trimmed(Command::new("osascript").arg("-e").arg(script))
         .filter(|path| !path.is_empty())
     {
-        let executable = macos_codex_bundle_executable(Path::new(&bundle));
-        if let Ok(executable) = canonical_codex_desktop_executable_path(&executable) {
-            return Some(executable);
+        if let Some(executable) = macos_codex_bundle_executable(Path::new(&bundle)) {
+            if let Ok(executable) = canonical_codex_desktop_executable_path(&executable) {
+                return Some(executable);
+            }
         }
     }
 
     let mut saw_codex_process = false;
-    for pid in command_stdout_lines(Command::new("pgrep").args(["-x", "Codex"])) {
-        saw_codex_process = true;
-        let path = command_stdout_trimmed(Command::new("ps").args(["-p", &pid, "-o", "comm="]));
-        let Some(path) = path.filter(|path| !path.is_empty()) else {
-            continue;
-        };
-        if let Ok(executable) = canonical_codex_desktop_executable_path(Path::new(&path)) {
-            return Some(executable);
+    for process_name in ["Codex", "ChatGPT"] {
+        for pid in command_stdout_lines(Command::new("pgrep").args(["-x", process_name])) {
+            saw_codex_process = true;
+            let path = command_stdout_trimmed(Command::new("ps").args(["-p", &pid, "-o", "comm="]));
+            let Some(path) = path.filter(|path| !path.is_empty()) else {
+                continue;
+            };
+            if let Ok(executable) = canonical_codex_desktop_executable_path(Path::new(&path)) {
+                return Some(executable);
+            }
         }
     }
     if saw_codex_process {
@@ -1296,21 +1326,17 @@ fn detect_running_linux_codex_main_process() -> Option<PathBuf> {
 fn find_macos_codex_executable() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     for bundle in macos_codex_common_bundle_candidates() {
-        push_codex_desktop_executable_candidate(
-            &mut candidates,
-            Vec::new(),
-            macos_codex_bundle_executable(&bundle),
-        );
+        if let Some(executable) = macos_codex_bundle_executable(&bundle) {
+            push_codex_desktop_executable_candidate(&mut candidates, Vec::new(), executable);
+        }
     }
-    for bundle in command_stdout_lines(
-        Command::new("mdfind")
-            .arg("kMDItemFSName == 'Codex.app' || kMDItemCFBundleIdentifier == 'com.openai.codex'"),
-    ) {
-        push_codex_desktop_executable_candidate(
-            &mut candidates,
-            Vec::new(),
-            macos_codex_bundle_executable(Path::new(&bundle)),
-        );
+    for bundle in command_stdout_lines(Command::new("mdfind").arg(format!(
+        "kMDItemCFBundleIdentifier == '{}' || kMDItemFSName == 'Codex.app'",
+        CODEX_DESKTOP_BUNDLE_IDENTIFIER
+    ))) {
+        if let Some(executable) = macos_codex_bundle_executable(Path::new(&bundle)) {
+            push_codex_desktop_executable_candidate(&mut candidates, Vec::new(), executable);
+        }
     }
 
     candidates.pop().map(|(_, executable)| executable)
@@ -1319,34 +1345,81 @@ fn find_macos_codex_executable() -> Option<PathBuf> {
 /// macOS 常见应用目录候选，覆盖系统级和用户级安装。
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn macos_codex_common_bundle_candidates() -> Vec<PathBuf> {
-    let mut bundles = vec![PathBuf::from("/Applications/Codex.app")];
+    let mut bundles = vec![
+        PathBuf::from("/Applications/Codex.app"),
+        PathBuf::from("/Applications/ChatGPT.app"),
+    ];
     if let Some(home) = std::env::var_os("HOME") {
-        bundles.push(PathBuf::from(home).join("Applications").join("Codex.app"));
+        let applications = PathBuf::from(home).join("Applications");
+        bundles.push(applications.join("Codex.app"));
+        bundles.push(applications.join("ChatGPT.app"));
     }
     bundles
 }
 
-/// 从 macOS `.app` bundle 路径推导 Desktop 主二进制路径。
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn macos_codex_bundle_executable(bundle: &Path) -> PathBuf {
-    bundle.join("Contents").join("MacOS").join("Codex")
+/// 以 bundle 的稳定身份和声明的主程序名构造候选，拒绝路径穿越与独立 ChatGPT。
+#[cfg(any(target_os = "macos", test))]
+fn macos_codex_bundle_executable_from_metadata(
+    bundle: &Path,
+    bundle_identifier: &str,
+    executable_name: &str,
+) -> Option<PathBuf> {
+    if bundle_identifier.trim() != CODEX_DESKTOP_BUNDLE_IDENTIFIER {
+        return None;
+    }
+    let executable_name = executable_name.trim();
+    let executable_path = Path::new(executable_name);
+    if executable_name.is_empty()
+        || executable_path.file_name().and_then(|name| name.to_str()) != Some(executable_name)
+        || executable_path.components().count() != 1
+    {
+        return None;
+    }
+    Some(bundle.join("Contents").join("MacOS").join(executable_name))
 }
 
-/// 如果路径位于 Codex.app 内部，返回对应 bundle 路径，便于使用 macOS `open` 启动。
+/// 读取 macOS bundle 的 Info.plist 字段；使用系统绝对路径，避免 GUI PATH 差异。
+#[cfg(target_os = "macos")]
+fn macos_bundle_info_value(bundle: &Path, key: &str) -> Option<String> {
+    let info_plist = bundle.join("Contents").join("Info.plist");
+    command_stdout_trimmed(
+        Command::new("/usr/bin/plutil")
+            .arg("-extract")
+            .arg(key)
+            .arg("raw")
+            .arg("-o")
+            .arg("-")
+            .arg(info_plist),
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
+/// 从 macOS `.app` 的真实元数据解析 Desktop 主二进制路径。
+#[cfg(target_os = "macos")]
+fn macos_codex_bundle_executable(bundle: &Path) -> Option<PathBuf> {
+    let bundle_identifier = macos_bundle_info_value(bundle, "CFBundleIdentifier")?;
+    let executable_name = macos_bundle_info_value(bundle, "CFBundleExecutable")?;
+    macos_codex_bundle_executable_from_metadata(bundle, &bundle_identifier, &executable_name)
+}
+
+/// 找到受支持的顶层包装；Framework 内部 Service.app 不会提前截断搜索。
+#[cfg(any(target_os = "macos", test))]
+fn macos_codex_bundle_ancestor(executable: &Path) -> Option<PathBuf> {
+    executable.ancestors().find_map(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| *name == "Codex.app" || *name == "ChatGPT.app")
+            .map(|_| path.to_path_buf())
+    })
+}
+
+/// 如果路径属于 bundle 元数据声明的主程序，返回对应 bundle，便于使用 `open` 启动。
 #[cfg(target_os = "macos")]
 fn macos_codex_bundle_for_executable(executable: &Path) -> Option<PathBuf> {
-    let mut current = executable.parent();
-    while let Some(path) = current {
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "Codex.app")
-        {
-            return Some(path.to_path_buf());
-        }
-        current = path.parent();
-    }
-    None
+    let bundle = macos_codex_bundle_ancestor(executable)?;
+    let declared_executable = macos_codex_bundle_executable(&bundle)?;
+    (declared_executable == executable).then_some(bundle)
 }
 
 /// 查找 Linux 常见 Desktop/AppImage 安装位置，避免把小写 CLI `codex` 当成 Desktop。
@@ -1756,8 +1829,11 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 /// 执行 PowerShell 并解析 JSON 输出，统一处理空输出和脚本失败。
 #[cfg(target_os = "windows")]
 fn powershell_json_value(script: &str) -> Option<Value> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -1832,6 +1908,53 @@ mod tests {
     }
 
     #[test]
+    fn codex_startup_toggle_is_explicit_and_idempotent() {
+        assert!(!should_launch_codex_desktop_with_ccswitch(false, false));
+        assert!(!should_launch_codex_desktop_with_ccswitch(false, true));
+        assert!(should_launch_codex_desktop_with_ccswitch(true, false));
+        assert!(!should_launch_codex_desktop_with_ccswitch(true, true));
+    }
+
+    /// 按当前平台构造一个能通过 Desktop 主程序校验的测试文件。
+    ///
+    /// Windows/Linux 是文件名级校验，直接写文件即可；macOS 要求 bundle 元数据
+    /// （CFBundleIdentifier=com.openai.codex + CFBundleExecutable），构造最小
+    /// Codex.app 结构（44b9de42 起 macOS 校验以 bundle 身份为准）。
+    fn write_desktop_test_executable(dir: &Path) -> PathBuf {
+        let name = desktop_test_executable_name();
+        if cfg!(target_os = "macos") {
+            let bundle = dir.join("Codex.app");
+            let contents = bundle.join("Contents");
+            let macos_dir = contents.join("MacOS");
+            std::fs::create_dir_all(&macos_dir).expect("create fake bundle MacOS dir");
+            std::fs::write(
+                contents.join("Info.plist"),
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>{name}</string>
+    <key>CFBundleIdentifier</key>
+    <string>{CODEX_DESKTOP_BUNDLE_IDENTIFIER}</string>
+</dict>
+</plist>
+"#
+                ),
+            )
+            .expect("write fake bundle Info.plist");
+            let executable = macos_dir.join(name);
+            std::fs::write(&executable, "").expect("write fake bundle executable");
+            executable
+        } else {
+            let executable = dir.join(name);
+            std::fs::write(&executable, "").expect("write desktop exe");
+            executable
+        }
+    }
+
+    #[test]
     fn catalog_projection_accepts_model_and_slug_fields() {
         let value = json!({
             "models": [
@@ -1844,6 +1967,17 @@ mod tests {
         assert_eq!(names, vec!["qwen3.6", "deepseek-v4-flash", "gpt-5.4-mini"]);
         assert!(models.iter().all(|model| model["hidden"] == false));
         assert_eq!(models[0]["displayName"], "Qwen 3.6");
+    }
+
+    #[test]
+    fn catalog_projection_does_not_invent_unknown_reasoning_defaults() {
+        let value = json!({
+            "models": [{ "model": "unknown-third-party", "display_name": "Unknown" }]
+        });
+        let (_, models) = codex_model_entries_from_catalog_value(&value);
+
+        assert!(models[0].get("defaultReasoningEffort").is_none());
+        assert!(models[0].get("supportedReasoningEfforts").is_none());
     }
 
     #[test]
@@ -1870,6 +2004,148 @@ mod tests {
             vec!["gpt-5.6-sol".to_string(), "qwen3.6".to_string()]
         );
         assert_eq!(projection.default_model.as_deref(), Some("qwen3.6"));
+    }
+
+    fn run_model_picker_patch_core_probe(probe: &str) -> serde_json::Value {
+        run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "qwen3.6",
+                "modelNames": ["qwen3.6", "deepseek-v4-flash"],
+                "models": [
+                    {"model": "qwen3.6", "displayName": "Qwen 3.6", "hidden": false},
+                    {"model": "deepseek-v4-flash", "displayName": "DeepSeek V4 Flash", "hidden": false}
+                ]
+            }),
+            probe,
+        )
+    }
+
+    fn run_model_picker_patch_core_probe_with_payload(
+        payload: Value,
+        probe: &str,
+    ) -> serde_json::Value {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            "const payload = {};\nconst state = {{ payload }};\n{}\n{}",
+            payload,
+            model_picker_patch_core_script(),
+            probe
+        );
+
+        context.with(|ctx| {
+            let json_text: String = ctx.eval(script).expect("execute model picker patch core");
+            serde_json::from_str(&json_text).expect("parse model picker patch probe result")
+        })
+    }
+
+    #[test]
+    fn model_picker_fallback_descriptor_does_not_invent_reasoning_capability() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "unknown-third-party",
+                "modelNames": ["unknown-third-party"],
+                "models": []
+            }),
+            r#"
+const descriptor = descriptorFor("unknown-third-party");
+JSON.stringify({
+  hasDefault: Object.prototype.hasOwnProperty.call(descriptor, "defaultReasoningEffort"),
+  hasEfforts: Object.prototype.hasOwnProperty.call(descriptor, "supportedReasoningEfforts"),
+});
+"#,
+        );
+
+        assert_eq!(result["hasDefault"], false);
+        assert_eq!(result["hasEfforts"], false);
+    }
+
+    /// 回归：模型解锁器不能再给 React Intl 的 formats/defaultFormats/formatters
+    /// 写入 defaultModel/useHiddenModels，否则 MessageFormat 缓存会因循环引用失败并回退
+    /// 为未插值的 ICU source。
+    #[test]
+    fn model_picker_patch_core_does_not_pollute_react_intl_objects() {
+        let result = run_model_picker_patch_core_probe(
+            r#"
+const intl = {
+  formats: {number: {compact: {notation: "compact"}}},
+  defaultFormats: {date: {short: {year: "numeric"}}},
+  formatters: {cache: {message: {}}},
+};
+const before = JSON.stringify(intl);
+const changed = [intl, intl.formats, intl.defaultFormats, intl.formatters]
+  .map((value) => patchModelContainer(value));
+JSON.stringify({before, after: JSON.stringify(intl), changed});
+"#,
+        );
+
+        assert_eq!(result["before"], result["after"]);
+        assert_eq!(result["changed"], json!([false, false, false, false]));
+    }
+
+    /// 已验证的模型门仍应补齐目录、解除隐藏并设置已有的默认模型字段；同时不能
+    /// 凭空向 camelCase 容器追加 snake_case 控制字段。
+    #[test]
+    fn model_picker_patch_core_still_unlocks_explicit_model_gate() {
+        let result = run_model_picker_patch_core_probe(
+            r#"
+const gate = {availableModels: ["gpt-5.6-sol"], useHiddenModels: true, defaultModel: null};
+const changed = patchModelContainer(gate);
+JSON.stringify({
+  changed,
+  availableModels: gate.availableModels,
+  useHiddenModels: gate.useHiddenModels,
+  defaultModel: gate.defaultModel?.model,
+  hasSnakeCaseFlag: Object.prototype.hasOwnProperty.call(gate, "use_hidden_models"),
+});
+"#,
+        );
+
+        assert_eq!(result["changed"], true);
+        assert_eq!(
+            result["availableModels"],
+            json!(["gpt-5.6-sol", "qwen3.6", "deepseek-v4-flash"])
+        );
+        assert_eq!(result["useHiddenModels"], false);
+        assert_eq!(result["defaultModel"], "qwen3.6");
+        assert_eq!(result["hasSnakeCaseFlag"], false);
+    }
+
+    #[test]
+    fn model_picker_patch_core_uses_latest_shared_catalog_payload() {
+        let result = run_model_picker_patch_core_probe_with_payload(
+            json!({
+                "defaultModel": "qwen3.8",
+                "modelNames": ["qwen3.8"],
+                "models": [{ "model": "qwen3.8", "hidden": false }]
+            }),
+            r#"
+const first = [];
+patchModelArray(first, true);
+state.payload = {
+  defaultModel: "deepseek-v4-flash",
+  modelNames: ["deepseek-v4-flash", "deepseek-v4-vision"],
+  models: [
+    {model: "deepseek-v4-flash", hidden: false},
+    {model: "deepseek-v4-vision", inputModalities: ["text", "image"], hidden: false},
+  ],
+};
+const second = [];
+patchModelArray(second, true);
+JSON.stringify({
+  first: first.map((model) => model.model),
+  second: second.map((model) => model.model),
+  modalities: second.find((model) => model.model === "deepseek-v4-vision")?.inputModalities,
+});
+"#,
+        );
+
+        assert_eq!(result["first"], json!(["qwen3.8"]));
+        assert_eq!(
+            result["second"],
+            json!(["deepseek-v4-flash", "deepseek-v4-vision"])
+        );
+        assert_eq!(result["modalities"], json!(["text", "image"]));
     }
 
     #[test]
@@ -2022,8 +2298,7 @@ mod tests {
     #[test]
     fn codex_desktop_executable_validation_rejects_cli_launcher() {
         let desktop_dir = tempfile::tempdir().expect("create desktop temp dir");
-        let desktop = desktop_dir.path().join(desktop_test_executable_name());
-        std::fs::write(&desktop, "").expect("write desktop exe");
+        let desktop = write_desktop_test_executable(desktop_dir.path());
         let resolved = canonical_codex_desktop_executable_path(&desktop)
             .expect("platform Desktop executable should be accepted");
         assert!(resolved.ends_with(desktop_test_executable_name()));
@@ -2072,8 +2347,7 @@ mod tests {
     #[test]
     fn remembered_codex_desktop_executable_round_trips_confirmed_path() {
         let desktop_dir = tempfile::tempdir().expect("create confirmed desktop temp dir");
-        let desktop = desktop_dir.path().join(desktop_test_executable_name());
-        std::fs::write(&desktop, "").expect("write desktop exe");
+        let desktop = write_desktop_test_executable(desktop_dir.path());
         let state_dir = tempfile::tempdir().expect("create state temp dir");
         let state_path = state_dir
             .path()
@@ -2088,13 +2362,82 @@ mod tests {
         assert!(loaded.ends_with(desktop_test_executable_name()));
     }
 
-    /// 验证 macOS `.app` bundle 会解析到内部 Desktop 主二进制。
+    /// 旧 Codex.app 和统一 ChatGPT.app 都必须按 bundle 元数据解析主程序，不能硬编码壳名称。
     #[test]
-    fn macos_codex_bundle_candidate_points_to_internal_binary() {
+    fn macos_codex_bundle_metadata_accepts_legacy_and_unified_shells() {
         assert_eq!(
-            macos_codex_bundle_executable(Path::new("/Applications/Codex.app")),
-            PathBuf::from("/Applications/Codex.app/Contents/MacOS/Codex")
+            macos_codex_bundle_executable_from_metadata(
+                Path::new("/Applications/Codex.app"),
+                "com.openai.codex",
+                "Codex",
+            ),
+            Some(PathBuf::from(
+                "/Applications/Codex.app/Contents/MacOS/Codex"
+            ))
         );
+        assert_eq!(
+            macos_codex_bundle_executable_from_metadata(
+                Path::new("/Applications/ChatGPT.app"),
+                "com.openai.codex",
+                "ChatGPT",
+            ),
+            Some(PathBuf::from(
+                "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+            ))
+        );
+    }
+
+    /// 独立 ChatGPT 即使目录和主程序同名，也不能进入 Codex Desktop/CDP 链路。
+    #[test]
+    fn macos_chatgpt_bundle_rejects_non_codex_identity_and_unsafe_executable_names() {
+        assert_eq!(
+            macos_codex_bundle_executable_from_metadata(
+                Path::new("/Applications/ChatGPT.app"),
+                "com.openai.chat",
+                "ChatGPT",
+            ),
+            None
+        );
+        assert_eq!(
+            macos_codex_bundle_executable_from_metadata(
+                Path::new("/Applications/ChatGPT.app"),
+                "com.openai.codex",
+                "../Codex",
+            ),
+            None
+        );
+    }
+
+    /// 反查 bundle 时兼容两代包装，但拒绝 Framework 内部 Service.app 和无关应用。
+    #[test]
+    fn macos_codex_bundle_ancestor_accepts_only_supported_top_level_shells() {
+        assert_eq!(
+            macos_codex_bundle_ancestor(Path::new("/Applications/Codex.app/Contents/MacOS/Codex")),
+            Some(PathBuf::from("/Applications/Codex.app"))
+        );
+        assert_eq!(
+            macos_codex_bundle_ancestor(Path::new(
+                "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+            )),
+            Some(PathBuf::from("/Applications/ChatGPT.app"))
+        );
+        assert_eq!(
+            macos_codex_bundle_ancestor(Path::new("/Applications/Other.app/Contents/MacOS/Other")),
+            None
+        );
+    }
+
+    /// Spotlight 不可用时也必须从系统和用户 Applications 目录发现统一壳。
+    #[test]
+    fn macos_common_candidates_include_legacy_and_unified_bundles() {
+        let candidates = macos_codex_common_bundle_candidates();
+        assert!(candidates.contains(&PathBuf::from("/Applications/Codex.app")));
+        assert!(candidates.contains(&PathBuf::from("/Applications/ChatGPT.app")));
+        if let Some(home) = std::env::var_os("HOME") {
+            let applications = PathBuf::from(home).join("Applications");
+            assert!(candidates.contains(&applications.join("Codex.app")));
+            assert!(candidates.contains(&applications.join("ChatGPT.app")));
+        }
     }
 
     /// 验证 Linux desktop entry 只提取绝对路径 Exec，忽略包装命令。

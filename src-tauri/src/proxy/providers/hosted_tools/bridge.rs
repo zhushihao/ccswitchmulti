@@ -130,6 +130,7 @@ pub(crate) fn scan_hosted_tool_calls(chat_response: &Value) -> HostedToolCallSca
 ///
 /// 返回:
 /// - `true` 表示成功追加；`false` 表示缺少 messages 或 assistant message。
+///
 /// 副作用:
 /// - 修改 `chat_request.messages`，并确保后续请求为非流式。
 pub(crate) fn append_tool_outputs_to_chat_request(
@@ -362,6 +363,39 @@ fn log_hosted_tool_event(
         }
         crate::proxy::codex_router_log::append_event("hosted_tool_call", &fields);
     }
+}
+
+/// 写入“hosted tool 已投影但上游没有发起调用”的脱敏诊断事件。
+///
+/// 该事件只在调用方已经明确要求某个 hosted tool 时写入；普通
+/// `tool_choice=auto` 下模型自然选择不搜索不应被标记为故障。
+pub(crate) fn log_hosted_tool_not_called(
+    trace_id: Option<&str>,
+    session: &str,
+    model: &str,
+    provider: &str,
+    tool: &str,
+    streaming: bool,
+) {
+    let Some(trace_id) = trace_id else {
+        return;
+    };
+    crate::proxy::codex_router_log::append_event(
+        "hosted_tool_not_called",
+        &[
+            ("trace", trace_id.to_string()),
+            ("session", session.to_string()),
+            ("model", model.to_string()),
+            ("provider", provider.to_string()),
+            ("tool", tool.to_string()),
+            ("status", "not_called".to_string()),
+            (
+                "reason",
+                "upstream_returned_success_without_hosted_tool_call".to_string(),
+            ),
+            ("streaming", streaming.to_string()),
+        ],
+    );
 }
 
 /// 裁剪错误文本，避免把上游长响应或敏感上下文回填给模型。

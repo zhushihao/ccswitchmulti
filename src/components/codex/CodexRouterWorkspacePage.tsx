@@ -28,6 +28,7 @@ import {
   Activity,
   AlertTriangle,
   ArrowRight,
+  Bot,
   Bug,
   CheckCircle2,
   Clipboard,
@@ -53,6 +54,14 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Tooltip,
@@ -61,6 +70,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { providersApi } from "@/lib/api";
+import type {
+  CodexMultiRouterMigrationPreview,
+  CodexRoutingProjectionStatus,
+} from "@/lib/api/providers";
 import { authApi, type CodexAccountPoolPolicy } from "@/lib/api/auth";
 import {
   fetchCodexOauthCachedModels,
@@ -68,6 +81,7 @@ import {
   fetchModelsForConfig,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
+import type { CodexGuardianStatus } from "@/types/proxy";
 import { proxyApi } from "@/lib/api/proxy";
 import {
   codexOfficialAuthRouteBinding,
@@ -77,7 +91,6 @@ import {
   readWizardCodexOAuthAccountId,
   resolveWizardModelNameCollisions,
 } from "@/lib/codexMultiRouterWizard";
-import { syncCodexMultiRouterPlanWithProviders } from "@/lib/codexMultiRouterSync";
 import {
   DEFAULT_HOSTED_TOOLS_CONFIG,
   readHostedToolsConfig,
@@ -110,15 +123,22 @@ import {
   codexPlanModelListAction,
   isCodexCatalogOnlyPlanModelFetch,
 } from "@/utils/codexPlanModelFetch";
+import { normalizeCodexSubagentVersion } from "@/utils/codexSubagentVersion";
 import { useCodexOauth } from "@/components/providers/forms/hooks/useCodexOauth";
 import { HostedToolsSwitchPanel } from "./HostedToolsSwitchPanel";
+import { CodexSubagentProfileEditor } from "./CodexSubagentProfileEditor";
 import type {
   CodexOfficialAuthConfig,
   CodexOfficialAuthMode,
   CodexRoutingConfig,
+  CodexRoutingAuth,
+  CodexRoutingConfigV2,
+  CodexRoutingRouteV2,
+  CodexSubagentVersion,
   Provider,
 } from "@/types";
 import type { RequestLog } from "@/types/usage";
+import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
 import type {
   CodexDiagnosticCheck,
   CodexDiagnosticStatus,
@@ -134,6 +154,8 @@ export type WorkspaceTab =
   | "overview"
   | "sources"
   | "routes"
+  | "model-order"
+  | "subagents"
   | "status"
   | "test";
 
@@ -164,10 +186,15 @@ type CodexRoute = {
     models?: string[];
     prefixes?: string[];
   };
+  modelSelection?: { mode: "all" } | { mode: "include"; models: string[] };
+  matchPrefixes?: string[];
+  aliases?: Record<string, string>;
+  authPolicy?: CodexRoutingAuth;
   upstream?: {
     baseUrl?: string;
     base_url?: string;
     apiFormat?: string;
+    apiFormatSource?: "provider" | "route_override";
     wireApi?: string;
     wire_api?: string;
     targetProviderId?: string;
@@ -194,9 +221,13 @@ type CodexRoute = {
 type CodexRouteCapabilities = NonNullable<CodexRoute["capabilities"]>;
 
 type CodexRouting = {
+  schemaVersion?: 2;
   enabled?: boolean;
   defaultRouteId?: string;
   officialAuth?: CodexOfficialAuthConfig;
+  subagentVersion?: CodexSubagentVersion;
+  subagentV2?: CodexRoutingConfigV2["subagentV2"];
+  spawnAgentModels?: string[];
   routes?: CodexRoute[];
 };
 
@@ -242,10 +273,91 @@ type RouteCandidate = {
   id: string;
   route: CodexRoute;
   provider?: Provider;
+  canonicalProvider?: Provider;
   isExisting: boolean;
   matchModels: string[];
   matchPrefixes: string[];
 };
+
+type RoutePolicyDraft = {
+  route: CodexRoute;
+  prefixesText: string;
+  aliasesText: string;
+};
+
+function parseRoutePolicyList(value: string): string[] {
+  return Array.from(
+    new Set(
+      value
+        .split(/[,\n]/)
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function parseRouteAliases(value: string): {
+  aliases: Record<string, string>;
+  error?: string;
+} {
+  const aliases: Record<string, string> = {};
+  for (const entry of value.split(/[,\n]/)) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const separator = trimmed.indexOf("=");
+    if (separator <= 0 || separator === trimmed.length - 1) {
+      return {
+        aliases,
+        error: `别名格式无效：${trimmed}，请使用“可见模型=上游模型”`,
+      };
+    }
+    const visible = trimmed.slice(0, separator).trim();
+    const canonical = trimmed.slice(separator + 1).trim();
+    if (!visible || !canonical) {
+      return {
+        aliases,
+        error: `别名格式无效：${trimmed}，请使用“可见模型=上游模型”`,
+      };
+    }
+    aliases[visible] = canonical;
+  }
+  return { aliases };
+}
+
+function routeAliasesText(aliases?: Record<string, string>): string {
+  return Object.entries(aliases ?? {})
+    .map(([visible, canonical]) => `${visible}=${canonical}`)
+    .join("\n");
+}
+
+function collectProviderCanonicalModelIds(provider?: Provider): string[] {
+  return provider ? collectProviderModelIds(provider) : [];
+}
+
+// 编辑草稿必须保持持久化 route 的身份字段不变。展示名由渲染层解析，不能借
+// 创建草稿的机会写回 label，否则一次仅为查看/保存的 UI 操作会改变旧 route 的
+// 语义回退路径。
+export function createRoutePolicyDraft(
+  candidate: RouteCandidate,
+): RoutePolicyDraft {
+  const route = candidate.route;
+  return {
+    route: {
+      ...route,
+      modelSelection: route.modelSelection ?? { mode: "all" },
+      matchPrefixes: route.matchPrefixes ?? route.match?.prefixes ?? [],
+      aliases: route.aliases ?? route.upstream?.modelMap ?? {},
+      authPolicy: route.authPolicy ??
+        (route.upstream?.auth as CodexRoutingAuth | undefined) ?? {
+          source: "provider_config",
+        },
+    },
+    prefixesText: (route.matchPrefixes ?? route.match?.prefixes ?? []).join(
+      ", ",
+    ),
+    aliasesText: routeAliasesText(route.aliases ?? route.upstream?.modelMap),
+  };
+}
 
 /// 将用于人眼识别的 route/provider 文本规整成稳定 key，供旧配置和新 provider 做语义匹配。
 function normalizedRouteIdentityText(value?: string | null): string {
@@ -294,22 +406,27 @@ function findSemanticRouteProvider(
     .map(normalizedRouteIdentityText)
     .filter(Boolean);
 
-  return modelSources.find((source) => {
+  const providerNameMatches = modelSources.filter((source) => {
     const providerNames = [source.id, source.name, source.meta?.providerType]
       .map((value) =>
         typeof value === "string" ? normalizedRouteIdentityText(value) : "",
       )
       .filter(Boolean);
-    if (
+    return (
       routeNames.some((name) => providerNames.includes(name)) ||
       providerNames.some((name) => routeNames.includes(name))
-    ) {
-      return true;
-    }
+    );
+  });
+  if (providerNameMatches.length === 1) return providerNameMatches[0];
+  if (providerNameMatches.length > 1) return undefined;
 
+  const providerModelMatches = modelSources.filter((source) => {
     const providerModels = providerRouteModelIdentitySet(source);
     return routeModels.some((model) => providerModels.has(model));
   });
+  return providerModelMatches.length === 1
+    ? providerModelMatches[0]
+    : undefined;
 }
 
 /// route 去重以真实目标 provider 优先；没有目标 provider 的旧 route 则退回到语义匹配出的 provider。
@@ -345,7 +462,6 @@ type MultiRouterSettingsDraft = {
   name: string;
   notes?: string;
   enabled: boolean;
-  defaultRouteId?: string;
   officialAuth: CodexOfficialAuthConfig;
   hostedTools: {
     webSearch: boolean;
@@ -409,7 +525,6 @@ type ProviderModelRefreshResult =
       status: "updated";
       models: FetchedModel[];
       nextProvider: Provider;
-      affectedPlans: Provider[];
       usedCodexCache?: boolean;
       onlineErrorMessage?: string;
     };
@@ -454,6 +569,17 @@ type CodexCatalogModelDraft = {
   supportsImage?: boolean;
   supports_image?: boolean;
   vision?: boolean;
+  supportsParallelToolCalls?: boolean;
+  supports_parallel_tool_calls?: boolean;
+  baseInstructions?: string;
+  base_instructions?: string;
+  apiFormat?: CodexCatalogModel["apiFormat"];
+  api_format?: CodexCatalogModel["api_format"];
+  codexCache?: CodexCatalogModel["codexCache"];
+  codex_cache?: CodexCatalogModel["codex_cache"];
+  sortIndex?: number;
+  reasoning?: CodexCatalogModel["reasoning"];
+  codexUltra?: CodexCatalogModel["codexUltra"];
   capabilities?: CodexRouteCapabilities;
 };
 
@@ -520,7 +646,7 @@ function withModelRefreshTimeout<T>(
       onTimeout?.();
       reject(
         new Error(
-          `模型列表读取或写回超过 ${Math.round(timeoutMs / 1000)} 秒，请检查网络、provider /models 端点或本地配置写入状态。`,
+          `模型列表读取或写回超过 ${Math.round(timeoutMs / 1000)} 秒，请检查网络、供应商的 /models 接口或本地配置写入状态。`,
         ),
       );
     }, timeoutMs);
@@ -529,9 +655,30 @@ function withModelRefreshTimeout<T>(
   });
 }
 
-/// 将未知异常转成 UI 可展示文本，避免每个 catch 重复 `instanceof Error`。
-function workspaceErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/// 将后端机器码集中翻译为用户可执行的中文信息；原始详情仍保留在后端日志中。
+export function workspaceErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const knownMessages: Array<[string, string]> = [
+    ["include_models_empty", "请至少选择一个上游模型"],
+    [
+      "include_models_duplicate_or_empty",
+      "上游模型列表包含空项或重复项，请重新选择",
+    ],
+    ["alias_target_not_selected", "别名目标必须是当前已选择的上游模型"],
+    ["route_target_provider_required", "该路由还没有选择目标供应商"],
+    [
+      "legacy_route_requires_migration",
+      "当前是旧版路由配置，请先完成迁移后再保存",
+    ],
+  ];
+  const matched = knownMessages.find(([code]) => message.includes(code));
+  if (matched) return matched[1];
+  if (/[^\x00-\x7f]/.test(message)) return message;
+
+  const errorCode = message.match(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/)?.[0];
+  return errorCode
+    ? `操作失败，请查看日志中的详细原因（错误代码：${errorCode}）`
+    : "操作失败，请检查当前配置或查看日志中的详细原因";
 }
 
 /// 读取 provider 模型列表；官方 OAuth 在线失败时回退到本地 Codex 模型缓存。
@@ -708,6 +855,11 @@ function providerWithFetchedModelCatalog(
         ? { supports_image: model.supports_image }
         : {}),
       ...(model.vision !== undefined ? { vision: model.vision } : {}),
+      ...(model.sortIndex !== undefined ? { sortIndex: model.sortIndex } : {}),
+      // 模型目录刷新必须保留已有 reasoning 声明（用户手动声明的档位/能力）。
+      // 否则 /models 拉取重建会把声明清空，导致档位消失（K3/Qwen 均受影响）。
+      ...(model.reasoning ? { reasoning: model.reasoning } : {}),
+      ...(model.codexUltra ? { codexUltra: model.codexUltra } : {}),
     } satisfies CodexCatalogModelDraft;
   });
   const byFetchedModel = new Map<string, number>();
@@ -944,10 +1096,43 @@ export function readCodexRouting(
   if (Array.isArray(routing)) {
     return {
       enabled: true,
+      subagentVersion: "v2",
       routes: routing.map(normalizeLegacyCodexRoutingRoute),
     };
   }
-  return routing as CodexRouting;
+  if ((routing as { schemaVersion?: unknown }).schemaVersion === 2) {
+    const v2 = routing as CodexRoutingConfigV2;
+    return {
+      schemaVersion: 2,
+      enabled: v2.enabled,
+      defaultRouteId: v2.defaultRouteId,
+      subagentVersion: normalizeCodexSubagentVersion(v2.subagentVersion),
+      subagentV2: v2.subagentV2,
+      spawnAgentModels: v2.spawnAgentModels ?? [],
+      routes: v2.routes.map((route) => {
+        const modelSelection = route.modelSelection ?? { mode: "all" as const };
+        return {
+          ...route,
+          modelSelection,
+          match: {
+            models:
+              modelSelection.mode === "include" ? modelSelection.models : [],
+            prefixes: route.matchPrefixes ?? [],
+          },
+          upstream: {
+            auth: route.authPolicy,
+            modelMap: route.aliases,
+          },
+        };
+      }),
+    };
+  }
+  return {
+    ...(routing as Omit<CodexRouting, "subagentVersion">),
+    subagentVersion: normalizeCodexSubagentVersion(
+      (routing as { subagentVersion?: unknown }).subagentVersion,
+    ),
+  };
 }
 
 /// 将旧版扁平 route 数组条目转换成新版 `codexRouting.routes[]` 条目，避免保存时清空历史路由。
@@ -1062,6 +1247,50 @@ function routeTargetProvider(
 ): Provider | undefined {
   const targetProviderId = routeTargetProviderId(route);
   return targetProviderId ? providersById.get(targetProviderId) : undefined;
+}
+
+/// 规则名称优先使用用户可读 label；历史 route 缺少 label 时跟随目标 Provider 名称，最后才暴露稳定 ID。
+function routeDisplayName(
+  route: CodexRoute,
+  providersById: Map<string, Provider>,
+  fallback = "未命名规则",
+): string {
+  const label = route.label?.trim();
+  const routeId = route.id?.trim();
+  if (label && (!routeId || label.toLowerCase() !== routeId.toLowerCase())) {
+    return label;
+  }
+  const providerName = routeTargetProvider(route, providersById)?.name?.trim();
+  return providerName || label || routeId || fallback;
+}
+
+export function routeSummaryDisplayName(
+  label: string | null | undefined,
+  routeId: string | null | undefined,
+  providerName: string | null | undefined,
+  fallback = "未命名规则",
+): string {
+  const normalizedLabel = label?.trim();
+  const normalizedRouteId = routeId?.trim();
+  if (
+    normalizedLabel &&
+    (!normalizedRouteId ||
+      normalizedLabel.toLowerCase() !== normalizedRouteId.toLowerCase())
+  ) {
+    return normalizedLabel;
+  }
+  return (
+    providerName?.trim() || normalizedLabel || normalizedRouteId || fallback
+  );
+}
+
+function routeDisplayTitle(
+  routeName: string,
+  routeId: string | null | undefined,
+): string | undefined {
+  const normalizedRouteId = routeId?.trim();
+  if (!normalizedRouteId || routeName === normalizedRouteId) return undefined;
+  return `${routeName}（ID: ${normalizedRouteId}）`;
 }
 
 /// 把 provider 或 route 标识清理成稳定的路由 ID 片段；空值回退到 fallback，避免保存后出现不可选规则。
@@ -1263,24 +1492,57 @@ function normalizeRouteCapabilitiesFromProvider(
 function catalogDraftFromSourceModel(
   id: string,
   source?: CodexCatalogModelDraft | CodexCatalogModel,
+  provider?: Provider,
 ): CodexCatalogModelDraft {
+  const settings = provider?.settingsConfig;
   const displayName = source?.displayName ?? source?.display_name;
   const upstreamModel = source?.upstreamModel ?? source?.upstream_model;
-  const contextWindow = source?.contextWindow ?? source?.context_window;
+  const contextWindow =
+    source?.contextWindow ??
+    source?.context_window ??
+    settings?.contextWindow ??
+    settings?.context_window ??
+    settings?.modelContextWindow;
+  const inputModalities =
+    source?.inputModalities ??
+    source?.input_modalities ??
+    settings?.inputModalities ??
+    settings?.input_modalities;
+  const reasoning =
+    source?.reasoning ??
+    settings?.reasoning ??
+    settings?.codexChatReasoning ??
+    settings?.codex_chat_reasoning ??
+    provider?.meta?.codexChatReasoning;
+  const codexCache =
+    source?.codexCache ??
+    source?.codex_cache ??
+    settings?.codexCache ??
+    settings?.codex_cache ??
+    provider?.meta?.codexCache;
+  const apiFormat =
+    source?.apiFormat ??
+    source?.api_format ??
+    provider?.meta?.apiFormat ??
+    settings?.apiFormat ??
+    settings?.api_format;
+  const effectiveSource = {
+    ...(source ?? {}),
+    model: id,
+    ...(inputModalities ? { inputModalities } : {}),
+  };
   const capabilities = capabilitiesFromImageSupport(
-    source ? imageSupportFromCatalogModel(source) : undefined,
+    source || inputModalities
+      ? imageSupportFromCatalogModel(effectiveSource)
+      : undefined,
   );
   return {
     model: id,
     ...(upstreamModel && upstreamModel !== id ? { upstreamModel } : {}),
     ...(displayName ? { displayName } : {}),
     ...(contextWindow ? { contextWindow } : {}),
-    ...(source?.inputModalities
-      ? { inputModalities: source.inputModalities }
-      : {}),
-    ...(source?.input_modalities
-      ? { input_modalities: source.input_modalities }
-      : {}),
+    ...(reasoning ? { reasoning } : {}),
+    ...(inputModalities ? { inputModalities } : {}),
     ...(source?.textOnly !== undefined ? { textOnly: source.textOnly } : {}),
     ...(source?.text_only !== undefined ? { text_only: source.text_only } : {}),
     ...(source?.supportsImage !== undefined
@@ -1290,6 +1552,20 @@ function catalogDraftFromSourceModel(
       ? { supports_image: source.supports_image }
       : {}),
     ...(source?.vision !== undefined ? { vision: source.vision } : {}),
+    ...(source?.supportsParallelToolCalls !== undefined
+      ? { supportsParallelToolCalls: source.supportsParallelToolCalls }
+      : source?.supports_parallel_tool_calls !== undefined
+        ? { supportsParallelToolCalls: source.supports_parallel_tool_calls }
+        : {}),
+    ...(source?.baseInstructions
+      ? { baseInstructions: source.baseInstructions }
+      : source?.base_instructions
+        ? { baseInstructions: source.base_instructions }
+        : {}),
+    ...(apiFormat ? { apiFormat } : {}),
+    ...(codexCache ? { codexCache } : {}),
+    ...(source?.codexUltra ? { codexUltra: source.codexUltra } : {}),
+    ...(source?.sortIndex !== undefined ? { sortIndex: source.sortIndex } : {}),
     ...(capabilities ? { capabilities } : {}),
   };
 }
@@ -1305,7 +1581,7 @@ function buildModelCatalogDraftFromSources(
     for (const catalogModel of sourceCatalogModels) {
       const id = catalogModel.model?.trim();
       if (!id || byModel.has(id)) continue;
-      byModel.set(id, catalogDraftFromSourceModel(id, catalogModel));
+      byModel.set(id, catalogDraftFromSourceModel(id, catalogModel, provider));
     }
 
     for (const model of collectProviderModelIds(provider)) {
@@ -1378,29 +1654,27 @@ function createRouteFromProvider(
 ): CodexRoute {
   const modelIds = collectProviderModelIds(provider);
   const prefixes = inferProviderPrefixes(provider, modelIds);
-  const capabilities = inferRouteCapabilitiesFromProvider(provider, modelIds);
   const modelMap = buildRouteModelMapFromProvider(provider);
+  const authPolicy = isWizardCodexOAuthSource(provider)
+    ? codexOfficialAuthRouteBinding(officialAuth)
+    : { source: "provider_config" as const };
   return {
     id: uniqueRouteId(`router-${provider.id}`, usedIds),
     label: provider.name,
     enabled: true,
     targetProviderId: provider.id,
+    modelSelection: { mode: "all" },
+    matchPrefixes: prefixes,
+    aliases: modelMap,
+    authPolicy,
     match: {
       models: modelIds,
       prefixes,
     },
     upstream: {
-      apiFormat:
-        provider.meta?.apiFormat ??
-        (isWizardCodexOAuthSource(provider)
-          ? "openai_responses"
-          : "openai_chat"),
-      auth: isWizardCodexOAuthSource(provider)
-        ? codexOfficialAuthRouteBinding(officialAuth)
-        : { source: "provider_config" },
+      auth: authPolicy,
       ...(modelMap ? { modelMap } : {}),
     },
-    ...(capabilities ? { capabilities } : {}),
   };
 }
 
@@ -1434,6 +1708,9 @@ function buildRouteCandidates(
         ? routableModelSources.find((source) => source.id === targetProviderId)
         : undefined) ??
       findSemanticRouteProvider(normalizedRoute, routableModelSources);
+    const canonicalProvider = provider
+      ? modelSources.find((source) => source.id === provider.id)
+      : findSemanticRouteProvider(normalizedRoute, modelSources);
     const routeWithInferredMatch = enrichRouteMatchFromProvider(
       normalizedRoute,
       provider,
@@ -1444,6 +1721,7 @@ function buildRouteCandidates(
       id,
       route: routeWithInferredCapabilities,
       provider,
+      canonicalProvider,
       isExisting: true,
       matchModels: routeWithInferredCapabilities.match?.models ?? [],
       matchPrefixes: routeWithInferredCapabilities.match?.prefixes ?? [],
@@ -1465,6 +1743,9 @@ function buildRouteCandidates(
       id: route.id!,
       route,
       provider,
+      canonicalProvider: modelSources.find(
+        (source) => source.id === provider.id,
+      ),
       isExisting: false,
       matchModels: route.match?.models ?? [],
       matchPrefixes: route.match?.prefixes ?? [],
@@ -1552,6 +1833,74 @@ export function normalizeCodexRouteForSave(
   };
 }
 
+/// 将工作台内部兼容视图收敛为 schema v2 Route；任何地址、密钥、协议和能力字段都会在此边界被丢弃。
+export function serializeCodexRouteV2(
+  route: CodexRoute,
+  index: number,
+): CodexRoutingRouteV2 {
+  const targetProviderId = routeTargetProviderId(route);
+  if (!targetProviderId) {
+    throw new Error(`route_target_provider_required:${route.id ?? index}`);
+  }
+  const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
+  const requestedModels = route.match?.models ?? [];
+  const canonicalModels = Array.from(
+    new Set(
+      requestedModels
+        .map((model) => aliases[model] ?? model)
+        .map((model) => model.trim())
+        .filter(Boolean),
+    ),
+  );
+  const modelSelection =
+    route.modelSelection?.mode === "all"
+      ? ({ mode: "all" } as const)
+      : ({
+          mode: "include" as const,
+          models:
+            route.modelSelection?.mode === "include"
+              ? route.modelSelection.models
+              : canonicalModels,
+        } as const);
+  const authPolicy: CodexRoutingAuth = route.authPolicy ??
+    (route.upstream?.auth as CodexRoutingAuth | undefined) ?? {
+      source: "provider_config",
+    };
+  return {
+    id: route.id ?? `route-${index + 1}`,
+    ...(route.label ? { label: route.label } : {}),
+    enabled: route.enabled !== false,
+    targetProviderId,
+    modelSelection,
+    matchPrefixes: route.matchPrefixes ?? route.match?.prefixes ?? [],
+    aliases: Object.fromEntries(
+      Object.entries(aliases).filter(
+        ([visible, canonical]) =>
+          visible.trim() !== "" &&
+          canonical.trim() !== "" &&
+          visible !== canonical,
+      ),
+    ),
+    authPolicy: {
+      source: authPolicy.source,
+      ...(authPolicy.accountId?.trim()
+        ? { accountId: authPolicy.accountId.trim() }
+        : {}),
+    },
+  };
+}
+
+function serializeCodexRoutingV2(routing: CodexRouting): CodexRoutingConfigV2 {
+  return {
+    schemaVersion: 2,
+    enabled: routing.enabled,
+    subagentVersion: routing.subagentVersion,
+    subagentV2: routing.subagentV2,
+    spawnAgentModels: routing.spawnAgentModels ?? [],
+    routes: (routing.routes ?? []).map(serializeCodexRouteV2),
+  };
+}
+
 /// 建立当前方案里已有 catalog 的索引；修复旧 route 时用它找回可见名背后的真实上游模型。
 function buildExistingCatalogByModel(
   plan: Provider,
@@ -1593,7 +1942,10 @@ export function normalizeCodexRoutesForVisibleModelAliases(
   routes: CodexRoute[],
   providersById: Map<string, Provider>,
 ): CodexRoute[] {
-  const existingModelById = buildExistingCatalogByModel(plan);
+  const legacyModelById =
+    readCodexRouting(plan)?.schemaVersion === 2
+      ? new Map<string, CodexCatalogModelDraft>()
+      : buildExistingCatalogByModel(plan);
   return routes.map((route) => {
     const targetProvider = routeTargetProvider(route, providersById);
     const targetCatalogModels = targetProvider
@@ -1626,7 +1978,7 @@ export function normalizeCodexRoutesForVisibleModelAliases(
       const upstream = routeModelUpstreamForAliasRepair(
         route,
         trimmedVisible,
-        existingModelById,
+        legacyModelById,
       );
       const targetModel =
         targetModelByUpstream.get(upstream) ??
@@ -1645,7 +1997,7 @@ export function normalizeCodexRoutesForVisibleModelAliases(
           : routeModelUpstreamForAliasRepair(
               route,
               visibleModel,
-              existingModelById,
+              legacyModelById,
             );
         return upstream && upstream !== visibleModel
           ? [visibleModel, upstream]
@@ -1656,11 +2008,16 @@ export function normalizeCodexRoutesForVisibleModelAliases(
       nextModelMapEntries.length > 0
         ? Object.fromEntries(nextModelMapEntries)
         : undefined;
+    const nextAliases = {
+      ...(nextModelMap ?? {}),
+      ...(route.aliases ?? {}),
+    };
     const { modelMap: _modelMap, ...upstreamWithoutModelMap } =
       route.upstream ?? {};
 
     return {
       ...route,
+      aliases: nextAliases,
       match: {
         ...(route.match ?? {}),
         models: nextModels,
@@ -1684,17 +2041,18 @@ function routeCanMatchVisibleCatalogModel(
   const model = visibleModel.trim();
   if (!model) return false;
   const lowerModel = model.toLowerCase();
-  if (
-    (route.match?.models ?? []).some(
-      (matchedModel) => matchedModel.trim().toLowerCase() === lowerModel,
-    )
-  ) {
+  const exactModels = (route.match?.models ?? [])
+    .map((matchedModel) => matchedModel.trim().toLowerCase())
+    .filter(Boolean);
+  if (exactModels.includes(lowerModel)) {
     return true;
   }
-  return (route.match?.prefixes ?? []).some((prefix) => {
+  const prefixMatched = (route.match?.prefixes ?? []).some((prefix) => {
     const normalizedPrefix = prefix.trim().toLowerCase();
     return normalizedPrefix && lowerModel.startsWith(normalizedPrefix);
   });
+  if (!prefixMatched) return false;
+  return route.modelSelection?.mode !== "include";
 }
 
 /// route 能力比 provider catalog 更接近最终路由结果；写入聚合 catalog，确保 Codex 看到的模型能力与规则一致。
@@ -1718,8 +2076,12 @@ export function buildModelCatalogForRoutes(
   routes: CodexRoute[],
   providersById: Map<string, Provider>,
 ): CodexModelCatalogDraft {
+  const routing = readCodexRouting(plan);
+  const isSchemaV2 = routing?.schemaVersion === 2;
   const existingCatalog = plan.settingsConfig?.modelCatalog;
-  const existingModelById = buildExistingCatalogByModel(plan);
+  const legacyModelById = isSchemaV2
+    ? new Map<string, CodexCatalogModelDraft>()
+    : buildExistingCatalogByModel(plan);
 
   const byModel = new Map<string, CodexCatalogModelDraft>();
   for (const route of routes) {
@@ -1730,16 +2092,23 @@ export function buildModelCatalogForRoutes(
     const targetCatalogModels = targetProvider
       ? readCodexModelCatalog(targetProvider).models
       : [];
-    const routableCatalogModels = targetCatalogModels.filter((catalogModel) =>
-      routeCanMatchVisibleCatalogModel(route, catalogModel.model ?? ""),
-    );
+    const routableCatalogModels =
+      route.modelSelection?.mode === "all"
+        ? targetCatalogModels.filter(
+            (catalogModel) => catalogModel.enabled !== false,
+          )
+        : targetCatalogModels.filter(
+            (catalogModel) =>
+              catalogModel.enabled !== false &&
+              routeCanMatchVisibleCatalogModel(route, catalogModel.model ?? ""),
+          );
     for (const catalogModel of routableCatalogModels) {
       const id = catalogModel.model?.trim();
       if (!id || byModel.has(id)) continue;
       byModel.set(
         id,
         applyRouteCapabilitiesToCatalogModel(
-          catalogDraftFromSourceModel(id, catalogModel),
+          catalogDraftFromSourceModel(id, catalogModel, targetProvider),
           route,
         ),
       );
@@ -1750,18 +2119,19 @@ export function buildModelCatalogForRoutes(
       byModel.set(
         id,
         applyRouteCapabilitiesToCatalogModel(
-          existingModelById.get(id) ?? { model: id },
+          legacyModelById.get(id) ?? { model: id },
           route,
         ),
       );
     }
   }
 
-  const existingSpawnAgentModels = Array.isArray(
-    existingCatalog?.spawnAgentModels,
-  )
-    ? (existingCatalog.spawnAgentModels as string[])
-    : [];
+  const routingSpawnAgentModels = routing?.spawnAgentModels;
+  const existingSpawnAgentModels = Array.isArray(routingSpawnAgentModels)
+    ? routingSpawnAgentModels
+    : !isSchemaV2 && Array.isArray(existingCatalog?.spawnAgentModels)
+      ? (existingCatalog.spawnAgentModels as string[])
+      : [];
   const modelIds = Array.from(byModel.keys());
   const spawnAgentModels = existingSpawnAgentModels
     .filter((model) => byModel.has(model))
@@ -1775,6 +2145,19 @@ export function buildModelCatalogForRoutes(
   };
 }
 
+/// 工作台只读使用 compiler 等价投影，不把聚合 catalog 写回 Router Provider。
+export function projectCodexModelCatalog(
+  plan: Provider | null,
+  providersById: Map<string, Provider>,
+): CodexModelCatalogDraft {
+  if (!plan) return { models: [], spawnAgentModels: [] };
+  return buildModelCatalogForRoutes(
+    plan,
+    readCodexRouting(plan)?.routes ?? [],
+    providersById,
+  );
+}
+
 /// 生成工作台专用的新 MultiRouter provider；它只承载路由配置，不再让用户填写无关的上游密钥表单。
 export function createDraftRoutingPlan(
   providers: Provider[],
@@ -1785,10 +2168,6 @@ export function createDraftRoutingPlan(
   const id = uniqueRouteId("codex-multirouter", existingIds);
   const catalogModels = buildModelCatalogDraftFromSources(routableModelSources);
   const sourceModels = catalogModels.map((model) => model.model);
-  const modelCatalog: CodexModelCatalogDraft = {
-    models: catalogModels,
-    spawnAgentModels: Array.from(new Set(sourceModels)).slice(0, 5),
-  };
   return {
     id,
     name: "New Codex MultiRouter",
@@ -1804,15 +2183,26 @@ export function createDraftRoutingPlan(
         DEFAULT_CODEX_PROXY_LISTEN_PORT,
       ),
       config: null,
-      modelCatalog,
       codexRouting: {
+        schemaVersion: 2,
         enabled: true,
+        subagentVersion: "v2",
+        spawnAgentModels: Array.from(new Set(sourceModels)).slice(0, 5),
         routes: [],
       },
       hostedTools: DEFAULT_HOSTED_TOOLS_CONFIG,
     },
     createdAt: Date.now(),
   };
+}
+
+function withoutDerivedRouterCatalog(
+  settingsConfig: Record<string, any>,
+): Record<string, any> {
+  const next = { ...settingsConfig };
+  delete next.modelCatalog;
+  delete next.model_catalog;
+  return next;
 }
 
 /// MultiRouter 设置页只允许修改方案元信息和入口开关；路由规则、模型目录和本地代理接管配置都继续由工作台自动维护。
@@ -1822,23 +2212,41 @@ export function applyMultiRouterSettingsDraft(
 ): Provider {
   const currentRouting = readCodexRouting(plan) ?? {};
   const officialBinding = codexOfficialAuthRouteBinding(draft.officialAuth);
-  const nextRouting: CodexRouting = {
-    ...currentRouting,
-    enabled: draft.enabled,
-    officialAuth: draft.officialAuth,
-    routes: (currentRouting.routes ?? []).map((route) =>
-      codexRouteUsesOfficialAuthentication(route)
-        ? {
-            ...route,
-            upstream: {
-              ...route.upstream,
-              auth: officialBinding,
-            },
-          }
-        : route,
-    ),
-  };
-  const defaultRouteId = draft.defaultRouteId?.trim();
+  const nextRouting: CodexRouting =
+    currentRouting.schemaVersion === 2
+      ? {
+          ...currentRouting,
+          enabled: draft.enabled,
+          routes: (currentRouting.routes ?? []).map((route) =>
+            codexRouteUsesOfficialAuthentication(route)
+              ? {
+                  ...route,
+                  authPolicy: officialBinding,
+                  upstream: {
+                    ...route.upstream,
+                    auth: officialBinding,
+                  },
+                }
+              : route,
+          ),
+        }
+      : {
+          ...currentRouting,
+          enabled: draft.enabled,
+          officialAuth: draft.officialAuth,
+          routes: (currentRouting.routes ?? []).map((route) =>
+            codexRouteUsesOfficialAuthentication(route)
+              ? {
+                  ...route,
+                  upstream: {
+                    ...route.upstream,
+                    auth: officialBinding,
+                  },
+                }
+              : route,
+          ),
+        };
+  const defaultRouteId = currentRouting.defaultRouteId?.trim();
   if (
     defaultRouteId &&
     (nextRouting.routes ?? []).some((route) => route.id === defaultRouteId)
@@ -1854,7 +2262,9 @@ export function applyMultiRouterSettingsDraft(
     notes: draft.notes?.trim() || undefined,
     settingsConfig: writeHostedToolsConfig(
       {
-        ...plan.settingsConfig,
+        ...(nextRouting.schemaVersion === 2
+          ? withoutDerivedRouterCatalog(plan.settingsConfig)
+          : plan.settingsConfig),
         auth: plan.settingsConfig?.auth ?? {},
         base_url:
           plan.settingsConfig?.base_url ??
@@ -1870,7 +2280,10 @@ export function applyMultiRouterSettingsDraft(
             DEFAULT_CODEX_PROXY_LISTEN_PORT,
           ),
         config: plan.settingsConfig?.config ?? null,
-        codexRouting: nextRouting,
+        codexRouting:
+          nextRouting.schemaVersion === 2
+            ? serializeCodexRoutingV2(nextRouting)
+            : nextRouting,
       },
       {
         webSearch: { enabled: draft.hostedTools.webSearch },
@@ -1965,6 +2378,31 @@ function routeMatchSummary(route: CodexRoute): string {
   return parts.join("；") || "尚未设置匹配条件";
 }
 
+/// 将固定白名单与 Provider 当前模型目录对照展示，避免 Provider 新增模型后看起来像“没有刷新”。
+function routeProviderModelSyncSummary(
+  route: CodexRoute,
+  provider?: Provider,
+): string | null {
+  if (!provider) return null;
+  const providerModels = collectProviderCanonicalModelIds(provider);
+  if (route.modelSelection?.mode !== "include") {
+    return `已接入 ${providerModels.length}/${providerModels.length} 个模型（自动跟随供应商）`;
+  }
+
+  const selected = new Set(
+    route.modelSelection.models.map((model) => model.trim()).filter(Boolean),
+  );
+  const connected = providerModels.filter((model) => selected.has(model));
+  const excluded = providerModels.filter((model) => !selected.has(model));
+  const stale = Array.from(selected).filter(
+    (model) => !providerModels.includes(model),
+  );
+  const parts = [`已接入 ${connected.length}/${providerModels.length} 个模型`];
+  if (excluded.length > 0) parts.push(`尚未接入：${excluded.join(", ")}`);
+  if (stale.length > 0) parts.push(`已不存在：${stale.join(", ")}`);
+  return parts.join("；");
+}
+
 /// 收集所有可被 Codex 请求命中的模型名，测试页会优先使用这些真实规则生成候选项。
 function collectRouteModels(routes: RouteEntry[]): string[] {
   const modelNames = routes.flatMap(({ route }) => [
@@ -1975,14 +2413,20 @@ function collectRouteModels(routes: RouteEntry[]): string[] {
 }
 
 /// 根据当前 MultiRouter 规则反查 catalog 中真实存在的模型，用于子 Agent 候选页的“路由命中”选项卡。
-function collectRoutedCatalogModels(
+export function collectRoutedCatalogModels(
   routes: RouteEntry[],
   catalogModels: CodexCatalogModel[],
 ): string[] {
   const exactModels = new Set<string>();
   const prefixes: string[] = [];
 
-  for (const { route } of routes) {
+  for (const { route, provider } of routes) {
+    if (route.modelSelection?.mode === "all") {
+      for (const model of readCodexModelCatalog(provider).models) {
+        const normalized = model.model?.trim();
+        if (normalized) exactModels.add(normalized);
+      }
+    }
     for (const model of route.match?.models ?? []) {
       const normalized = model.trim();
       if (normalized) exactModels.add(normalized);
@@ -2140,7 +2584,12 @@ function applyRouteProtocolMetadata(
 ) {
   if (!entry) return;
   row.routeId = entry.route.id?.trim() || null;
-  row.routeLabel = entry.route.label?.trim() || null;
+  row.routeLabel = routeSummaryDisplayName(
+    entry.route.label,
+    entry.route.id,
+    entry.provider.name,
+    "",
+  );
   const summary = routeSummaries.get(routeEntryStatusKey(entry));
   if (!summary) return;
   row.configuredProtocol ??= summary.configuredProtocol;
@@ -2351,7 +2800,6 @@ export function CodexRouterWorkspacePage({
   onEditProvider,
   onDeletePlan,
   onCreateProvider,
-  onRuntimeReady,
 }: {
   providers: Provider[];
   proxyStatus?: ProxyStatus;
@@ -2363,7 +2811,6 @@ export function CodexRouterWorkspacePage({
   onEditProvider: (provider: Provider) => void;
   onDeletePlan: (provider: Provider) => void;
   onCreateProvider: () => void;
-  onRuntimeReady?: (provider: Provider) => void;
 }) {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>(initialTab);
   const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null);
@@ -2378,6 +2825,16 @@ export function CodexRouterWorkspacePage({
   const [routePickerError, setRoutePickerError] = useState<string | null>(null);
   const [isSavingRoutes, setIsSavingRoutes] = useState(false);
   const [isSavingPlanSettings, setIsSavingPlanSettings] = useState(false);
+  const [migrationPreview, setMigrationPreview] =
+    useState<CodexMultiRouterMigrationPreview | null>(null);
+  const [migrationTargetPlan, setMigrationTargetPlan] =
+    useState<Provider | null>(null);
+  const [migrationPendingAction, setMigrationPendingAction] = useState<
+    "routes" | "settings" | null
+  >(null);
+  const [isLoadingMigration, setIsLoadingMigration] = useState(false);
+  const [isApplyingMigration, setIsApplyingMigration] = useState(false);
+  const [migrationError, setMigrationError] = useState<string | null>(null);
   const [routePickerSelectAll, setRoutePickerSelectAll] = useState(false);
   const [optimisticRoutingPlan, setOptimisticRoutingPlan] =
     useState<Provider | null>(null);
@@ -2472,6 +2929,7 @@ export function CodexRouterWorkspacePage({
   // 不能因缺少 targetProviderId 退回到刷新全部候选 Provider。
   const selectedPlanForModelRefresh =
     routingPlans.find((provider) => provider.id === selectedPlanId) ??
+    routingPlans.find((provider) => provider.id === activeProviderId) ??
     routingPlans[0] ??
     null;
   const enabledModelSourceIdsForRefresh = useMemo(() => {
@@ -2549,7 +3007,7 @@ export function CodexRouterWorkspacePage({
             status: "empty",
             message: onlineErrorMessage
               ? `OAuth 在线模型列表获取失败：${onlineErrorMessage}；本地缓存没有可恢复的官方模型目录。`
-              : "获取模型列表失败：远端返回空列表，请检查当前 provider 配置。",
+              : "获取模型列表失败：远端返回空列表，请检查当前供应商配置。",
           };
         }
 
@@ -2570,40 +3028,10 @@ export function CodexRouterWorkspacePage({
           return { status: "stale" };
         }
 
-        const updatedProvidersById = new Map(providersById);
-        updatedProvidersById.set(nextProvider.id, nextProvider);
-        const updatedRoutableSources = resolveWizardModelNameCollisions(
-          modelSources.map((source) =>
-            source.id === nextProvider.id ? nextProvider : source,
-          ),
-        );
-        const updatedRoutableProvidersById = new Map(updatedProvidersById);
-        for (const source of updatedRoutableSources) {
-          updatedRoutableProvidersById.set(source.id, source);
-        }
-        const affectedPlans: Provider[] = [];
-        for (const plan of routingPlans) {
-          // 每个 plan 都交给同步层判定是否变化：旧版内联 OAuth route 没有
-          // targetProviderId，若在页面层提前过滤，就会出现 provider 已刷新而旧
-          // MultiRouter 永远停在旧模型目录的断层。同步层返回 null 时不会写库。
-          const syncResult = syncCodexMultiRouterPlanWithProviders(
-            plan,
-            updatedRoutableProvidersById,
-          );
-          if (!syncResult) continue;
-          const nextPlan = syncResult.plan;
-          await providersApi.update(nextPlan, "codex");
-          if (!isCurrentAttempt()) {
-            return { status: "stale" };
-          }
-          affectedPlans.push(nextPlan);
-        }
-
         return {
           status: "updated",
           models,
           nextProvider,
-          affectedPlans,
           usedCodexCache,
           onlineErrorMessage,
         };
@@ -2621,7 +3049,7 @@ export function CodexRouterWorkspacePage({
                 status: "error",
                 message:
                   result.message ??
-                  "获取模型列表失败：远端返回空列表，请检查当前 provider 配置。",
+                  "获取模型列表失败：远端返回空列表，请检查当前供应商配置。",
                 modelCount: 0,
               },
             }));
@@ -2638,17 +3066,8 @@ export function CodexRouterWorkspacePage({
               ...Object.fromEntries(providersById),
               ...(current?.providers ?? {}),
               [result.nextProvider.id]: result.nextProvider,
-              ...Object.fromEntries(
-                result.affectedPlans.map((plan) => [plan.id, plan]),
-              ),
             },
           }));
-          const selectedAffectedPlan = result.affectedPlans.find(
-            (plan) => plan.id === selectedPlanId,
-          );
-          if (selectedAffectedPlan) {
-            setOptimisticRoutingPlan(selectedAffectedPlan);
-          }
           setProviderModelRefreshStates((current) => ({
             ...current,
             [provider.id]: {
@@ -2678,7 +3097,7 @@ export function CodexRouterWorkspacePage({
             ...current,
             [provider.id]: {
               status: "error",
-              message: `获取模型列表失败，请检查当前 provider 配置：${workspaceErrorMessage(error)}`,
+              message: `获取模型列表失败，请检查当前供应商配置：${workspaceErrorMessage(error)}`,
             },
           }));
         });
@@ -2703,15 +3122,17 @@ export function CodexRouterWorkspacePage({
       index,
     })),
   );
-  const enabledRoutes = routeEntries.filter(
-    ({ route }) => route.enabled !== false,
-  );
   const routeModels = collectRouteModels(routeEntries);
   const selectedPlan =
     routingPlans.find((provider) => provider.id === selectedPlanId) ??
+    routingPlans.find((provider) => provider.id === activeProviderId) ??
     routingPlans[0] ??
     null;
   const selectedRouting = selectedPlan ? readCodexRouting(selectedPlan) : null;
+  const selectedProjectedCatalog = useMemo(
+    () => projectCodexModelCatalog(selectedPlan, routableProvidersById),
+    [selectedPlan, routableProvidersById],
+  );
   const selectedPlanRouteEntries = selectedPlan
     ? routeEntries.filter(({ provider }) => provider.id === selectedPlan.id)
     : routeEntries;
@@ -2799,30 +3220,33 @@ export function CodexRouterWorkspacePage({
     setRoutePickerMessage(null);
     try {
       await providersApi.add(nextPlan, "codex", false);
-      queryClient.setQueryData(["providers", "codex"], (current: any) =>
-        current?.providers
-          ? {
-              ...current,
-              providers: { ...current.providers, [nextPlan.id]: nextPlan },
-            }
-          : current,
+      const initializedPlan = await codexSubagentV2Api.initializeProviderConfig(
+        nextPlan.id,
       );
+      queryClient.setQueryData(["providers", "codex"], (current: any) => ({
+        ...(current ?? { currentProviderId: "" }),
+        providers: {
+          ...Object.fromEntries(
+            providers.map((provider) => [provider.id, provider]),
+          ),
+          ...(current?.providers ?? {}),
+          [initializedPlan.id]: initializedPlan,
+        },
+      }));
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
       await queryClient.refetchQueries({
         queryKey: ["providers", "codex"],
         type: "active",
       });
-      setOptimisticRoutingPlan(nextPlan);
-      setSelectedPlanId(nextPlan.id);
+      setOptimisticRoutingPlan(initializedPlan);
+      setSelectedPlanId(initializedPlan.id);
       setSelectedRouteKey(null);
       setActiveTab("routes");
       setRoutePickerSelectAll(true);
       setIsRoutePickerOpen(true);
       setRoutePickerMessage("已创建新的多路路由，请选择要接入的候选 router。");
     } catch (error) {
-      setRoutePickerError(
-        error instanceof Error ? error.message : String(error),
-      );
+      setRoutePickerError(workspaceErrorMessage(error));
     } finally {
       setIsSavingRoutes(false);
     }
@@ -2873,9 +3297,7 @@ export function CodexRouterWorkspacePage({
       setIsPlanSettingsOpen(false);
       setRoutePickerMessage("多路路由设置已保存，接管配置由系统继续自动维护。");
     } catch (error) {
-      setRoutePickerError(
-        error instanceof Error ? error.message : String(error),
-      );
+      setRoutePickerError(workspaceErrorMessage(error));
     } finally {
       setIsSavingPlanSettings(false);
     }
@@ -2896,21 +3318,17 @@ export function CodexRouterWorkspacePage({
       normalizedRouteDrafts,
       routableProvidersById,
     );
-    const enabledRouteIds = normalizedRoutes
-      .filter((route) => route.enabled !== false)
-      .map((route) => route.id)
-      .filter((id): id is string => Boolean(id));
-    const defaultRouteId = normalizedRoutes.some(
-      (route) => route.id && route.id === currentRouting.defaultRouteId,
-    )
-      ? currentRouting.defaultRouteId
-      : (enabledRouteIds[0] ?? normalizedRoutes[0]?.id);
+    const defaultRouteId = currentRouting.defaultRouteId?.trim();
     const nextRouting: CodexRouting = {
       ...currentRouting,
+      schemaVersion: 2,
       enabled: currentRouting.enabled ?? true,
       routes: normalizedRoutes,
     };
-    if (defaultRouteId) {
+    if (
+      defaultRouteId &&
+      normalizedRoutes.some((route) => route.id === defaultRouteId)
+    ) {
       nextRouting.defaultRouteId = defaultRouteId;
     } else {
       delete nextRouting.defaultRouteId;
@@ -2918,13 +3336,8 @@ export function CodexRouterWorkspacePage({
     const nextProvider: Provider = {
       ...plan,
       settingsConfig: {
-        ...plan.settingsConfig,
-        modelCatalog: buildModelCatalogForRoutes(
-          plan,
-          normalizedRoutes,
-          routableProvidersById,
-        ),
-        codexRouting: nextRouting,
+        ...withoutDerivedRouterCatalog(plan.settingsConfig),
+        codexRouting: serializeCodexRoutingV2(nextRouting),
       },
     };
     const nextEnabledProviderIds = new Set<string>();
@@ -2971,9 +3384,7 @@ export function CodexRouterWorkspacePage({
     } catch (error) {
       // 保存失败时回滚原方案；启用集合恢复后刷新 effect 会重新读取被失效的 Provider。
       setOptimisticRoutingPlan(plan);
-      setRoutePickerError(
-        error instanceof Error ? error.message : String(error),
-      );
+      setRoutePickerError(workspaceErrorMessage(error));
     } finally {
       setIsSavingRoutes(false);
     }
@@ -2994,14 +3405,91 @@ export function CodexRouterWorkspacePage({
     setActiveTab("routes");
   }
 
+  async function previewLegacyPlanMigration(
+    plan: Provider,
+    action: "routes" | "settings",
+  ) {
+    setMigrationTargetPlan(plan);
+    setMigrationPendingAction(action);
+    setMigrationPreview(null);
+    setMigrationError(null);
+    setIsLoadingMigration(true);
+    try {
+      const revision = await providersApi.getCodexMultiRouterRevision(plan.id);
+      const preview = await providersApi.previewCodexMultiRouterMigration(
+        plan.id,
+        revision,
+      );
+      setMigrationPreview(preview);
+    } catch (error) {
+      setMigrationError(workspaceErrorMessage(error));
+    } finally {
+      setIsLoadingMigration(false);
+    }
+  }
+
+  async function applyLegacyPlanMigration() {
+    if (!migrationPreview || !migrationTargetPlan) return;
+    setIsApplyingMigration(true);
+    setMigrationError(null);
+    try {
+      await providersApi.applyCodexMultiRouterMigration(
+        migrationTargetPlan.id,
+        migrationPreview.expectedRevision,
+        migrationPreview.planToken,
+      );
+      const refreshedProviders = await providersApi.getAll("codex");
+      const migratedPlan = refreshedProviders[migrationTargetPlan.id];
+      if (
+        !migratedPlan ||
+        readCodexRouting(migratedPlan)?.schemaVersion !== 2
+      ) {
+        throw new Error("migration_readback_failed");
+      }
+      setOptimisticRoutingPlan(migratedPlan);
+      setSelectedPlanId(migratedPlan.id);
+      const action = migrationPendingAction;
+      setMigrationPreview(null);
+      setMigrationTargetPlan(null);
+      setMigrationPendingAction(null);
+      if (action === "routes") {
+        setActiveTab("routes");
+        setRoutePickerError(null);
+        setRoutePickerMessage("旧方案已迁移为 schema v2，请检查后再保存规则。");
+        setRoutePickerSelectAll(false);
+        setIsRoutePickerOpen(true);
+      } else if (action === "settings") {
+        setIsPlanSettingsOpen(true);
+      }
+      await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
+    } catch (error) {
+      setMigrationError(workspaceErrorMessage(error));
+    } finally {
+      setIsApplyingMigration(false);
+    }
+  }
+
   /// 从任何规则入口打开候选选择器时，先切到规则页并清理上一次保存提示。
   function handleOpenRoutePicker(provider?: Provider | null) {
-    if (provider) setSelectedPlanId(provider.id);
+    const targetPlan = provider ?? selectedPlan;
+    if (targetPlan && readCodexRouting(targetPlan)?.schemaVersion !== 2) {
+      void previewLegacyPlanMigration(targetPlan, "routes");
+      return;
+    }
+    if (targetPlan) setSelectedPlanId(targetPlan.id);
     setActiveTab("routes");
     setRoutePickerError(null);
     setRoutePickerMessage(null);
     setRoutePickerSelectAll(false);
     setIsRoutePickerOpen(true);
+  }
+
+  function handlePlanSettingsOpenChange(open: boolean) {
+    if (open && selectedPlan && selectedRouting?.schemaVersion !== 2) {
+      void previewLegacyPlanMigration(selectedPlan, "settings");
+      return;
+    }
+    setIsPlanSettingsOpen(open);
   }
 
   /// 页面内测试只做规则匹配预览，不发真实上游请求，避免误触发计费或账号请求。
@@ -3014,25 +3502,40 @@ export function CodexRouterWorkspacePage({
       return;
     }
 
-    const matched = enabledRoutes.find(({ route }) => {
-      const models = route.match?.models ?? [];
-      const prefixes = route.match?.prefixes ?? [];
-      return (
-        models.includes(model) ||
-        prefixes.some((prefix) => model.startsWith(prefix))
+    const matched = selectedPlanRouteEntries.find(({ route }) => {
+      if (route.enabled === false) return false;
+      if (routeCanMatchVisibleCatalogModel(route, model)) return true;
+      if (route.modelSelection?.mode !== "all") return false;
+
+      const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
+      if (
+        Object.keys(aliases).some(
+          (alias) => alias.trim().toLowerCase() === model.toLowerCase(),
+        )
+      ) {
+        return true;
+      }
+      const target = routeTargetProvider(route, providersById);
+      return readCodexModelCatalog(target ?? null).models.some(
+        (catalogModel) => {
+          const candidate = catalogModel.model?.trim();
+          const upstream = (
+            catalogModel.upstreamModel ?? catalogModel.upstream_model
+          )?.trim();
+          return [candidate, upstream].some(
+            (value) => value?.toLowerCase() === model.toLowerCase(),
+          );
+        },
       );
     });
 
     if (matched) {
-      const result = `${model} 会命中「${matched.route.label || matched.route.id || "未命名规则"}」，上游为 ${routeBaseUrl(matched.route, providersById)}。`;
+      const result = `${model} 会命中「${routeDisplayName(matched.route, providersById)}」，上游为 ${routeBaseUrl(matched.route, providersById)}。`;
       setTestResult(result);
       return;
     }
 
-    const fallback = selectedRouting?.defaultRouteId
-      ? `没有精确命中，会走默认路由 ${selectedRouting.defaultRouteId}。`
-      : "没有命中任何启用规则，且当前方案没有默认路由。";
-    setTestResult(fallback);
+    setTestResult(`${model} 不可路由：未命中当前方案中的任何已启用模型规则。`);
   }
 
   return (
@@ -3051,7 +3554,7 @@ export function CodexRouterWorkspacePage({
           onValueChange={(value) => setActiveTab(value as WorkspaceTab)}
         >
           <div className="sticky top-0 z-10 -mx-1 bg-background/95 px-1 py-2 backdrop-blur">
-            <TabsList className="grid w-full grid-cols-5 bg-muted p-1 dark:bg-slate-950/40">
+            <TabsList className="grid w-full grid-cols-3 bg-muted p-1 dark:bg-slate-950/40 lg:grid-cols-7">
               <WorkspaceTabTrigger
                 value="overview"
                 icon={Layers3}
@@ -3066,6 +3569,16 @@ export function CodexRouterWorkspacePage({
                 value="routes"
                 icon={Route}
                 label="路由规则"
+              />
+              <WorkspaceTabTrigger
+                value="model-order"
+                icon={GripVertical}
+                label="模型排序"
+              />
+              <WorkspaceTabTrigger
+                value="subagents"
+                icon={Bot}
+                label="子 Agent"
               />
               <WorkspaceTabTrigger
                 value="status"
@@ -3115,6 +3628,7 @@ export function CodexRouterWorkspacePage({
               onSaveRoutes={handleSaveRoutingRoutes}
               onSelectPlan={handleSelectPlan}
               onSelectRoute={handleSelectRoute}
+              onEditProvider={onEditProvider}
               onEditPlan={handleEditPlan}
               onDeletePlan={onDeletePlan}
               providersById={providersById}
@@ -3127,12 +3641,31 @@ export function CodexRouterWorkspacePage({
               isSavingRoutes={isSavingRoutes}
               isPlanSettingsOpen={isPlanSettingsOpen}
               isSavingPlanSettings={isSavingPlanSettings}
-              onPlanSettingsOpenChange={setIsPlanSettingsOpen}
+              onPlanSettingsOpenChange={handlePlanSettingsOpenChange}
               onSavePlanSettings={handleSavePlanSettings}
               routePickerSelectAll={routePickerSelectAll}
               routePickerMessage={routePickerMessage}
               routePickerError={routePickerError}
               onRoutePickerOpenChange={setIsRoutePickerOpen}
+            />
+          </TabsContent>
+
+          <TabsContent value="model-order" className="mt-3">
+            <ModelOrderTab
+              selectedPlan={selectedPlan}
+              catalog={selectedProjectedCatalog}
+              selectedRoutes={selectedPlanRouteEntries}
+              providersById={providersById}
+              onCreatePlan={handleCreatePlan}
+            />
+          </TabsContent>
+
+          <TabsContent value="subagents" className="mt-3">
+            <SubagentsTab
+              selectedPlan={selectedPlan}
+              selectedRoutes={selectedPlanRouteEntries}
+              catalog={selectedProjectedCatalog}
+              onCreatePlan={handleCreatePlan}
             />
           </TabsContent>
 
@@ -3148,7 +3681,6 @@ export function CodexRouterWorkspacePage({
               activeProviderId={activeProviderId}
               onEditPlan={handleEditPlan}
               onDeletePlan={onDeletePlan}
-              onRuntimeReady={onRuntimeReady}
             />
           </TabsContent>
 
@@ -3166,6 +3698,101 @@ export function CodexRouterWorkspacePage({
           </TabsContent>
         </Tabs>
       </div>
+      <Dialog
+        open={Boolean(migrationTargetPlan)}
+        onOpenChange={(open) => {
+          if (open || isApplyingMigration) return;
+          setMigrationTargetPlan(null);
+          setMigrationPreview(null);
+          setMigrationPendingAction(null);
+          setMigrationError(null);
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>迁移旧 MultiRouter 到 schema v2</DialogTitle>
+            <DialogDescription>
+              编辑或启用旧方案前必须显式迁移。预览只展示引用变化和字段类别，不会展示
+              API Key、Token 或 OAuth 凭据。
+            </DialogDescription>
+          </DialogHeader>
+          {isLoadingMigration ? (
+            <div className="rounded-md border p-3 text-sm text-muted-foreground">
+              正在生成迁移预览…
+            </div>
+          ) : migrationPreview ? (
+            <div className="space-y-3 text-sm">
+              <div className="grid gap-2 sm:grid-cols-3">
+                <DetailRow
+                  label="删除冗余字段"
+                  value={String(
+                    migrationPreview.diff.removedRouteFields.length,
+                  )}
+                />
+                <DetailRow
+                  label="引用变化 Route"
+                  value={String(migrationPreview.diff.changedRouteIds.length)}
+                />
+                <DetailRow
+                  label="迁移生成 Provider"
+                  value={String(migrationPreview.generatedProviders.length)}
+                />
+              </div>
+              {migrationPreview.generatedProviders.length > 0 ? (
+                <div className="rounded-md border p-3">
+                  <div className="font-medium">将创建的 Provider</div>
+                  <ul className="mt-2 list-disc space-y-1 pl-5 text-muted-foreground">
+                    {migrationPreview.generatedProviders.map((provider) => (
+                      <li key={provider.id}>
+                        {provider.name} ({provider.id})，来源{" "}
+                        {provider.sourceProviderId}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {migrationPreview.warnings.length > 0 ? (
+                <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
+                  <div className="font-medium">迁移警告</div>
+                  <ul className="mt-2 list-disc space-y-1 pl-5">
+                    {migrationPreview.warnings.map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {migrationError ? (
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"
+            >
+              {migrationError}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={isApplyingMigration}
+              onClick={() => {
+                setMigrationTargetPlan(null);
+                setMigrationPreview(null);
+                setMigrationPendingAction(null);
+                setMigrationError(null);
+              }}
+            >
+              取消
+            </Button>
+            <Button
+              disabled={!migrationPreview || isApplyingMigration}
+              onClick={() => void applyLegacyPlanMigration()}
+            >
+              {isApplyingMigration ? "正在应用…" : "应用迁移并继续"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -3300,7 +3927,10 @@ function OverviewTab({
                 key={provider.id}
                 className="group rounded-lg border border-blue-200 bg-card p-4 text-left transition hover:border-blue-400 hover:bg-blue-50 hover:shadow-[0_0_0_1px_rgba(96,165,250,0.25)] dark:border-blue-600/40 dark:bg-slate-950/40 dark:hover:bg-blue-950/30 dark:hover:shadow-[0_0_0_1px_rgba(96,165,250,0.35)]"
               >
-                <PlanCardContent provider={provider} />
+                <PlanCardContent
+                  provider={provider}
+                  providersById={providersById}
+                />
                 <div className="mt-3 flex flex-wrap gap-2">
                   <Button
                     type="button"
@@ -3418,6 +4048,12 @@ function SourcesTab({
   onEditPlan: (provider: Provider, detail?: string) => void;
   onSelectPlan: (provider: Provider) => void;
 }) {
+  const providersById = new Map(
+    [...routingPlans, ...modelSources].map((provider) => [
+      provider.id,
+      provider,
+    ]),
+  );
   return (
     <div className="grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
       <section className="rounded-lg border border-blue-200 bg-blue-50/70 p-4 dark:border-blue-700/40 dark:bg-blue-950/15">
@@ -3442,7 +4078,11 @@ function SourcesTab({
               key={provider.id}
               className="rounded-lg border border-blue-200 bg-card p-3 text-left transition hover:border-blue-400 hover:bg-blue-50 dark:border-blue-700/40 dark:bg-slate-950/40 dark:hover:bg-blue-950/30"
             >
-              <PlanCardContent provider={provider} compact />
+              <PlanCardContent
+                provider={provider}
+                providersById={providersById}
+                compact
+              />
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button
                   type="button"
@@ -3545,6 +4185,303 @@ function SourcesTab({
   );
 }
 
+/// 子 Agent 使用独立工作区承载协议与模型能力，避免用户在路由规则页尾部寻找配置入口。
+function SubagentsTab({
+  selectedPlan,
+  selectedRoutes,
+  catalog,
+  onCreatePlan,
+}: {
+  selectedPlan: Provider | null;
+  selectedRoutes: RouteEntry[];
+  catalog: CodexModelCatalogDraft;
+  onCreatePlan: () => void;
+}) {
+  if (!selectedPlan) {
+    return (
+      <EmptyState
+        icon={Bot}
+        title="还没有可配置的 MultiRouter"
+        detail="先创建或选择一个多路路由方案，再配置它的子 Agent 协议和模型能力。"
+        actionLabel="创建多路路由"
+        onAction={onCreatePlan}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <section
+        aria-label="当前子 Agent 方案"
+        className="rounded-lg border border-blue-200 bg-blue-50/70 p-3 dark:border-blue-700/40 dark:bg-blue-950/15"
+      >
+        <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-blue-800 dark:text-blue-100">
+          <Bot className="h-4 w-4" />
+          当前 MultiRouter
+        </div>
+        <PlanCardContent
+          provider={selectedPlan}
+          providersById={
+            new Map(
+              selectedRoutes.map(({ provider }) => [provider.id, provider]),
+            )
+          }
+          compact
+        />
+      </section>
+      <SpawnAgentCandidatesPanel
+        selectedPlan={selectedPlan}
+        selectedRoutes={selectedRoutes}
+        catalog={catalog}
+      />
+    </div>
+  );
+}
+
+function ModelOrderTab({
+  selectedPlan,
+  catalog,
+  selectedRoutes,
+  providersById,
+  onCreatePlan,
+}: {
+  selectedPlan: Provider | null;
+  catalog: CodexModelCatalogDraft;
+  selectedRoutes: RouteEntry[];
+  providersById: Map<string, Provider>;
+  onCreatePlan: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const [draftModels, setDraftModels] = useState<CodexCatalogModel[]>([]);
+  const [isSaving, setIsSaving] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const sensors = useSensors(
+    useSensor(PointerSensor),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+  const catalogKey = catalog.models
+    .map((model) => `${model.model ?? ""}:${model.sortIndex ?? ""}`)
+    .join("\n");
+  const hasCustomOrder = catalog.models.some(
+    (model) => model.sortIndex !== undefined,
+  );
+  const hasChanges =
+    draftModels.map((model) => model.model).join("\n") !==
+    catalog.models
+      .slice()
+      .sort(
+        (left, right) =>
+          (left.sortIndex ?? Number.MAX_SAFE_INTEGER) -
+          (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
+      )
+      .map((model) => model.model)
+      .join("\n");
+
+  useEffect(() => {
+    setDraftModels(
+      catalog.models
+        .slice()
+        .sort(
+          (left, right) =>
+            (left.sortIndex ?? Number.MAX_SAFE_INTEGER) -
+            (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
+        ),
+    );
+    setMessage(null);
+    setError(null);
+  }, [selectedPlan?.id, catalogKey]);
+
+  function handleDragEnd(event: DragEndEvent) {
+    const activeModel = String(event.active.id);
+    const overModel = event.over ? String(event.over.id) : "";
+    if (!overModel || activeModel === overModel) return;
+    setDraftModels((current) => {
+      const activeIndex = current.findIndex(
+        (model) => model.model?.trim() === activeModel,
+      );
+      const overIndex = current.findIndex(
+        (model) => model.model?.trim() === overModel,
+      );
+      if (activeIndex < 0 || overIndex < 0) return current;
+      const next = [...current];
+      const [moved] = next.splice(activeIndex, 1);
+      next.splice(overIndex, 0, moved);
+      return next;
+    });
+    setMessage(null);
+    setError(null);
+  }
+
+  async function saveOrder(reset = false) {
+    if (!selectedPlan) return;
+    setIsSaving(true);
+    setMessage(null);
+    setError(null);
+    try {
+      const models = (reset ? catalog.models : draftModels).map(
+        (model, index) => {
+          const rest = { ...model };
+          delete rest.sortIndex;
+          return reset ? rest : { ...rest, sortIndex: index };
+        },
+      );
+      const updates = new Map<string, Provider>();
+      for (const [sortIndex, projectedModel] of models.entries()) {
+        const visibleModel = projectedModel.model?.trim();
+        if (!visibleModel) continue;
+        for (const { route } of selectedRoutes) {
+          if (route.enabled === false) continue;
+          const targetProviderId = routeTargetProviderId(route);
+          if (!targetProviderId) continue;
+          const aliases = route.aliases ?? route.upstream?.modelMap ?? {};
+          const canonicalModel = aliases[visibleModel] ?? visibleModel;
+          if (
+            route.modelSelection?.mode === "include" &&
+            !route.modelSelection.models.includes(canonicalModel)
+          ) {
+            continue;
+          }
+          const source =
+            updates.get(targetProviderId) ??
+            providersById.get(targetProviderId);
+          if (!source) continue;
+          const sourceModels = readCodexModelCatalog(source).models;
+          const sourceIndex = sourceModels.findIndex(
+            (model) =>
+              model.model?.trim() === canonicalModel ||
+              model.upstreamModel?.trim() === canonicalModel ||
+              model.upstream_model?.trim() === canonicalModel,
+          );
+          if (sourceIndex < 0) continue;
+          const nextModels = sourceModels.map((model, index) => {
+            if (index !== sourceIndex) return model;
+            const next = { ...model };
+            if (reset) delete next.sortIndex;
+            else next.sortIndex = sortIndex;
+            return next;
+          });
+          updates.set(targetProviderId, {
+            ...source,
+            settingsConfig: {
+              ...source.settingsConfig,
+              modelCatalog: {
+                ...(source.settingsConfig?.modelCatalog ?? {}),
+                models: nextModels,
+              },
+            },
+          });
+          break;
+        }
+      }
+      for (const provider of updates.values()) {
+        await providersApi.update(provider, "codex");
+      }
+      setDraftModels(models);
+      setMessage(
+        reset
+          ? "已从目标 Provider 模型条目移除自定义顺序；投影刷新后生效。"
+          : `已把 ${models.length} 个模型的展示顺序保存到目标 Provider 模型条目；投影刷新后生效。`,
+      );
+      await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
+    } catch (saveError) {
+      setError(`保存模型顺序失败：${workspaceErrorMessage(saveError)}`);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  if (!selectedPlan) {
+    return (
+      <EmptyState
+        icon={GripVertical}
+        title="还没有可排序的 MultiRouter"
+        detail="先创建或选择一个多路路由方案，再调整 Codex 模型选择器中的全量模型顺序。"
+        actionLabel="创建多路路由"
+        onAction={onCreatePlan}
+      />
+    );
+  }
+
+  if (catalog.models.length === 0) {
+    return (
+      <EmptyState
+        icon={GripVertical}
+        title="当前方案没有模型目录"
+        detail="先在“路由规则”中接入模型源并保存，模型目录生成后即可在这里排序。"
+        actionLabel="前往路由规则"
+      />
+    );
+  }
+
+  return (
+    <section className="rounded-lg border border-blue-200 bg-blue-50/50 p-4 dark:border-blue-700/40 dark:bg-blue-950/10">
+      <SectionHeader
+        icon={GripVertical}
+        title="Codex 模型排序"
+        detail="拖动调整所有自定义模型在 Codex 模型选择器中的顺序。子 Agent 候选、路由规则和默认模型不会因此改变。"
+        action={
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={isSaving || !hasCustomOrder}
+              onClick={() => void saveOrder(true)}
+            >
+              恢复默认
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={isSaving || !hasChanges}
+              onClick={() => void saveOrder()}
+              className="gap-2 bg-blue-600 hover:bg-blue-500"
+            >
+              <Save className="h-4 w-4" />
+              保存顺序
+            </Button>
+          </div>
+        }
+      />
+
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={draftModels
+            .map((model) => model.model?.trim())
+            .filter((model): model is string => Boolean(model))}
+          strategy={verticalListSortingStrategy}
+        >
+          <div className="mt-4 space-y-2">
+            {draftModels.map((model, index) => (
+              <SortableCatalogModel
+                key={model.model}
+                model={model}
+                index={index}
+              />
+            ))}
+          </div>
+        </SortableContext>
+      </DndContext>
+
+      {message ? (
+        <p className="mt-3 text-xs text-emerald-700 dark:text-emerald-200">
+          {message}
+        </p>
+      ) : null}
+      {error ? (
+        <p className="mt-3 text-xs text-rose-700 dark:text-rose-200">{error}</p>
+      ) : null}
+    </section>
+  );
+}
+
 /// 路由规则页提供方案选择、规则列表和右侧详情，形成真实的“查/改/删入口”工作流。
 function RoutesTab({
   routingPlans,
@@ -3559,6 +4496,7 @@ function RoutesTab({
   onSaveRoutes,
   onSelectPlan,
   onSelectRoute,
+  onEditProvider,
   onEditPlan,
   onDeletePlan,
   proxyStatus,
@@ -3589,6 +4527,7 @@ function RoutesTab({
   onSaveRoutes: (plan: Provider, routes: CodexRoute[]) => Promise<void>;
   onSelectPlan: (provider: Provider) => void;
   onSelectRoute: (entry: RouteEntry) => void;
+  onEditProvider: (provider: Provider) => void;
   onEditPlan: (provider: Provider, detail?: string) => void;
   onDeletePlan: (provider: Provider) => void;
   proxyStatus?: ProxyStatus;
@@ -3692,7 +4631,11 @@ function RoutesTab({
                       : "border-border bg-card text-foreground hover:border-blue-400 hover:bg-blue-50 dark:border-slate-700 dark:bg-slate-950/40 dark:hover:border-blue-500 dark:hover:bg-blue-950/20",
                   )}
                 >
-                  <PlanCardContent provider={provider} compact />
+                  <PlanCardContent
+                    provider={provider}
+                    providersById={providersById}
+                    compact
+                  />
                   <div className="mt-2 flex flex-wrap gap-2">
                     <Button
                       type="button"
@@ -3787,6 +4730,19 @@ function RoutesTab({
             selectedPlan={selectedPlan}
             providersById={providersById}
             onOpenRoutePicker={onOpenRoutePicker}
+            onEditProvider={onEditProvider}
+            onFollowAllModels={async () => {
+              if (!selectedPlan || !selectedRoute) return;
+              const routes = readCodexRouting(selectedPlan)?.routes ?? [];
+              await onSaveRoutes(
+                selectedPlan,
+                routes.map((route, index) =>
+                  index === selectedRoute.index
+                    ? { ...route, modelSelection: { mode: "all" } }
+                    : route,
+                ),
+              );
+            }}
           />
         </section>
       </div>
@@ -3809,6 +4765,7 @@ function RoutesTab({
           <MultiRouterSettingsPanel
             selectedPlan={selectedPlan}
             selectedRoutes={selectedPlanRoutes}
+            providersById={providersById}
             onSave={onSavePlanSettings}
             onClose={() => onPlanSettingsOpenChange(false)}
             isSaving={isSavingPlanSettings}
@@ -3832,11 +4789,6 @@ function RoutesTab({
       <ProviderModelRefreshPanel
         modelSources={modelSources}
         states={providerModelRefreshStates}
-      />
-
-      <SpawnAgentCandidatesPanel
-        selectedPlan={selectedPlan}
-        selectedRoutes={selectedPlanRoutes}
       />
     </div>
   );
@@ -3970,12 +4922,14 @@ function StatusInlineItem({
 function MultiRouterSettingsPanel({
   selectedPlan,
   selectedRoutes,
+  providersById,
   onSave,
   onClose,
   isSaving,
 }: {
   selectedPlan: Provider;
   selectedRoutes: RouteEntry[];
+  providersById: Map<string, Provider>;
   onSave: (plan: Provider, draft: MultiRouterSettingsDraft) => Promise<void>;
   onClose: () => void;
   isSaving: boolean;
@@ -3988,9 +4942,6 @@ function MultiRouterSettingsPanel({
   const [name, setName] = useState(selectedPlan.name);
   const [notes, setNotes] = useState(selectedPlan.notes ?? "");
   const [enabled, setEnabled] = useState(selectedRouting.enabled !== false);
-  const [defaultRouteId, setDefaultRouteId] = useState(
-    selectedRouting.defaultRouteId ?? "",
-  );
   const [officialAuthMode, setOfficialAuthMode] =
     useState<CodexOfficialAuthMode>(initialOfficialAuth.mode);
   const [officialAccountId, setOfficialAccountId] = useState(
@@ -4029,7 +4980,6 @@ function MultiRouterSettingsPanel({
     setName(selectedPlan.name);
     setNotes(selectedPlan.notes ?? "");
     setEnabled(routing.enabled !== false);
-    setDefaultRouteId(routing.defaultRouteId ?? "");
     const officialAuth = readRouterOfficialAuth(routing);
     setOfficialAuthMode(officialAuth.mode);
     setOfficialAccountId(officialAuth.accountId ?? "");
@@ -4051,7 +5001,7 @@ function MultiRouterSettingsPanel({
 
   useEffect(() => {
     if (!globalProxyConfigError) return;
-    setListenerError(globalProxyConfigError.message);
+    setListenerError(workspaceErrorMessage(globalProxyConfigError));
   }, [globalProxyConfigError]);
 
   /// 保存前同时写回方案草稿和全局监听配置；API Key 仍不在 MultiRouter 页面直接编辑。
@@ -4083,7 +5033,7 @@ function MultiRouterSettingsPanel({
         queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
       }
     } catch (error) {
-      setListenerError(error instanceof Error ? error.message : String(error));
+      setListenerError(workspaceErrorMessage(error));
       setIsSavingListener(false);
       return;
     }
@@ -4108,7 +5058,6 @@ function MultiRouterSettingsPanel({
       name,
       notes,
       enabled,
-      defaultRouteId,
       officialAuth: nextOfficialAuth,
       hostedTools: {
         webSearch: webSearchEnabled,
@@ -4129,15 +5078,14 @@ function MultiRouterSettingsPanel({
     setIsSavingListener(false);
   }
 
-  const routeOptions = selectedRoutes
-    .map(({ route }) => ({
-      id: route.id,
-      label: route.label || route.id || "未命名规则",
-      enabled: route.enabled !== false,
-    }))
-    .filter((route): route is { id: string; label: string; enabled: boolean } =>
-      Boolean(route.id),
-    );
+  const legacyDefaultRoute = selectedRouting.defaultRouteId
+    ? selectedRoutes.find(
+        ({ route }) => route.id === selectedRouting.defaultRouteId,
+      )
+    : undefined;
+  const legacyDefaultRouteName = legacyDefaultRoute
+    ? routeDisplayName(legacyDefaultRoute.route, providersById)
+    : undefined;
   const listenerPreview = validateProxyListenDraft(listenAddress, listenPort);
   const previewBaseUrl = listenerPreview.ok
     ? listenerPreview.baseUrl
@@ -4179,7 +5127,7 @@ function MultiRouterSettingsPanel({
       <SectionHeader
         icon={Settings2}
         title="多路路由设置"
-        detail="这里配置 MultiRouter 方案名称、默认路由和本地代理监听入口；上游 API Key 仍由各 route 目标模型源维护。"
+        detail="这里配置 MultiRouter 方案名称和本地代理监听入口；上游 API Key 仍由各 route 目标模型源维护。"
         action={
           <div className="flex flex-wrap gap-2">
             <Button
@@ -4256,31 +5204,16 @@ function MultiRouterSettingsPanel({
             }}
             disabled={isSaving || isSavingListener}
           />
-          <div className="grid gap-2">
-            <label className="text-xs font-semibold text-muted-foreground dark:text-slate-300">
-              默认路由
-            </label>
-            <select
-              value={defaultRouteId}
-              onChange={(event) => setDefaultRouteId(event.target.value)}
-              className="h-10 rounded-md border border-blue-200 bg-background px-3 text-sm outline-none transition focus:border-blue-400 focus:ring-2 focus:ring-blue-500/20 dark:border-blue-700/50 dark:bg-slate-950/80 dark:focus:ring-blue-500/30"
-              disabled={
-                isSaving || isSavingListener || routeOptions.length === 0
-              }
-            >
-              <option value="">不设置默认路由</option>
-              {routeOptions.map((route) => (
-                <option key={route.id} value={route.id}>
-                  {route.label}
-                  {route.enabled ? "" : "（已停用）"}
-                </option>
-              ))}
-            </select>
-            <p className="text-xs leading-5 text-muted-foreground dark:text-slate-500">
-              没有精确命中 model
-              时才会使用默认路由；匹配规则仍在“编辑匹配规则”里选择。
-            </p>
-          </div>
+          {selectedRouting.defaultRouteId && (
+            <div className="grid gap-1 rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-600/50 dark:bg-amber-950/20 dark:text-amber-100">
+              <span className="font-semibold">旧版默认路由已停用</span>
+              <span className="leading-5">
+                旧配置指向「{legacyDefaultRouteName ?? "已删除的路由"}」。
+                严格路由不会使用它；保存设置和路由规则时会保留该兼容字段。
+                它只用于兼容展示，不参与当前转发。
+              </span>
+            </div>
+          )}
           <div className="grid gap-3 rounded-lg border border-blue-200 bg-blue-50/70 p-3 dark:border-blue-700/40 dark:bg-blue-950/10">
             <div>
               <label className="text-xs font-semibold text-muted-foreground dark:text-slate-300">
@@ -4580,6 +5513,17 @@ function RouteCandidatePicker({
   const [enabledIds, setEnabledIds] = useState<Set<string>>(() =>
     buildInitialRoutePickerEnabledIds(candidates, selectAllByDefault),
   );
+  const [routeDraftsById, setRouteDraftsById] = useState<
+    Record<string, RoutePolicyDraft>
+  >(() =>
+    Object.fromEntries(
+      candidates.map((candidate) => [
+        candidate.id,
+        createRoutePolicyDraft(candidate),
+      ]),
+    ),
+  );
+  const [routePolicyError, setRoutePolicyError] = useState<string | null>(null);
 
   useEffect(() => {
     const currentPlanId = selectedPlan?.id ?? null;
@@ -4595,6 +5539,14 @@ function RouteCandidatePicker({
     if (previousPlanId !== currentPlanId) {
       setSelectedIds(new Set(selectedDefaults));
       setEnabledIds(new Set(enabledDefaults));
+      setRouteDraftsById(
+        Object.fromEntries(
+          candidates.map((candidate) => [
+            candidate.id,
+            createRoutePolicyDraft(candidate),
+          ]),
+        ),
+      );
     } else {
       setSelectedIds((current) =>
         mergeRoutePickerDraftIds(
@@ -4612,7 +5564,17 @@ function RouteCandidatePicker({
           enabledDefaults,
         ),
       );
+      setRouteDraftsById((current) =>
+        Object.fromEntries(
+          candidates.map((candidate) => [
+            candidate.id,
+            current[candidate.id] ?? createRoutePolicyDraft(candidate),
+          ]),
+        ),
+      );
     }
+
+    setRoutePolicyError(null);
 
     draftPlanIdRef.current = currentPlanId;
     draftCandidateIdsRef.current = candidateIds;
@@ -4631,14 +5593,60 @@ function RouteCandidatePicker({
     });
   }
 
+  function updateRoutePolicyDraft(
+    id: string,
+    update: (draft: RoutePolicyDraft) => RoutePolicyDraft,
+  ) {
+    setRoutePolicyError(null);
+    setRouteDraftsById((current) => {
+      const candidate = candidates.find((item) => item.id === id);
+      if (!candidate) return current;
+      const draft = current[id] ?? createRoutePolicyDraft(candidate);
+      return { ...current, [id]: update(draft) };
+    });
+  }
+
   /// 保存前只保留勾选项，并把启用状态同步到 route.enabled；取消勾选即删除该 route。
   async function handleSave() {
-    const routes = candidates
-      .filter((candidate) => selectedIds.has(candidate.id))
-      .map((candidate) => ({
-        ...candidate.route,
-        enabled: enabledIds.has(candidate.id),
-      }));
+    const routes: CodexRoute[] = [];
+    for (const candidate of candidates) {
+      if (!selectedIds.has(candidate.id)) continue;
+      const enabled = enabledIds.has(candidate.id);
+      const draft =
+        routeDraftsById[candidate.id] ?? createRoutePolicyDraft(candidate);
+      const canonicalModels = collectProviderCanonicalModelIds(
+        candidate.canonicalProvider,
+      );
+      const canonicalSet = new Set(canonicalModels);
+      const aliasesResult = parseRouteAliases(draft.aliasesText);
+      if (aliasesResult.error) {
+        setRoutePolicyError(aliasesResult.error);
+        return;
+      }
+      for (const upstreamModel of Object.values(aliasesResult.aliases)) {
+        if (enabled && !canonicalSet.has(upstreamModel)) {
+          setRoutePolicyError(
+            `别名目标“${upstreamModel}”不在目标供应商的上游模型列表中`,
+          );
+          return;
+        }
+      }
+      if (
+        enabled &&
+        draft.route.modelSelection?.mode === "include" &&
+        draft.route.modelSelection.models.length === 0
+      ) {
+        setRoutePolicyError("请至少选择一个上游模型");
+        return;
+      }
+      routes.push({
+        ...draft.route,
+        enabled,
+        matchPrefixes: parseRoutePolicyList(draft.prefixesText),
+        aliases: aliasesResult.aliases,
+      });
+    }
+    setRoutePolicyError(null);
     await onSaveRoutes(selectedPlan, routes);
   }
 
@@ -4646,7 +5654,7 @@ function RouteCandidatePicker({
     <section className="rounded-lg border border-emerald-200 bg-card p-3 shadow-[0_0_0_1px_rgba(16,185,129,0.10)] dark:border-emerald-700/50 dark:bg-slate-950/70 dark:shadow-[0_0_0_1px_rgba(16,185,129,0.15)]">
       <SectionHeader
         icon={Route}
-        title="选择候选 router"
+        title="选择候选路由"
         detail="这里直接选择哪些模型源进入当前多路路由；取消勾选会从规则中移除，不再打开普通供应商编辑表单。"
         action={
           <div className="flex flex-wrap gap-2">
@@ -4713,6 +5721,15 @@ function RouteCandidatePicker({
         }
       />
 
+      {routePolicyError ? (
+        <div
+          role="alert"
+          className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-100"
+        >
+          {routePolicyError}
+        </div>
+      ) : null}
+
       <div className="mt-2 grid gap-2 md:grid-cols-2">
         {candidates.map((candidate) => {
           const checked = selectedIds.has(candidate.id);
@@ -4724,6 +5741,15 @@ function RouteCandidatePicker({
           const refreshState = candidate.provider
             ? providerModelRefreshStates[candidate.provider.id]
             : undefined;
+          const draft =
+            routeDraftsById[candidate.id] ?? createRoutePolicyDraft(candidate);
+          const canonicalModels = collectProviderCanonicalModelIds(
+            candidate.canonicalProvider,
+          );
+          const modelSelection = draft.route.modelSelection ?? { mode: "all" };
+          const authPolicy = draft.route.authPolicy ?? {
+            source: "provider_config" as const,
+          };
           return (
             <div
               key={candidate.id}
@@ -4753,7 +5779,12 @@ function RouteCandidatePicker({
                   <span className="min-w-0">
                     <span className="flex min-w-0 flex-wrap items-center gap-2">
                       <span className="truncate text-sm font-semibold text-foreground dark:text-slate-100">
-                        {candidate.route.label || targetLabel}
+                        {routeSummaryDisplayName(
+                          candidate.route.label,
+                          candidate.route.id,
+                          candidate.provider?.name,
+                          targetLabel,
+                        )}
                       </span>
                       <Badge
                         className={cn(
@@ -4804,6 +5835,223 @@ function RouteCandidatePicker({
                   {!checked ? "启用" : enabled ? "已启用" : "已停用"}
                 </Button>
               </div>
+              {checked ? (
+                <div className="mt-3 space-y-3 rounded-md border border-emerald-200/80 bg-background/80 p-2.5 dark:border-emerald-700/40 dark:bg-slate-950/50">
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <label className="space-y-1 text-xs text-muted-foreground">
+                      <span>路由名称</span>
+                      <input
+                        aria-label={`路由名称：${targetLabel}`}
+                        value={draft.route.label ?? ""}
+                        onChange={(event) =>
+                          updateRoutePolicyDraft(candidate.id, (current) => ({
+                            ...current,
+                            route: {
+                              ...current.route,
+                              label: event.target.value,
+                            },
+                          }))
+                        }
+                        className="h-8 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+                      />
+                    </label>
+                    <label className="space-y-1 text-xs text-muted-foreground">
+                      <span>模型选择范围</span>
+                      <select
+                        aria-label={`模型选择范围：${targetLabel}`}
+                        value={modelSelection.mode}
+                        onChange={(event) =>
+                          updateRoutePolicyDraft(candidate.id, (current) => ({
+                            ...current,
+                            route: {
+                              ...current.route,
+                              modelSelection:
+                                event.target.value === "include"
+                                  ? {
+                                      mode: "include",
+                                      models: collectProviderCanonicalModelIds(
+                                        candidate.canonicalProvider,
+                                      ),
+                                    }
+                                  : { mode: "all" },
+                            },
+                          }))
+                        }
+                        className="h-8 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+                      >
+                        <option value="all">全部模型（自动接收新增）</option>
+                        <option value="include">仅选中的上游模型</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  {modelSelection.mode === "include" ? (
+                    <div className="space-y-1">
+                      <div className="text-xs text-muted-foreground">
+                        供应商当前的上游模型
+                      </div>
+                      <div className="text-xs leading-5 text-muted-foreground">
+                        {routeProviderModelSyncSummary(
+                          draft.route,
+                          candidate.canonicalProvider,
+                        )}
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {canonicalModels.map((model) => (
+                          <label
+                            key={model}
+                            className="flex items-center gap-1.5 rounded-md border border-border bg-muted/50 px-2 py-1 text-xs text-foreground"
+                          >
+                            <input
+                              type="checkbox"
+                              aria-label={`选择上游模型 ${model}`}
+                              checked={modelSelection.models.includes(model)}
+                              onChange={(event) =>
+                                updateRoutePolicyDraft(
+                                  candidate.id,
+                                  (current) => {
+                                    const selection =
+                                      current.route.modelSelection?.mode ===
+                                      "include"
+                                        ? current.route.modelSelection.models
+                                        : [];
+                                    const models = event.target.checked
+                                      ? Array.from(
+                                          new Set([...selection, model]),
+                                        )
+                                      : selection.filter(
+                                          (item) => item !== model,
+                                        );
+                                    return {
+                                      ...current,
+                                      route: {
+                                        ...current.route,
+                                        modelSelection: {
+                                          mode: "include",
+                                          models,
+                                        },
+                                      },
+                                    };
+                                  },
+                                )
+                              }
+                            />
+                            {model}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <label className="space-y-1 text-xs text-muted-foreground">
+                      <span>匹配前缀（逗号或换行分隔）</span>
+                      <textarea
+                        aria-label={`匹配前缀：${targetLabel}`}
+                        value={draft.prefixesText}
+                        onChange={(event) =>
+                          updateRoutePolicyDraft(candidate.id, (current) => ({
+                            ...current,
+                            prefixesText: event.target.value,
+                          }))
+                        }
+                        rows={2}
+                        className="w-full rounded-md border border-input bg-background px-2 py-1.5 text-sm text-foreground"
+                      />
+                    </label>
+                    <label className="space-y-1 text-xs text-muted-foreground">
+                      <span>可见别名（可见模型=上游模型）</span>
+                      <textarea
+                        aria-label={`可见别名映射：${targetLabel}`}
+                        value={draft.aliasesText}
+                        onChange={(event) =>
+                          updateRoutePolicyDraft(candidate.id, (current) => ({
+                            ...current,
+                            aliasesText: event.target.value,
+                          }))
+                        }
+                        rows={2}
+                        className="w-full rounded-md border border-input bg-background px-2 py-1.5 text-sm text-foreground"
+                      />
+                    </label>
+                  </div>
+
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <label className="space-y-1 text-xs text-muted-foreground">
+                      <span>认证策略引用</span>
+                      <select
+                        aria-label={`认证策略：${targetLabel}`}
+                        value={authPolicy.source}
+                        onChange={(event) => {
+                          const source = event.target
+                            .value as CodexRoutingAuth["source"];
+                          updateRoutePolicyDraft(candidate.id, (current) => ({
+                            ...current,
+                            route: {
+                              ...current.route,
+                              authPolicy: {
+                                source,
+                                ...(source === "managed_codex_oauth" ||
+                                source === "managed_account" ||
+                                source === "account_pool"
+                                  ? {
+                                      accountId:
+                                        current.route.authPolicy?.accountId,
+                                    }
+                                  : {}),
+                              },
+                            },
+                          }));
+                        }}
+                        className="h-8 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+                      >
+                        <option value="provider_config">
+                          Provider 配置认证
+                        </option>
+                        <option value="native_codex_auth">
+                          Codex Desktop 当前登录
+                        </option>
+                        <option value="managed_codex_oauth">
+                          托管 Codex OAuth
+                        </option>
+                        <option value="account_pool">OAuth 账号池</option>
+                      </select>
+                    </label>
+                    {authPolicy.source === "managed_codex_oauth" ||
+                    authPolicy.source === "managed_account" ||
+                    authPolicy.source === "account_pool" ? (
+                      <label className="space-y-1 text-xs text-muted-foreground">
+                        <span>账号/策略引用 ID（不保存 Token）</span>
+                        <input
+                          aria-label={`${
+                            authPolicy.source === "managed_codex_oauth"
+                              ? "托管 OAuth 账号 ID"
+                              : "账号池策略 ID"
+                          }：${targetLabel}`}
+                          value={authPolicy.accountId ?? ""}
+                          onChange={(event) =>
+                            updateRoutePolicyDraft(candidate.id, (current) => ({
+                              ...current,
+                              route: {
+                                ...current.route,
+                                authPolicy: {
+                                  source: authPolicy.source,
+                                  accountId: event.target.value,
+                                },
+                              },
+                            }))
+                          }
+                          className="h-8 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+                        />
+                      </label>
+                    ) : null}
+                  </div>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    地址、API Key、协议、上下文和能力由目标
+                    Provider/模型条目维护；这里仅保存无密钥 Route policy。
+                  </p>
+                </div>
+              ) : null}
               <div className="mt-2 flex flex-wrap gap-1.5 text-xs">
                 {candidate.matchModels.slice(0, 6).map((model) => (
                   <span
@@ -4867,9 +6115,11 @@ function RouteCandidatePicker({
 function SpawnAgentCandidatesPanel({
   selectedPlan,
   selectedRoutes,
+  catalog,
 }: {
   selectedPlan: Provider | null;
   selectedRoutes: RouteEntry[];
+  catalog: CodexModelCatalogDraft;
 }) {
   const [diagnostics, setDiagnostics] =
     useState<CodexMultiRouterDiagnostics | null>(null);
@@ -4889,6 +6139,19 @@ function SpawnAgentCandidatesPanel({
   >(null);
   const [isSavingCandidates, setIsSavingCandidates] = useState(false);
   const [isValidatingCandidates, setIsValidatingCandidates] = useState(false);
+  const persistedSubagentVersion =
+    readCodexRouting(selectedPlan)?.subagentVersion ?? "v2";
+  const [activeSubagentVersion, setActiveSubagentVersion] =
+    useState<CodexSubagentVersion>(persistedSubagentVersion);
+  const [isSavingSubagentVersion, setIsSavingSubagentVersion] = useState(false);
+  const [pendingSubagentVersion, setPendingSubagentVersion] =
+    useState<CodexSubagentVersion | null>(null);
+  const [subagentVersionError, setSubagentVersionError] = useState<
+    string | null
+  >(null);
+  const [subagentVersionMessage, setSubagentVersionMessage] = useState<
+    string | null
+  >(null);
   const queryClient = useQueryClient();
   const candidateSensors = useSensors(
     useSensor(PointerSensor),
@@ -4896,7 +6159,10 @@ function SpawnAgentCandidatesPanel({
       coordinateGetter: sortableKeyboardCoordinates,
     }),
   );
-  const selectedCatalog = readCodexModelCatalog(selectedPlan);
+  const selectedCatalog = {
+    ...catalog,
+    spawnAgentModels: catalog.spawnAgentModels ?? [],
+  };
   const selectedCatalogModelKey = selectedCatalog.models
     .map((model) => model.model?.trim() ?? "")
     .join("\n");
@@ -4966,6 +6232,28 @@ function SpawnAgentCandidatesPanel({
     selectedCatalog.spawnAgentModels.join("\n");
   const spawnAgentMissingPriorityModels =
     diagnostics?.liveConfig.spawnAgentMissingPriorityModels ?? [];
+  const isFlashRoleModel = (name: string) => {
+    const normalized = name.trim().toLowerCase();
+    return (
+      (normalized === "deepseek-v4-flash" ||
+        normalized.startsWith("deepseek-v4-flash-")) &&
+      !normalized.includes("vision")
+    );
+  };
+  const hasFlashRoleModel = selectedCatalog.models.some((model) =>
+    isFlashRoleModel(model.model?.trim() ?? ""),
+  );
+  const hasProRoleModel = selectedCatalog.models.some((model) => {
+    const name = model.model?.trim().toLowerCase() ?? "";
+    return name === "deepseek-v4-pro" || name.startsWith("deepseek-v4-pro-");
+  });
+
+  useEffect(() => {
+    setActiveSubagentVersion(persistedSubagentVersion);
+    setSubagentVersionError(null);
+    setSubagentVersionMessage(null);
+    setPendingSubagentVersion(null);
+  }, [persistedSubagentVersion, selectedPlan?.id]);
 
   useEffect(() => {
     setDraftSpawnAgentModels(
@@ -5017,7 +6305,7 @@ function SpawnAgentCandidatesPanel({
     );
   }
 
-  /// 写回 provider 时只更新 cc-switch 私有的 modelCatalog.spawnAgentModels，避免破坏 auth、routing 和统计归属。
+  /// schema v2 只保存用户选择的 spawn-agent policy；可见 catalog 由 compiler 重建。
   async function saveSpawnAgentCandidates() {
     if (!selectedPlan) return;
     setIsSavingCandidates(true);
@@ -5029,19 +6317,18 @@ function SpawnAgentCandidatesPanel({
         selectedCatalog.models,
         spawnAgentVisibleLimit,
       );
-      const currentModelCatalog =
-        selectedPlan.settingsConfig?.modelCatalog &&
-        typeof selectedPlan.settingsConfig.modelCatalog === "object"
-          ? selectedPlan.settingsConfig.modelCatalog
-          : {};
+      const currentRouting = readCodexRouting(selectedPlan);
+      if (currentRouting?.schemaVersion !== 2) {
+        throw new Error("legacy_route_requires_migration");
+      }
       const nextProvider: Provider = {
         ...selectedPlan,
         settingsConfig: {
-          ...selectedPlan.settingsConfig,
-          modelCatalog: {
-            ...currentModelCatalog,
+          ...withoutDerivedRouterCatalog(selectedPlan.settingsConfig),
+          codexRouting: serializeCodexRoutingV2({
+            ...currentRouting,
             spawnAgentModels: normalized,
-          },
+          }),
         },
       };
       await providersApi.update(nextProvider, "codex");
@@ -5051,11 +6338,45 @@ function SpawnAgentCandidatesPanel({
       );
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
     } catch (error) {
-      setCandidateSaveError(
-        error instanceof Error ? error.message : String(error),
-      );
+      setCandidateSaveError(workspaceErrorMessage(error));
     } finally {
       setIsSavingCandidates(false);
+    }
+  }
+
+  /// V1/V2 是当前 MultiRouter 的会话级协议选择；切换时保留完整 schema v2 routing policy。
+  async function saveSubagentVersion(version: CodexSubagentVersion) {
+    if (!selectedPlan || version === activeSubagentVersion) return;
+    setIsSavingSubagentVersion(true);
+    setPendingSubagentVersion(version);
+    setSubagentVersionError(null);
+    setSubagentVersionMessage(null);
+    try {
+      const currentRouting = readCodexRouting(selectedPlan);
+      if (currentRouting?.schemaVersion !== 2) {
+        throw new Error("legacy_route_requires_migration");
+      }
+      const nextProvider: Provider = {
+        ...selectedPlan,
+        settingsConfig: {
+          ...withoutDerivedRouterCatalog(selectedPlan.settingsConfig),
+          codexRouting: serializeCodexRoutingV2({
+            ...currentRouting,
+            subagentVersion: version,
+          }),
+        },
+      };
+      await providersApi.update(nextProvider, "codex");
+      setActiveSubagentVersion(version);
+      setSubagentVersionMessage(
+        `已启用 ${version.toUpperCase()}；重启 Codex/app-server 并新建会话后生效。`,
+      );
+      await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
+    } catch (error) {
+      setSubagentVersionError(workspaceErrorMessage(error));
+    } finally {
+      setIsSavingSubagentVersion(false);
+      setPendingSubagentVersion(null);
     }
   }
 
@@ -5087,7 +6408,7 @@ function SpawnAgentCandidatesPanel({
       );
     } catch (error) {
       setCandidateValidationMessage(
-        `校验失败：${error instanceof Error ? error.message : String(error)}`,
+        `校验失败：${workspaceErrorMessage(error)}`,
       );
     } finally {
       setIsValidatingCandidates(false);
@@ -5095,263 +6416,555 @@ function SpawnAgentCandidatesPanel({
   }
 
   return (
-    <section className="rounded-lg border border-violet-200 bg-violet-50/70 p-3 dark:border-violet-700/40 dark:bg-violet-950/15">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
+    <section className="rounded-xl border border-violet-200 bg-gradient-to-br from-violet-50/90 via-background to-cyan-50/70 p-3 shadow-sm dark:border-violet-500/35 dark:from-violet-950/25 dark:via-slate-950/40 dark:to-cyan-950/20">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="max-w-3xl">
           <div className="flex items-center gap-2 text-sm font-semibold text-violet-800 dark:text-violet-100">
-            <GitBranch className="h-4 w-4" />子 Agent 候选模型
+            <Settings2 className="h-4 w-4" />
+            Sub-Agent 设置
           </div>
-          <div className="mt-0.5 text-xs text-violet-700/80 dark:text-violet-200/80">
-            前 {spawnAgentVisibleLimit} 个进入
-            spawn_agent；拖拽只改候选顺序，不改实际路由。
-          </div>
+          <p className="mt-1 text-xs leading-5 text-violet-700/80 dark:text-violet-200/80">
+            V1 适合旧版 Codex 和需要手工指定子模型的兼容场景；V2 适合新版本
+            Codex，由父 Agent 按任务做 best-effort
+            语义角色选择。两套配置都会保留， 但同一会话只启用一种协议。
+          </p>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={validateSpawnAgentCandidateWindow}
-            disabled={isValidatingCandidates || !selectedPlan}
-            className="gap-2 border-emerald-300 bg-background/70 text-emerald-700 hover:bg-emerald-50 dark:border-emerald-500/50 dark:bg-emerald-500/10 dark:text-emerald-100 dark:hover:bg-emerald-500/20"
-          >
-            {isValidatingCandidates ? (
-              <RefreshCw className="h-4 w-4 animate-spin" />
-            ) : (
-              <CheckCircle2 className="h-4 w-4" />
-            )}
-            校验候选
-          </Button>
-          <Button
-            size="sm"
-            onClick={saveSpawnAgentCandidates}
-            disabled={
-              isSavingCandidates || !selectedPlan || !hasCandidateChanges
-            }
-            className="gap-2 bg-violet-600 hover:bg-violet-500"
-          >
-            {isSavingCandidates ? (
-              <RefreshCw className="h-4 w-4 animate-spin" />
-            ) : (
-              <Save className="h-4 w-4" />
-            )}
-            保存排序
-          </Button>
+        <Badge className="border border-violet-300 bg-background text-violet-800 dark:border-violet-500/50 dark:bg-violet-500/10 dark:text-violet-100">
+          当前使用 {activeSubagentVersion.toUpperCase()}
+        </Badge>
+      </div>
+
+      <div className="mt-3 grid gap-2 lg:grid-cols-2">
+        <div
+          data-subagent-protocol="v1"
+          className={cn(
+            "rounded-lg border p-3 shadow-sm transition-colors",
+            activeSubagentVersion === "v1"
+              ? "border-blue-300 bg-blue-50 dark:border-blue-500/60 dark:bg-blue-950/25"
+              : "border-sky-200 bg-sky-50/70 dark:border-sky-500/40 dark:bg-sky-950/20",
+          )}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-sm font-semibold">Sub-Agent V1</div>
+            <Button
+              size="sm"
+              variant={activeSubagentVersion === "v1" ? "outline" : "default"}
+              disabled={
+                isSavingSubagentVersion || activeSubagentVersion === "v1"
+              }
+              className={cn(
+                activeSubagentVersion === "v1"
+                  ? "border-border bg-muted text-muted-foreground hover:bg-muted"
+                  : "bg-blue-600 text-white hover:bg-blue-500",
+              )}
+              onClick={() => saveSubagentVersion("v1")}
+            >
+              {pendingSubagentVersion === "v1"
+                ? "切换中…"
+                : activeSubagentVersion === "v1"
+                  ? "已启用 V1"
+                  : "启用 V1"}
+            </Button>
+          </div>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            通过 direct model override 暴露并排序前 {spawnAgentVisibleLimit}
+            个候选。适用于旧版
+            Codex、兼容性排查，或明确需要手工控制子模型的场景。
+          </p>
+        </div>
+        <div
+          data-subagent-protocol="v2"
+          className={cn(
+            "rounded-lg border p-3 shadow-sm transition-colors",
+            activeSubagentVersion === "v2"
+              ? "border-emerald-300 bg-emerald-50 dark:border-emerald-500/60 dark:bg-emerald-500/10"
+              : "border-violet-200 bg-violet-50/70 dark:border-violet-500/40 dark:bg-violet-950/20",
+          )}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-sm font-semibold">Sub-Agent V2</div>
+            <Button
+              size="sm"
+              variant={activeSubagentVersion === "v2" ? "outline" : "default"}
+              disabled={
+                isSavingSubagentVersion || activeSubagentVersion === "v2"
+              }
+              className={cn(
+                activeSubagentVersion === "v2"
+                  ? "border-border bg-muted text-muted-foreground hover:bg-muted"
+                  : "bg-blue-600 text-white hover:bg-blue-500",
+              )}
+              onClick={() => saveSubagentVersion("v2")}
+            >
+              {pendingSubagentVersion === "v2"
+                ? "切换中…"
+                : activeSubagentVersion === "v2"
+                  ? "已启用 V2"
+                  : "启用 V2"}
+            </Button>
+          </div>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            使用任务路径、mailbox 和 follow-up；Codex 会在符合条件的内置与自定义
+            角色之间进行 best-effort
+            语义选择。能力问卷与角色说明只提供选择指导， 不保证选择 Flash 或
+            Pro；内置 default、worker、explorer 仍可能被选择。 推荐新版本 Codex
+            使用。
+          </p>
         </div>
       </div>
 
-      <div className="mt-2 grid items-stretch gap-2 xl:grid-cols-[minmax(0,1fr)_minmax(260px,0.65fr)]">
-        <div className="space-y-2">
-          <div>
-            <div className="mb-1.5 text-xs font-semibold text-violet-800 dark:text-violet-100">
-              Codex spawn_agent 前五可用模型
+      {subagentVersionError ? (
+        <div
+          role="alert"
+          className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-100"
+        >
+          切换失败：{subagentVersionError}
+        </div>
+      ) : null}
+      {subagentVersionMessage ? (
+        <div
+          aria-live="polite"
+          className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-100"
+        >
+          {subagentVersionMessage}
+        </div>
+      ) : null}
+      <div className="mt-3 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-800 dark:border-sky-700/50 dark:bg-sky-950/25 dark:text-sky-100">
+        切换协议后请重启 Codex
+        Desktop/app-server，并新建会话；已有会话不会在中途更换子 Agent 协议。
+      </div>
+
+      {activeSubagentVersion === "v2" && selectedPlan ? (
+        <div className="mt-3">
+          <div className="mb-2">
+            <div className="text-sm font-semibold text-emerald-800 dark:text-emerald-100">
+              第一步：配置 V2 子 Agent 模型与能力
             </div>
-            <div className="grid gap-1.5 md:grid-cols-5">
-              {previewVisibleModels.length > 0 ? (
-                previewVisibleModels.map((model, index) => (
-                  <div
-                    key={`${model.model ?? index}-${index}`}
-                    className="min-w-0 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 shadow-[0_0_0_1px_rgba(251,191,36,0.12)] dark:border-amber-400/70 dark:bg-amber-500/15 dark:shadow-[0_0_0_1px_rgba(251,191,36,0.18)]"
-                  >
-                    <div className="flex items-center justify-between gap-2 text-[10px] text-amber-700 dark:text-amber-200">
-                      <span>#{index + 1}</span>
-                      <span>spawn</span>
-                    </div>
-                    <div
-                      className="mt-0.5 truncate font-mono text-[11px] text-foreground dark:text-slate-50"
-                      title={catalogModelLabel(model)}
-                    >
-                      {catalogModelLabel(model)}
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <div className="rounded-md border border-violet-200 bg-background/80 px-3 py-2 text-xs text-violet-800 dark:border-violet-800/60 dark:bg-slate-950/45 dark:text-violet-100 md:col-span-5">
-                  当前 MultiRouter provider 还没有
-                  modelCatalog；请先在模型映射里添加 OpenAI / Qwen / DeepSeek
-                  等候选模型。
-                </div>
-              )}
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              先从完整可路由目录添加模型并配置角色能力；保存能力配置后，再在下方选择
+              Codex 工具说明优先展示的前 {spawnAgentVisibleLimit} 个模型。
+            </p>
+          </div>
+          <CodexSubagentProfileEditor
+            provider={selectedPlan}
+            modelCatalog={selectedCatalog}
+          />
+        </div>
+      ) : null}
+
+      {activeSubagentVersion === "v2" ? (
+        <div className="mt-3 grid gap-2 lg:grid-cols-2">
+          <div className="rounded-md border border-emerald-200 bg-background/75 p-3 dark:border-emerald-700/50 dark:bg-slate-950/30">
+            <div className="flex items-center justify-between gap-2">
+              <code className="text-xs font-semibold">deepseek-flash</code>
+              <Badge
+                className={cn(
+                  "border",
+                  hasFlashRoleModel
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/40 dark:bg-emerald-500/10 dark:text-emerald-100"
+                    : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100",
+                )}
+              >
+                {hasFlashRoleModel ? "可路由" : "目录中缺失"}
+              </Badge>
+            </div>
+            <p className="mt-2 text-xs leading-5 text-muted-foreground">
+              长上下文阅读、代码库扫描、架构追踪、并行证据收集和轻量验证。
+            </p>
+          </div>
+          <div className="rounded-md border border-emerald-200 bg-background/75 p-3 dark:border-emerald-700/50 dark:bg-slate-950/30">
+            <div className="flex items-center justify-between gap-2">
+              <code className="text-xs font-semibold">deepseek-pro</code>
+              <Badge
+                className={cn(
+                  "border",
+                  hasProRoleModel
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/40 dark:bg-emerald-500/10 dark:text-emerald-100"
+                    : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100",
+                )}
+              >
+                {hasProRoleModel ? "可路由" : "目录中缺失"}
+              </Badge>
+            </div>
+            <p className="mt-2 text-xs leading-5 text-muted-foreground">
+              复杂调试、跨模块推理、架构决策、高风险审查和复杂实现。
+            </p>
+          </div>
+          <p className="text-xs leading-5 text-violet-700/80 dark:text-violet-200/80 lg:col-span-2">
+            V2 managed roles 仍从完整可路由模型目录生成；下方前五顺序只决定
+            spawn_agent 工具向父 Agent 优先宣传哪些 direct model
+            override，不会删除其余角色或模型。
+          </p>
+        </div>
+      ) : null}
+
+      {selectedPlan ? (
+        <div className="mt-3 rounded-md border border-amber-200 bg-background/70 p-3 dark:border-amber-700/50 dark:bg-slate-950/30">
+          <div className="text-sm font-semibold text-amber-800 dark:text-amber-100">
+            {activeSubagentVersion === "v2"
+              ? "第二步：选择 V2 工具说明的前五模型"
+              : "V1 direct model override"}
+          </div>
+          <p className="mt-1 text-xs text-amber-700/80 dark:text-amber-200/80">
+            {activeSubagentVersion === "v2"
+              ? "Codex Multi-agent V2 当前也只在 spawn_agent 工具说明中展示前五个模型；其余可路由模型仍可被显式调用。这里保存 V1/V2 共用的宣传顺序。"
+              : "此排序用于 V1 的 direct model override 可见窗口，并保留在当前 MultiRouter 配置中；切换到 V2 后会继续复用。"}
+          </p>
+          <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+            <div className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={validateSpawnAgentCandidateWindow}
+                disabled={isValidatingCandidates || !selectedPlan}
+                className="gap-2 border-emerald-300 bg-background/70 text-emerald-700 hover:bg-emerald-50 dark:border-emerald-500/50 dark:bg-emerald-500/10 dark:text-emerald-100 dark:hover:bg-emerald-500/20"
+              >
+                {isValidatingCandidates ? (
+                  <RefreshCw className="h-4 w-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 className="h-4 w-4" />
+                )}
+                校验候选
+              </Button>
+              <Button
+                size="sm"
+                onClick={saveSpawnAgentCandidates}
+                disabled={
+                  isSavingCandidates || !selectedPlan || !hasCandidateChanges
+                }
+                className="gap-2 bg-violet-600 hover:bg-violet-500"
+              >
+                {isSavingCandidates ? (
+                  <RefreshCw className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Save className="h-4 w-4" />
+                )}
+                保存排序
+              </Button>
             </div>
           </div>
 
-          <div>
-            <div className="mb-1.5 flex items-center justify-between gap-2">
-              <div className="text-xs font-semibold text-violet-800 dark:text-violet-100">
-                可拖拽排序的前五候选
-              </div>
-              <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
-                {draftSpawnAgentModels.length} / {spawnAgentVisibleLimit}
-              </Badge>
-            </div>
-            <DndContext
-              sensors={candidateSensors}
-              collisionDetection={closestCenter}
-              onDragEnd={handleSpawnAgentDragEnd}
-            >
-              <SortableContext
-                items={draftSpawnAgentModels}
-                strategy={verticalListSortingStrategy}
-              >
-                <div className="grid gap-1.5">
-                  {draftVisibleModels.length > 0 ? (
-                    draftVisibleModels.map((model, index) => (
-                      <SortableSpawnAgentCandidate
-                        key={model.model}
-                        model={model}
-                        index={index}
-                        onRemove={toggleSpawnAgentCandidate}
-                      />
+          <div className="mt-2 grid items-stretch gap-2 xl:grid-cols-[minmax(0,1fr)_minmax(260px,0.65fr)]">
+            <div className="space-y-2">
+              <div>
+                <div className="mb-1.5 text-xs font-semibold text-violet-800 dark:text-violet-100">
+                  Codex spawn_agent 前五可用模型
+                </div>
+                <div className="grid gap-1.5 md:grid-cols-5">
+                  {previewVisibleModels.length > 0 ? (
+                    previewVisibleModels.map((model, index) => (
+                      <div
+                        key={`${model.model ?? index}-${index}`}
+                        className="min-w-0 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 shadow-[0_0_0_1px_rgba(251,191,36,0.12)] dark:border-amber-400/70 dark:bg-amber-500/15 dark:shadow-[0_0_0_1px_rgba(251,191,36,0.18)]"
+                      >
+                        <div className="flex items-center justify-between gap-2 text-[10px] text-amber-700 dark:text-amber-200">
+                          <span>#{index + 1}</span>
+                          <span>spawn</span>
+                        </div>
+                        <div
+                          className="mt-0.5 truncate font-mono text-[11px] text-foreground dark:text-slate-50"
+                          title={catalogModelLabel(model)}
+                        >
+                          {catalogModelLabel(model)}
+                        </div>
+                      </div>
                     ))
                   ) : (
-                    <div className="rounded-md border border-dashed border-violet-200 bg-background/70 px-3 py-2 text-xs text-violet-800 dark:border-violet-700/60 dark:bg-slate-950/30 dark:text-violet-100">
-                      还没有选择子 Agent 候选；从右侧候选池添加，最多{" "}
-                      {spawnAgentVisibleLimit} 个。
+                    <div className="rounded-md border border-violet-200 bg-background/80 px-3 py-2 text-xs text-violet-800 dark:border-violet-800/60 dark:bg-slate-950/45 dark:text-violet-100 md:col-span-5">
+                      当前 MultiRouter provider 还没有
+                      modelCatalog；请先在模型映射里添加 OpenAI / Qwen /
+                      DeepSeek 等候选模型。
                     </div>
                   )}
                 </div>
-              </SortableContext>
-            </DndContext>
-          </div>
-        </div>
+              </div>
 
-        <div className="flex h-full min-h-0 flex-col rounded-md border border-violet-200 bg-background/70 p-2 dark:border-violet-800/50 dark:bg-slate-950/35">
-          <Tabs
-            value={candidateView}
-            onValueChange={(value) =>
-              setCandidateView(value as SpawnAgentCandidateView)
-            }
-            className="flex h-full min-h-0 flex-col"
-          >
-            <TabsList className="grid w-full grid-cols-4 bg-muted p-1 dark:bg-slate-950/60">
-              <TabsTrigger value="selected">已选</TabsTrigger>
-              <TabsTrigger value="routed">路由</TabsTrigger>
-              <TabsTrigger value="priority">重点</TabsTrigger>
-              <TabsTrigger value="all">全部</TabsTrigger>
-            </TabsList>
-            {(["selected", "routed", "priority", "all"] as const).map(
-              (view) => (
-                <TabsContent
-                  key={view}
-                  value={view}
-                  className="mt-2 min-h-0 flex-1"
-                >
-                  <div className="max-h-[220px] min-h-[132px] space-y-1.5 overflow-y-auto pr-1 xl:max-h-[260px]">
-                    {candidateSourceModels[view].length > 0 ? (
-                      candidateSourceModels[view].map((model) => {
-                        const catalogModel = selectedCatalogByModel.get(
-                          model,
-                        ) ?? { model };
-                        const isSelected = selectedCandidateSet.has(model);
-                        const selectedIndex =
-                          draftSpawnAgentModels.indexOf(model);
-                        return (
-                          <button
-                            key={`${view}-${model}`}
-                            type="button"
-                            onClick={() => toggleSpawnAgentCandidate(model)}
-                            disabled={
-                              !isSelected &&
-                              draftSpawnAgentModels.length >=
-                                spawnAgentVisibleLimit
-                            }
-                            className={cn(
-                              "flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left text-xs transition",
-                              isSelected
-                                ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-400/70 dark:bg-amber-500/15 dark:text-amber-50"
-                                : "border-border bg-card text-foreground hover:border-violet-300 hover:bg-violet-50 dark:border-slate-700 dark:bg-slate-950/45 dark:text-slate-200 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10",
-                              !isSelected &&
-                                draftSpawnAgentModels.length >=
-                                  spawnAgentVisibleLimit
-                                ? "cursor-not-allowed opacity-45"
-                                : "",
-                            )}
-                          >
-                            <span className="min-w-0 truncate font-mono">
-                              {catalogModelLabel(catalogModel)}
-                            </span>
-                            <Badge
-                              className={cn(
-                                "shrink-0 border text-[10px]",
-                                isSelected
-                                  ? "border-amber-300 bg-amber-100 text-amber-800 dark:border-amber-300/70 dark:bg-amber-200/10 dark:text-amber-50"
-                                  : "border-border bg-muted text-muted-foreground dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300",
-                              )}
-                            >
-                              {isSelected
-                                ? `前五 #${selectedIndex + 1}`
-                                : "添加"}
-                            </Badge>
-                          </button>
-                        );
-                      })
-                    ) : (
-                      <div className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground dark:border-slate-700 dark:text-slate-400">
-                        这个来源暂时没有可用模型。
-                      </div>
-                    )}
+              <div>
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <div className="text-xs font-semibold text-violet-800 dark:text-violet-100">
+                    可拖拽排序的前五候选
                   </div>
-                </TabsContent>
-              ),
-            )}
-          </Tabs>
-        </div>
-      </div>
+                  <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
+                    {draftSpawnAgentModels.length} / {spawnAgentVisibleLimit}
+                  </Badge>
+                </div>
+                <DndContext
+                  sensors={candidateSensors}
+                  collisionDetection={closestCenter}
+                  onDragEnd={handleSpawnAgentDragEnd}
+                >
+                  <SortableContext
+                    items={draftSpawnAgentModels}
+                    strategy={verticalListSortingStrategy}
+                  >
+                    <div className="grid gap-1.5">
+                      {draftVisibleModels.length > 0 ? (
+                        draftVisibleModels.map((model, index) => (
+                          <SortableSpawnAgentCandidate
+                            key={model.model}
+                            model={model}
+                            index={index}
+                            onRemove={toggleSpawnAgentCandidate}
+                          />
+                        ))
+                      ) : (
+                        <div className="rounded-md border border-dashed border-violet-200 bg-background/70 px-3 py-2 text-xs text-violet-800 dark:border-violet-700/60 dark:bg-slate-950/30 dark:text-violet-100">
+                          还没有选择子 Agent 候选；从右侧候选池添加，最多{" "}
+                          {spawnAgentVisibleLimit} 个。
+                        </div>
+                      )}
+                    </div>
+                  </SortableContext>
+                </DndContext>
+              </div>
+            </div>
 
-      <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] text-violet-700/80 dark:text-violet-200/80">
-        <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
-          catalog: {selectedCatalog.models.length}
-        </Badge>
-        <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
-          路由命中: {routedCatalogModelIds.length}
-        </Badge>
-        <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
-          来源: {generatedVisibleModels.length > 0 ? "诊断实测" : "配置预览"}
-        </Badge>
-        <Badge
-          className={cn(
-            "border",
-            localCandidateValidation.missingSelectedModels.length === 0
-              ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/40 dark:bg-emerald-500/10 dark:text-emerald-100"
-              : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100",
-          )}
-        >
-          本地检查:{" "}
-          {localCandidateValidation.missingSelectedModels.length === 0
-            ? "已选已覆盖"
-            : `缺 ${localCandidateValidation.missingSelectedModels.length} 个已选`}
-        </Badge>
-      </div>
+            <div className="flex h-full min-h-0 flex-col rounded-md border border-violet-200 bg-background/70 p-2 dark:border-violet-800/50 dark:bg-slate-950/35">
+              <Tabs
+                value={candidateView}
+                onValueChange={(value) =>
+                  setCandidateView(value as SpawnAgentCandidateView)
+                }
+                className="flex h-full min-h-0 flex-col"
+              >
+                <TabsList className="grid w-full grid-cols-4 bg-muted p-1 dark:bg-slate-950/60">
+                  <TabsTrigger value="selected">已选</TabsTrigger>
+                  <TabsTrigger value="routed">路由</TabsTrigger>
+                  <TabsTrigger value="priority">重点</TabsTrigger>
+                  <TabsTrigger value="all">全部</TabsTrigger>
+                </TabsList>
+                {(["selected", "routed", "priority", "all"] as const).map(
+                  (view) => (
+                    <TabsContent
+                      key={view}
+                      value={view}
+                      className="mt-2 min-h-0 flex-1"
+                    >
+                      <div className="max-h-[220px] min-h-[132px] space-y-1.5 overflow-y-auto pr-1 xl:max-h-[260px]">
+                        {candidateSourceModels[view].length > 0 ? (
+                          candidateSourceModels[view].map((model) => {
+                            const catalogModel = selectedCatalogByModel.get(
+                              model,
+                            ) ?? { model };
+                            const isSelected = selectedCandidateSet.has(model);
+                            const selectedIndex =
+                              draftSpawnAgentModels.indexOf(model);
+                            return (
+                              <button
+                                key={`${view}-${model}`}
+                                type="button"
+                                onClick={() => toggleSpawnAgentCandidate(model)}
+                                disabled={
+                                  !isSelected &&
+                                  draftSpawnAgentModels.length >=
+                                    spawnAgentVisibleLimit
+                                }
+                                className={cn(
+                                  "flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left text-xs transition",
+                                  isSelected
+                                    ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-400/70 dark:bg-amber-500/15 dark:text-amber-50"
+                                    : "border-border bg-card text-foreground hover:border-violet-300 hover:bg-violet-50 dark:border-slate-700 dark:bg-slate-950/45 dark:text-slate-200 dark:hover:border-violet-500/60 dark:hover:bg-violet-500/10",
+                                  !isSelected &&
+                                    draftSpawnAgentModels.length >=
+                                      spawnAgentVisibleLimit
+                                    ? "cursor-not-allowed opacity-45"
+                                    : "",
+                                )}
+                              >
+                                <span className="min-w-0 truncate font-mono">
+                                  {catalogModelLabel(catalogModel)}
+                                </span>
+                                <Badge
+                                  className={cn(
+                                    "shrink-0 border text-[10px]",
+                                    isSelected
+                                      ? "border-amber-300 bg-amber-100 text-amber-800 dark:border-amber-300/70 dark:bg-amber-200/10 dark:text-amber-50"
+                                      : "border-border bg-muted text-muted-foreground dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300",
+                                  )}
+                                >
+                                  {isSelected
+                                    ? `前五 #${selectedIndex + 1}`
+                                    : "添加"}
+                                </Badge>
+                              </button>
+                            );
+                          })
+                        ) : (
+                          <div className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground dark:border-slate-700 dark:text-slate-400">
+                            这个来源暂时没有可用模型。
+                          </div>
+                        )}
+                      </div>
+                    </TabsContent>
+                  ),
+                )}
+              </Tabs>
+            </div>
+          </div>
 
-      {candidateSaveError ? (
-        <div className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-100">
-          保存失败：{candidateSaveError}
-        </div>
-      ) : null}
-      {candidateSaveMessage ? (
-        <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs leading-5 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-100">
-          {candidateSaveMessage}
-        </div>
-      ) : null}
-      {candidateValidationMessage ? (
-        <div className="mt-3 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-800 dark:border-sky-700/50 dark:bg-sky-950/30 dark:text-sky-100">
-          {candidateValidationMessage}
-        </div>
-      ) : null}
-      {actualCandidateValidation.missingSelectedModels.length > 0 ? (
-        <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-100">
-          live 可见窗口还没覆盖已选模型：
-          {actualCandidateValidation.missingSelectedModels.join(", ")}
-          。保存后请重启 Codex Desktop/app-server 再校验。
-        </div>
-      ) : null}
-      {spawnAgentMissingPriorityModels.length > 0 ? (
-        <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-100">
-          仍有重点模型不在前 {spawnAgentVisibleLimit} 个可见候选中：
-          {spawnAgentMissingPriorityModels.join(", ")}
-          。请把它们加入子 Agent 候选列表并重启 Codex Desktop/app-server。
+          <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] text-violet-700/80 dark:text-violet-200/80">
+            <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
+              catalog: {selectedCatalog.models.length}
+            </Badge>
+            <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
+              路由命中: {routedCatalogModelIds.length}
+            </Badge>
+            <Badge className="border border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-500/40 dark:bg-violet-500/10 dark:text-violet-100">
+              来源:{" "}
+              {generatedVisibleModels.length > 0 ? "诊断实测" : "配置预览"}
+            </Badge>
+            <Badge
+              className={cn(
+                "border",
+                localCandidateValidation.missingSelectedModels.length === 0
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/40 dark:bg-emerald-500/10 dark:text-emerald-100"
+                  : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100",
+              )}
+            >
+              本地检查:{" "}
+              {localCandidateValidation.missingSelectedModels.length === 0
+                ? "已选已覆盖"
+                : `缺 ${localCandidateValidation.missingSelectedModels.length} 个已选`}
+            </Badge>
+          </div>
+
+          {candidateSaveError ? (
+            <div className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-100">
+              保存失败：{candidateSaveError}
+            </div>
+          ) : null}
+          {candidateSaveMessage ? (
+            <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs leading-5 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-100">
+              {candidateSaveMessage}
+            </div>
+          ) : null}
+          {candidateValidationMessage ? (
+            <div className="mt-3 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-800 dark:border-sky-700/50 dark:bg-sky-950/30 dark:text-sky-100">
+              {candidateValidationMessage}
+            </div>
+          ) : null}
+          {actualCandidateValidation.missingSelectedModels.length > 0 ? (
+            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-100">
+              live 可见窗口还没覆盖已选模型：
+              {actualCandidateValidation.missingSelectedModels.join(", ")}
+              。保存后请重启 Codex Desktop/app-server 再校验。
+            </div>
+          ) : null}
+          {spawnAgentMissingPriorityModels.length > 0 ? (
+            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-100">
+              仍有重点模型不在前 {spawnAgentVisibleLimit} 个可见候选中：
+              {spawnAgentMissingPriorityModels.join(", ")}
+              。请把它们加入子 Agent 候选列表并重启 Codex Desktop/app-server。
+            </div>
+          ) : null}
         </div>
       ) : null}
     </section>
+  );
+}
+
+function CodexProjectionStatusPanel({
+  status,
+  queryError,
+  retryError,
+  isRefreshing,
+  onRetry,
+}: {
+  status?: CodexRoutingProjectionStatus;
+  queryError: Error | null;
+  retryError: string | null;
+  isRefreshing: boolean;
+  onRetry: () => void;
+}) {
+  const inactive = status?.state === "not_required";
+  const pending = Boolean(queryError) || status?.state === "pending" || !status;
+  const errorMessage =
+    retryError ||
+    status?.lastError ||
+    (queryError instanceof Error ? queryError.message : null);
+  const routeRows = (status?.routes ?? []).slice(0, 8);
+
+  return (
+    <div
+      role="status"
+      className={cn(
+        "mt-3 rounded-lg border p-3 text-xs leading-5",
+        pending
+          ? "border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100"
+          : inactive
+            ? "border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-200"
+            : "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100",
+      )}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="font-semibold">
+          MultiRouter 目录投影：
+          {inactive ? "激活后生成" : pending ? "待同步" : "已同步"}
+        </div>
+        {pending && !inactive ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onRetry}
+            disabled={isRefreshing}
+            className="h-8 gap-1.5 border-amber-300 bg-background/70 text-amber-800 hover:bg-amber-100 dark:border-amber-500/50 dark:bg-amber-500/10 dark:text-amber-100 dark:hover:bg-amber-500/20"
+          >
+            <RefreshCw
+              className={cn("h-3.5 w-3.5", isRefreshing && "animate-spin")}
+            />
+            {isRefreshing ? "同步中…" : "重新同步目录"}
+          </Button>
+        ) : null}
+      </div>
+      <div className="mt-1">
+        {inactive
+          ? "当前不是正在使用的 MultiRouter；它不拥有共享 live 文件，激活时会按最新 Provider 配置自动生成。"
+          : pending
+            ? "当前 Provider/模型目录与 Codex live 投影可能不一致；先重新同步，再发送请求。"
+            : `已确认 ${status?.routes.length ?? 0} 条模型映射与当前 Provider 目录一致。`}
+      </div>
+      {errorMessage ? (
+        <div className="mt-1">
+          原因：{errorMessage}
+          {status?.lastErrorCode ? `（${status.lastErrorCode}）` : ""}
+        </div>
+      ) : null}
+      {(status?.warnings ?? []).length > 0 ? (
+        <div className="mt-2 space-y-1 border-t border-current/15 pt-2">
+          <div className="font-medium">需要处理的策略引用</div>
+          {status!.warnings.map((warning) => (
+            <div key={warning}>{warning}</div>
+          ))}
+        </div>
+      ) : null}
+      {routeRows.length > 0 ? (
+        <div className="mt-2 space-y-1 border-t border-current/15 pt-2">
+          <div className="font-medium">当前有效映射</div>
+          {routeRows.map((route) => {
+            const routeLabel = routeSummaryDisplayName(
+              route.routeLabel,
+              route.routeId,
+              route.targetProviderName,
+            );
+            return (
+              <div
+                key={`${route.routeId}:${route.visibleModel}`}
+                title={`Route ID: ${route.routeId}; Provider ID: ${route.targetProviderId}`}
+                className="font-mono text-[11px]"
+              >
+                {routeLabel} / {route.targetProviderName}: {route.visibleModel}{" "}
+                → {route.upstreamModel}
+              </div>
+            );
+          })}
+          {status && status.routes.length > routeRows.length ? (
+            <div>
+              其余 {status.routes.length - routeRows.length} 条映射已省略。
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -5367,7 +6980,6 @@ function StatusTab({
   activeProviderId,
   onEditPlan,
   onDeletePlan,
-  onRuntimeReady,
 }: {
   selectedPlan: Provider | null;
   selectedRouting: CodexRouting | null;
@@ -5379,7 +6991,6 @@ function StatusTab({
   activeProviderId?: string;
   onEditPlan: (provider: Provider, detail?: string) => void;
   onDeletePlan: (provider: Provider) => void;
-  onRuntimeReady?: (provider: Provider) => void;
 }) {
   const queryClient = useQueryClient();
   const range = useMemo(() => ({ preset: "today" as const }), []);
@@ -5403,6 +7014,28 @@ function StatusTab({
   const [isDiagnosing, setIsDiagnosing] = useState(false);
   const [modelPickerUnlockResult, setModelPickerUnlockResult] =
     useState<CodexModelPickerUnlockResult | null>(null);
+
+  const { data: guardianStatus } = useQuery<CodexGuardianStatus | null>({
+    queryKey: ["codexGuardianStatus"],
+    queryFn: () => proxyApi.getCodexGuardianStatus(),
+    refetchInterval: 10_000,
+  });
+  const {
+    data: projectionStatus,
+    error: projectionError,
+    isFetching: isRefreshingProjection,
+  } = useQuery<CodexRoutingProjectionStatus>({
+    queryKey: ["codexMultiRouterProjection", selectedPlan?.id],
+    queryFn: () =>
+      providersApi.inspectCodexMultiRouterProjection(selectedPlan!.id),
+    enabled: Boolean(selectedPlan?.id),
+    retry: false,
+    refetchInterval: 15_000,
+  });
+  const [projectionRetryError, setProjectionRetryError] = useState<
+    string | null
+  >(null);
+  const [isRetryingProjection, setIsRetryingProjection] = useState(false);
   const [modelPickerUnlockError, setModelPickerUnlockError] = useState<
     string | null
   >(null);
@@ -5518,12 +7151,6 @@ function StatusTab({
       : "",
   ].filter(Boolean);
 
-  // 当状态页确认 MultiRouter 配置与真实转发都成功后，通知 App 进入“配置成功 -> 历史修复”收尾流程。
-  useEffect(() => {
-    if (!selectedPlan || !linkOnline || !currentRouteForwardOk) return;
-    onRuntimeReady?.(selectedPlan);
-  }, [currentRouteForwardOk, linkOnline, onRuntimeReady, selectedPlan]);
-
   /// 配置完成返回状态页后，手动刷新所有校验数据，避免用户等待轮询才看到最新监听、接管和转发日志。
   async function refreshValidationState() {
     setIsRefreshingValidation(true);
@@ -5555,10 +7182,30 @@ function StatusTab({
       );
     } catch (error) {
       setValidationRefreshMessage(
-        `刷新校验失败：${error instanceof Error ? error.message : String(error)}`,
+        `刷新校验失败：${workspaceErrorMessage(error)}`,
       );
     } finally {
       setIsRefreshingValidation(false);
+    }
+  }
+
+  async function retryProjection() {
+    if (!selectedPlan) return;
+    setIsRetryingProjection(true);
+    setProjectionRetryError(null);
+    try {
+      const refreshed = await providersApi.retryCodexMultiRouterProjection(
+        selectedPlan.id,
+      );
+      queryClient.setQueryData(
+        ["codexMultiRouterProjection", selectedPlan.id],
+        refreshed,
+      );
+      await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
+    } catch (error) {
+      setProjectionRetryError(workspaceErrorMessage(error));
+    } finally {
+      setIsRetryingProjection(false);
     }
   }
 
@@ -5575,9 +7222,7 @@ function StatusTab({
       );
       await queryClient.invalidateQueries({ queryKey: usageKeys.all });
     } catch (error) {
-      setSessionSyncMessage(
-        `同步失败：${error instanceof Error ? error.message : String(error)}`,
-      );
+      setSessionSyncMessage(`同步失败：${workspaceErrorMessage(error)}`);
     } finally {
       setIsSyncingSessionUsage(false);
     }
@@ -5594,7 +7239,7 @@ function StatusTab({
       );
       setDiagnostics(result);
     } catch (error) {
-      setDiagnoseError(error instanceof Error ? error.message : String(error));
+      setDiagnoseError(workspaceErrorMessage(error));
     } finally {
       setIsDiagnosing(false);
     }
@@ -5608,9 +7253,7 @@ function StatusTab({
       const result = await proxyApi.unlockCodexModelPicker();
       setModelPickerUnlockResult(result);
     } catch (error) {
-      setModelPickerUnlockError(
-        error instanceof Error ? error.message : String(error),
-      );
+      setModelPickerUnlockError(workspaceErrorMessage(error));
     } finally {
       setIsUnlockingModelPicker(false);
     }
@@ -5795,9 +7438,73 @@ function StatusTab({
               }
             />
           </div>
+          {linkOnline ? (
+            <div
+              role="status"
+              className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
+            >
+              <div className="font-semibold">
+                MultiRouter 已通过真实请求验证
+              </div>
+              <div className="text-xs">
+                当前 Provider、代理监听、Codex
+                接管、路由入口和最近一次路由转发均正常。你可以继续留在状态页观察流量或调整路由。
+              </div>
+            </div>
+          ) : null}
+          {selectedPlan ? (
+            <CodexProjectionStatusPanel
+              status={projectionStatus}
+              queryError={projectionError}
+              retryError={projectionRetryError}
+              isRefreshing={isRefreshingProjection || isRetryingProjection}
+              onRetry={retryProjection}
+            />
+          ) : null}
           {validationRefreshMessage ? (
             <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-200">
               {validationRefreshMessage}
+            </div>
+          ) : null}
+          {guardianStatus?.active ? (
+            <div
+              className={cn(
+                "mt-3 rounded-lg border p-3 text-xs leading-5",
+                guardianStatus.injected
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
+                  : guardianStatus.cdpAvailable
+                    ? "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100"
+                    : "border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-300",
+              )}
+            >
+              <div className="font-semibold flex items-center gap-2">
+                <span
+                  className={cn(
+                    "inline-block h-2 w-2 rounded-full",
+                    guardianStatus.injected
+                      ? "bg-emerald-500"
+                      : guardianStatus.cdpAvailable
+                        ? "bg-amber-400"
+                        : "bg-slate-400",
+                  )}
+                />
+                模型菜单守护
+                {guardianStatus.injected
+                  ? " · 已注入"
+                  : guardianStatus.cdpAvailable
+                    ? " · 待注入"
+                    : " · 轮询中"}
+              </div>
+              <div className="mt-1">{guardianStatus.message}</div>
+              <div className="mt-1 font-mono text-[11px] opacity-80">
+                codex={guardianStatus.codexRunning ? "运行中" : "未运行"} cdp=
+                {guardianStatus.cdpAvailable ? "可用" : "不可用"} targets=
+                {guardianStatus.injectedTargetCount}
+              </div>
+            </div>
+          ) : isCodexTakeoverActive ? (
+            <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-600 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-300">
+              模型菜单守护未启动；重新开启 Codex 接管以激活。
             </div>
           ) : null}
           {!modelPickerUnlockResult ? (
@@ -5919,7 +7626,11 @@ function StatusTab({
                   <div className="min-w-0">
                     <div className="truncate">{row.providerName}</div>
                     <div className="truncate text-[11px] text-muted-foreground dark:text-slate-500">
-                      {row.routeLabel || row.routeId || "未命名规则"}
+                      {routeSummaryDisplayName(
+                        row.routeLabel,
+                        row.routeId,
+                        row.providerName,
+                      )}
                     </div>
                   </div>
                   <span className="truncate font-mono">{row.model}</span>
@@ -6005,7 +7716,7 @@ function StatusTab({
                         {targetProvider?.name ?? targetProviderId ?? "内联上游"}
                       </div>
                       <div className="mt-1 truncate text-xs text-muted-foreground dark:text-slate-400">
-                        {entry.route.label || entry.route.id || "未命名规则"}
+                        {routeDisplayName(entry.route, providersById)}
                       </div>
                     </div>
                     <Badge
@@ -6284,10 +7995,7 @@ function TestTab({
             ok={selectedRouting?.enabled !== false}
             label="多路路由处于启用状态"
           />
-          <ChecklistItem
-            ok={Boolean(selectedRouting?.defaultRouteId)}
-            label="已设置默认路由"
-          />
+          <ChecklistItem ok label="未匹配模型会拒绝转发" />
           <ChecklistItem
             ok={(selectedRouting?.routes?.length ?? 0) > 0}
             label="至少有一条路由规则"
@@ -6634,8 +8342,23 @@ function DiagnosticsPanel({
                   value={`${diagnostics.routePlan.enabledRouteCount} / ${diagnostics.routePlan.routeCount}`}
                 />
                 <DetailRow
-                  label="默认路由"
-                  value={diagnostics.routePlan.defaultRouteId ?? "未设置"}
+                  label="旧版默认路由（已停用）"
+                  value={(() => {
+                    const defaultRoute =
+                      diagnostics.routePlan.routeSummaries.find(
+                        (route) =>
+                          route.id === diagnostics.routePlan.defaultRouteId,
+                      );
+                    const displayName = routeSummaryDisplayName(
+                      defaultRoute?.label,
+                      diagnostics.routePlan.defaultRouteId,
+                      defaultRoute?.targetProviderName,
+                      "无",
+                    );
+                    return diagnostics.routePlan.defaultRouteId
+                      ? `${displayName}（不会参与转发）`
+                      : displayName;
+                  })()}
                 />
               </div>
             </div>
@@ -6666,6 +8389,10 @@ function DiagnosticsPanel({
                   label="最近错误"
                   value={diagnostics.routerLog.latestError ?? "无"}
                 />
+                <DetailRow
+                  label="Hosted tool 未调用"
+                  value={diagnostics.routerLog.latestHostedToolWarning ?? "无"}
+                />
               </div>
             </div>
           </div>
@@ -6685,7 +8412,12 @@ function DiagnosticsPanel({
                   className="grid grid-cols-[1fr_1fr_1fr_1fr_0.8fr] gap-2 border-t border-border px-3 py-2 text-xs text-foreground dark:border-slate-800 dark:text-slate-300"
                 >
                   <span className="truncate">
-                    {route.label ?? route.id ?? `规则 ${index + 1}`}
+                    {routeSummaryDisplayName(
+                      route.label,
+                      route.id,
+                      route.targetProviderName,
+                      `规则 ${index + 1}`,
+                    )}
                     {route.enabled ? "" : "（停用）"}
                   </span>
                   <span className="truncate">
@@ -6755,6 +8487,9 @@ function DiagnosticsPanel({
                     title={event.upstreamUrl ?? event.line}
                   >
                     {event.error ??
+                      (event.event === "hosted_tool_not_called"
+                        ? `${event.tool ?? "hosted tool"}：${event.reason ?? "上游未发起调用"}`
+                        : null) ??
                       event.upstreamUrl ??
                       event.model ??
                       event.line}
@@ -6987,16 +8722,82 @@ function SortableSpawnAgentCandidate({
   );
 }
 
+function SortableCatalogModel({
+  model,
+  index,
+}: {
+  model: CodexCatalogModel;
+  index: number;
+}) {
+  const modelId = model.model?.trim() ?? "";
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: modelId });
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+      }}
+      className={cn(
+        "flex min-h-11 items-center gap-3 rounded-md border border-blue-200 bg-background px-3 py-2 dark:border-blue-800/60 dark:bg-slate-950/50",
+        isDragging ? "opacity-60 shadow-lg shadow-blue-950/30" : "",
+      )}
+    >
+      <button
+        type="button"
+        className="grid h-7 w-7 shrink-0 place-items-center rounded border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 dark:border-blue-700/60 dark:bg-blue-500/10 dark:text-blue-200 dark:hover:bg-blue-500/20"
+        {...attributes}
+        {...listeners}
+        aria-label={`拖动 ${modelId}`}
+      >
+        <GripVertical className="h-4 w-4" />
+      </button>
+      <span className="w-7 shrink-0 text-right font-mono text-xs text-muted-foreground dark:text-slate-400">
+        {index + 1}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div
+          className="truncate text-sm font-medium text-foreground dark:text-slate-100"
+          title={catalogModelLabel(model)}
+        >
+          {catalogModelLabel(model)}
+        </div>
+        {model.upstreamModel || model.upstream_model ? (
+          <div className="mt-0.5 truncate font-mono text-xs text-muted-foreground dark:text-slate-400">
+            {model.upstreamModel ?? model.upstream_model}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 /// 路由方案卡片内容；外层决定是按钮还是静态容器。
 function PlanCardContent({
   provider,
+  providersById,
   compact = false,
 }: {
   provider: Provider;
+  providersById?: Map<string, Provider>;
   compact?: boolean;
 }) {
   const routing = readCodexRouting(provider);
   const routes = routing?.routes ?? [];
+  const defaultRoute = routing?.defaultRouteId
+    ? routes.find((route) => route.id === routing.defaultRouteId)
+    : undefined;
+  const defaultRouteName = defaultRoute
+    ? routeDisplayName(defaultRoute, providersById ?? new Map())
+    : undefined;
 
   return (
     <div className="min-w-0">
@@ -7017,7 +8818,16 @@ function PlanCardContent({
       </div>
       <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground dark:text-slate-400">
         <span>规则 {routes.length} 条</span>
-        {routing?.defaultRouteId && <span>默认 {routing.defaultRouteId}</span>}
+        {routing?.defaultRouteId && (
+          <span
+            title={routeDisplayTitle(
+              defaultRouteName ?? "默认路由",
+              routing.defaultRouteId,
+            )}
+          >
+            旧默认（已停用） {defaultRouteName ?? routing.defaultRouteId}
+          </span>
+        )}
         {!compact && <span>ID {provider.id}</span>}
       </div>
     </div>
@@ -7054,7 +8864,7 @@ function RouteListButton({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold text-foreground dark:text-slate-100">
-            {entry.route.label || entry.route.id || "未命名规则"}
+            {routeDisplayName(entry.route, providersById)}
           </div>
           <div className="mt-1 truncate text-xs text-muted-foreground dark:text-slate-400">
             所属多路路由：{entry.provider.name}
@@ -7076,12 +8886,20 @@ function RouteListButton({
           {targetProvider ? "复用供应商配置" : apiFormatLabel(format)}
         </span>
         <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-muted-foreground dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300">
-          {authSourceLabel(entry.route.upstream?.auth?.source)}
+          {authSourceLabel(
+            entry.route.authPolicy?.source ??
+              entry.route.upstream?.auth?.source,
+          )}
         </span>
       </div>
       <div className="mt-1.5 min-w-0 break-words whitespace-normal text-xs leading-5 text-muted-foreground dark:text-slate-400">
         {routeMatchSummary(entry.route)}
       </div>
+      {routeProviderModelSyncSummary(entry.route, targetProvider) ? (
+        <div className="mt-1 min-w-0 break-words whitespace-normal text-xs leading-5 text-amber-700 dark:text-amber-200">
+          {routeProviderModelSyncSummary(entry.route, targetProvider)}
+        </div>
+      ) : null}
     </button>
   );
 }
@@ -7092,11 +8910,15 @@ function RouteDetailPanel({
   selectedPlan,
   providersById,
   onOpenRoutePicker,
+  onEditProvider,
+  onFollowAllModels,
 }: {
   selectedRoute?: RouteEntry;
   selectedPlan: Provider | null;
   providersById: Map<string, Provider>;
   onOpenRoutePicker: (provider?: Provider | null) => void;
+  onEditProvider: (provider: Provider) => void;
+  onFollowAllModels: () => Promise<void>;
 }) {
   if (!selectedRoute) {
     return (
@@ -7113,7 +8935,10 @@ function RouteDetailPanel({
   }
 
   const route = selectedRoute.route;
-  const matchedModels = route.match?.models ?? [];
+  const matchedModels =
+    route.modelSelection?.mode === "include"
+      ? route.modelSelection.models
+      : (route.match?.models ?? []);
   const targetProviderId = routeTargetProviderId(route);
   const targetProvider = routeTargetProvider(route, providersById);
 
@@ -7121,7 +8946,7 @@ function RouteDetailPanel({
     <section className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-3 dark:border-emerald-700/40 dark:bg-slate-950/50">
       <SectionHeader
         icon={Database}
-        title={route.label || route.id || "规则详情"}
+        title={routeDisplayName(route, providersById, "规则详情")}
         detail="这里是当前规则的只读摘要；修改接入范围请打开候选 router 选择器。"
         action={
           <Button
@@ -7147,20 +8972,18 @@ function RouteDetailPanel({
           />
         ) : null}
         <DetailRow
-          label="上游地址"
-          value={routeBaseUrl(route, providersById)}
-        />
-        <DetailRow
-          label="接口类型"
+          label="模型选择"
           value={
-            targetProvider
-              ? "跟随目标供应商"
-              : apiFormatLabel(routeApiFormat(route))
+            route.modelSelection?.mode === "all"
+              ? "目标供应商的全部模型（自动接收新增模型）"
+              : `${matchedModels.length} 个上游模型；${routeProviderModelSyncSummary(route, targetProvider) ?? "无法读取供应商当前模型目录"}`
           }
         />
         <DetailRow
           label="认证方式"
-          value={authSourceLabel(route.upstream?.auth?.source)}
+          value={authSourceLabel(
+            route.authPolicy?.source ?? route.upstream?.auth?.source,
+          )}
         />
         {codexRouteUsesOfficialAuthentication(route) ? (
           <DetailRow
@@ -7169,16 +8992,30 @@ function RouteDetailPanel({
           />
         ) : null}
         <DetailRow
-          label="能力"
-          value={[
-            route.capabilities?.textOnly ? "仅文本" : "图文",
-            route.capabilities?.supportsReasoning ? "推理" : null,
-          ]
-            .filter(Boolean)
-            .join(" / ")}
+          label="配置所有权"
+          value="地址、凭据、协议和模型能力由目标 Provider/模型条目维护；Route 只保存选择、前缀、别名和认证策略。"
         />
       </div>
       <div className="mt-3 grid gap-2">
+        {route.modelSelection?.mode === "include" ? (
+          <Button
+            className="justify-start gap-2 bg-emerald-600 hover:bg-emerald-500"
+            onClick={() => void onFollowAllModels()}
+          >
+            <RefreshCw className="h-4 w-4" />
+            改为自动跟随全部模型
+          </Button>
+        ) : null}
+        {targetProvider ? (
+          <Button
+            variant="outline"
+            className="justify-start gap-2"
+            onClick={() => onEditProvider(targetProvider)}
+          >
+            <Settings2 className="h-4 w-4" />
+            编辑目标 Provider/模型配置
+          </Button>
+        ) : null}
         <Button
           variant="outline"
           className="justify-start gap-2"

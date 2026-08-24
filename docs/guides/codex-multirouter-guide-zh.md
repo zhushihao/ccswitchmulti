@@ -29,14 +29,14 @@ Codex Desktop 仍然只看到一个“当前模型提供方”，但这个提供
 3. ➕ 在 Codex 面板添加 DeepSeek、GLM 或本地模型等“模型源”。
 4. 🧭 对额外模型源开启 `需要本地路由映射`，填写 Base URL / API Key，获取模型列表并配置上下文窗口。
 5. 🧱 进入 `Codex 多模型路由` 工作台，创建多路路由方案。
-6. 🚦 添加并启用路由规则，配置路由名称和匹配模型。
-7. 🤖 配置 `子 Agent 候选模型`，把希望 Codex 用来创建 subagent 的模型排进前 5 个。
-8. 💾 保存排序并选中该多路由方案。
+6. 🚦 添加并启用路由规则，配置模型范围、前缀、可见别名和认证策略引用。
+7. 🤖 确认 V4 Pro / Flash 已进入最终可路由模型目录；CCSwitchMulti 会自动注册对应 custom roles。
+8. 💾 保存并选中该多路由方案；只有需要手工覆盖 `spawn_agent.model` 展示顺序时才展开高级设置。
 9. ▶️ 在 `设置 → 路由` 打开路由总开关和 Codex 路由，启动 MultiRouter。
 10. 🔄 完全退出并重启 Codex Desktop，检查模型列表和请求连通性。
 11. 🕘 如果历史记录暂时消失，进入会话管理的 `Codex 历史修复`，预览修复并确认写入，再次重启 Codex。
 
-完成后，你应该同时验证两件事：Codex 模型列表能看到 MultiRouter 汇总的候选模型；Codex 识别到的子 Agent 候选模型顺序和 CCSwitchMulti 里保存的前 5 个一致。
+完成后，你应该同时验证两件事：Codex 模型列表能看到 MultiRouter 汇总的候选模型；不写模型名的委派提示能让 Codex 按任务选择 `deepseek-flash` 或 `deepseek-pro` custom role。
 
 <!-- guide-page: 02-step-1.png | 1. 先登录 Codex Desktop -->
 
@@ -137,37 +137,41 @@ Codex 多模型路由
 
 ![路由规则页中添加和启用模型源](../images/codex-multirouter/07-configure-route-rules.png)
 
-每条规则至少要确认：
+每条 schema v2 规则至少要确认：
 
 - 路由名称：给用户看的名称，例如 `DeepSeek`、`GLM`、`Local vLLM`。
-- 匹配模型：Codex 请求里的模型名，例如 `deepseek-v4-flash`。
-- 上游模型：第三方接口真实接收的模型名。
-- 认证方式：第三方模型通常使用路由 API Key；官方 GPT / Codex 路由使用托管 Codex OAuth。
-- 能力声明：文本、图文、是否支持推理等。
+- 模型选择：`全部模型` 会自动接收目标 Provider 后续新增模型；`仅选中的 canonical 模型` 不会扩大用户选择。
+- 匹配前缀：用于没有精确可见名时的前缀匹配；精确匹配始终优先。
+- 可见别名：只在确实需要不同显示名时填写 `visible=canonical`，目标必须是该 Provider 的 canonical 模型 ID。
+- 认证策略引用：选择 Provider 配置认证、Codex Desktop 当前登录、托管 Codex OAuth 或账号池；这里只保存引用 ID，不保存 Token。
+
+Base URL、API Key、默认协议、模型级协议覆盖、上下文窗口、输入模态、推理和缓存能力都在目标 Provider 的“模型与兼容性”中维护。Route 编辑器不会复制这些字段；修改 Provider 后，下一次请求直接使用新值，无需删除或重建 Route。
+
+如果打开的是旧 schema v1 方案，CCSwitchMulti 会先显示迁移预览。确认新建 Provider、引用变化、删除的冗余字段、冲突和警告后再应用迁移；预览和日志不会显示 API Key/Token。迁移完成前旧方案可查看，但不能直接编辑或启用。
 
 规则配置完成后，保存路由方案。
 
 ![路由规则配置完成后保存方案](../images/codex-multirouter/08-save-route-rules.png)
 
-<!-- guide-page: 08-step-7.png | 7. 配置子 Agent 候选模型 -->
+<!-- guide-page: 08-step-7.png | 7. 子 Agent 自动角色与高级覆盖 -->
 
-## 7. 配置子 Agent 候选模型
+## 7. 子 Agent 自动角色与高级覆盖
 
-在 `路由规则` 页下方找到 `子 Agent 候选模型`。这里控制 Codex 创建 subagent 时能看到哪些模型。
+只要 `deepseek-v4-flash` 和 `deepseek-v4-pro` 位于最终可路由模型目录，CCSwitchMulti 就会分别注册 `deepseek-flash` 和 `deepseek-pro` custom role。父 Codex 决定委派后，会根据角色描述自动选择：长上下文扫描和轻量验证优先 Flash，复杂调试、跨模块推理和高风险实现优先 Pro。用户不需要在主向导里选择子 Agent 模型。
 
-这个列表需要手动整理，原因是 Codex 只取前 5 个模型作为 subagent 可用候选。如果不整理，模型顺序可能来自自动发现或历史配置，导致真正想用的 DeepSeek、Qwen、本地模型排在后面，Codex 创建子 Agent 时看不到。
+`路由规则` 页仍保留默认折叠的 `高级：子 Agent 模型覆盖`。它只控制 Codex V2 直接 `spawn_agent.model` 参数描述里的前 5 个模型顺序，不控制 custom role 是否注册，也不是 Pro/Flash 自动选型的主路径。
 
 建议做法：
 
-1. 把你最希望用于 subagent 的模型拖到前 5 个。
-2. 前 5 个里保留一个官方 GPT 作为兜底。
-3. 给长上下文任务放 `deepseek-v4-flash` 或你实际验证过的长上下文模型。
-4. 给本地 / 多模态任务放对应的本地模型或 Qwen 系模型。
-5. 点击 `保存排序`。
+只有明确需要 direct model override 时才展开这里：
+
+1. 选择最多 5 个希望显示在 `spawn_agent.model` 描述中的模型。
+2. 拖动调整它们的展示顺序。
+3. 点击 `保存排序`。
 
 ![子 Agent 候选模型排序和保存排序](../images/codex-multirouter/09-subagent-model-order.png)
 
-保存后，MultiRouter 会把这个顺序写入模型目录。Codex Desktop 仍然需要重启后才会刷新模型候选。
+保存后，MultiRouter 会把这个顺序作为 `codexRouting.spawnAgentModels` policy 保存；compiler 再按当前可路由 catalog 过滤并投影。无论是否设置这份高级排序，managed custom roles 都从完整可路由目录生成。Codex Desktop 仍然需要重启后才会刷新模型和角色。
 
 <!-- guide-page: 09-step-8.png | 8. 选中 MultiRouter 并启动路由 -->
 
@@ -211,6 +215,8 @@ Codex 多模型路由
 - 当前 MultiRouter 方案是否被选中。
 - 启用路由数量是否正确。
 - 模型目录是否包含你配置的模型。
+- dependency fingerprint 是否为最新、投影是否处于 ready；pending 表示 live 文件发布失败但数据库真值仍保留，可以重试投影。
+- 诊断里的最终 Provider、canonical/upstream model、协议、认证所有者和能力来源是否符合预期；诊断不会回传凭据。
 - 最近日志里是否出现 `route_resolved`、`request_prepared`、`upstream_send`、`upstream_status`。
 
 如果 Debug 里显示端口可达但没有近期路由事件，请先在 Codex Desktop 里发送一条测试消息，再回来看日志。没有日志通常说明 Codex 还没有真正走到 MultiRouter，而不是第三方上游一定坏了。
@@ -237,7 +243,7 @@ Codex 多模型路由
 3. 给 Codex 发送一条简单测试消息。
 4. 回到 CCSwitchMulti 状态页确认请求命中了正确路由。
 
-如果配置正确，此时 Codex 的模型候选列表里应该能看到你在 MultiRouter 里设置的所有备选模型。你也可以询问 Codex 当前可用的子 Agent 候选模型，返回结果应当和 `子 Agent 候选模型` 里保存的前 5 个顺序一致。
+如果配置正确，此时 Codex 的模型候选列表里应该能看到你在 MultiRouter 里设置的所有备选模型。验证子 Agent 时不要写模型名：分别要求子 Agent 做长上下文扫描和复杂修复设计，检查父 Codex 是否选择了对应的 `deepseek-flash` / `deepseek-pro` role。
 
 ![Codex Desktop 中显示 MultiRouter 提供的模型候选列表](../images/codex-multirouter/13-codex-model-picker-validation.png)
 
@@ -280,11 +286,11 @@ Codex 多模型路由
 
 ### 为什么保存模型映射后还要重启 Codex？
 
-Codex Desktop 的模型菜单不是每次都热加载本地 catalog。修改模型映射、上下文窗口或子 Agent 候选顺序后，完整退出并重启 Codex 最稳。
+Codex Desktop 的模型菜单和 custom roles 不是每次都热加载。修改模型映射、上下文窗口、managed roles 或高级 direct override 顺序后，完整退出并重启 Codex 最稳。
 
-### 为什么子 Agent 候选只强调前 5 个？
+### 为什么高级子 Agent 模型覆盖只有前 5 个？
 
-Codex 创建 subagent 时只取前 5 个候选模型。`子 Agent 候选模型` 面板就是用来把这 5 个名额显式排好，避免自动顺序把关键模型挤到后面。
+这是 Codex 在 `spawn_agent.model` 工具描述中展示 direct model override 的固定窗口。它不限制 custom agent role 数量；V4 Pro / Flash 自动选型使用完整模型目录生成的 roles，因此不会因 Pro 位于第 6 位而消失。
 
 ### 为什么历史记录看起来没了？
 
@@ -293,6 +299,10 @@ Codex 创建 subagent 时只取前 5 个候选模型。`子 Agent 候选模型` 
 ### 如何判断请求真的走到了 MultiRouter？
 
 不要只看 Codex 左下角账号或模型显示。以 CCSwitchMulti 状态页、Debug 结果和 `codex-router.log` 为准。出现 `route_resolved` 和对应上游状态，才说明请求进入了 MultiRouter。
+
+### 修改 Provider 协议后，为什么不需要重新建 Route？
+
+schema v2 Route 只引用 `targetProviderId` 和 canonical 模型，不保存协议快照。每次请求都会从数据库读取最新 Provider/模型条目，再由 compiler 生成 effective Provider。把 Qwen 从 Chat 改为 Responses（或反向修改）后直接发送测试请求，并检查日志中的 `request_prepared effective_endpoint` 和转换标记即可；只有 Codex 模型菜单缓存需要时才重启 Desktop。
 
 <!-- guide-page: 14-related-docs.png | 相关文档 -->
 

@@ -9,12 +9,21 @@ import type { Provider } from "@/types";
 const apiMocks = vi.hoisted(() => ({
   update: vi.fn(),
   getAll: vi.fn(),
+  inspectActiveCodexMultiRouterProjection: vi.fn(),
+}));
+
+const toastMocks = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+  warning: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => ({
   providersApi: {
     update: (...args: unknown[]) => apiMocks.update(...args),
     getAll: (...args: unknown[]) => apiMocks.getAll(...args),
+    inspectActiveCodexMultiRouterProjection: (...args: unknown[]) =>
+      apiMocks.inspectActiveCodexMultiRouterProjection(...args),
   },
   sessionsApi: {},
   settingsApi: {},
@@ -38,10 +47,7 @@ vi.mock("react-i18next", () => ({
 }));
 
 vi.mock("sonner", () => ({
-  toast: {
-    success: vi.fn(),
-    error: vi.fn(),
-  },
+  toast: toastMocks,
 }));
 
 function createWrapper() {
@@ -72,6 +78,15 @@ function createProvider(overrides: Partial<Provider> = {}): Provider {
 beforeEach(() => {
   apiMocks.update.mockReset().mockResolvedValue(true);
   apiMocks.getAll.mockReset().mockResolvedValue({});
+  apiMocks.inspectActiveCodexMultiRouterProjection
+    .mockReset()
+    .mockResolvedValue({
+      routerProviderId: "router-active",
+      state: "ready",
+    });
+  toastMocks.success.mockReset();
+  toastMocks.error.mockReset();
+  toastMocks.warning.mockReset();
 });
 
 describe("useUpdateProviderMutation", () => {
@@ -98,7 +113,7 @@ describe("useUpdateProviderMutation", () => {
     });
   });
 
-  it("syncs affected Codex MultiRouter plans and returns removed subagent candidates", async () => {
+  it("submits one Codex Provider mutation without rewriting MultiRouter plans in the frontend", async () => {
     const { wrapper } = createWrapper();
     const provider = createProvider({
       id: "provider-b",
@@ -106,67 +121,42 @@ describe("useUpdateProviderMutation", () => {
         modelCatalog: { models: [{ model: "new-model" }] },
       },
     });
-    const plan = createProvider({
-      id: "router",
-      name: "Codex MultiRouter",
-      settingsConfig: {
-        modelCatalog: {
-          models: [{ model: "old-model" }],
-          spawnAgentModels: ["old-model"],
-        },
-        codexRouting: {
-          enabled: true,
-          routes: [
-            {
-              id: "route-provider-b",
-              targetProviderId: "provider-b",
-              match: { models: ["old-model"] },
-              upstream: {
-                apiFormat: "openai_chat",
-                auth: { source: "provider_config" },
-              },
-            },
-          ],
-        },
-      },
-    });
-    apiMocks.getAll.mockResolvedValue({
-      [provider.id]: provider,
-      [plan.id]: plan,
-    });
     const { result } = renderHook(() => useUpdateProviderMutation("codex"), {
       wrapper,
     });
 
-    let mutationResult:
-      | Awaited<ReturnType<typeof result.current.mutateAsync>>
-      | undefined;
     await act(async () => {
-      mutationResult = await result.current.mutateAsync({ provider });
+      await result.current.mutateAsync({ provider });
     });
 
-    expect(apiMocks.getAll).toHaveBeenCalledWith("codex");
-    expect(apiMocks.update).toHaveBeenNthCalledWith(
-      1,
-      provider,
-      "codex",
-      undefined,
-    );
-    expect(apiMocks.update).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        id: "router",
-        settingsConfig: expect.objectContaining({
-          modelCatalog: expect.objectContaining({
-            spawnAgentModels: [],
-          }),
-        }),
-      }),
-      "codex",
-    );
+    expect(apiMocks.getAll).not.toHaveBeenCalled();
+    expect(apiMocks.update).toHaveBeenCalledTimes(1);
+    expect(apiMocks.update).toHaveBeenCalledWith(provider, "codex", undefined);
+  });
+
+  it("warns immediately when the active MultiRouter projection is pending after save", async () => {
+    apiMocks.inspectActiveCodexMultiRouterProjection.mockResolvedValueOnce({
+      routerProviderId: "router-active",
+      state: "pending",
+      lastErrorCode: "projection_live_drift",
+      lastErrorMessage: "live files differ",
+    });
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useUpdateProviderMutation("codex"), {
+      wrapper,
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync({ provider: createProvider() });
+    });
+
     expect(
-      mutationResult?.codexMultiRouterSyncResults?.[0]?.removedSpawnAgentModels,
-    ).toEqual(["old-model"]);
+      apiMocks.inspectActiveCodexMultiRouterProjection,
+    ).toHaveBeenCalledTimes(1);
+    expect(toastMocks.warning).toHaveBeenCalledWith(
+      "Provider 已保存，但当前 MultiRouter 尚未同步到 Codex。请到 MultiRouter 工作台查看并重试。",
+      { closeButton: true },
+    );
   });
 
   it("also invalidates the previous usage query when provider id changes", async () => {

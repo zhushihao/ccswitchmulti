@@ -123,6 +123,7 @@ export interface ProviderStats {
 
 export interface ModelStats {
   model: string;
+  providerName: string;
   requestCount: number;
   totalTokens: number;
   totalCost: string;
@@ -212,6 +213,7 @@ export interface LogFilters {
   providerName?: string;
   model?: string;
   statusCode?: number;
+  statusGroup?: "other";
   startDate?: number;
   endDate?: number;
 }

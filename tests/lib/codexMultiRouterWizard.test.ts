@@ -7,12 +7,14 @@ import {
   canContinueAfterConnectivity,
   classifyWizardConnectivityResult,
   collectWizardModelNameCollisions,
+  collectWizardRouteAliasSelectionIssues,
   defaultWizardModelSources,
   getWizardConfigIssues,
   getWizardModelFetchConfig,
   inferCodexOfficialAuth,
   inferWizardApiFormat,
   inferWizardCacheConfig,
+  initialWizardCatalogModelOrder,
   isWizardCatalogOnlyModelSource,
   isWizardCodexOAuthSource,
   mergeFetchedModelsIntoWizardProvider,
@@ -32,6 +34,40 @@ function provider(overrides: Partial<Provider>): Provider {
 }
 
 describe("codexMultiRouterWizard helpers", () => {
+  it("keeps an existing all-model route in automatic-follow mode", () => {
+    const source = provider({
+      id: "deepseek",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            { model: "deepseek-v4-flash" },
+            { model: "deepseek-v4-pro" },
+          ],
+        },
+      },
+    });
+    const plan = provider({
+      id: "router",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "deepseek-route",
+              enabled: true,
+              targetProviderId: source.id,
+              modelSelection: { mode: "all" },
+              authPolicy: { source: "provider_config" },
+            },
+          ],
+        },
+      },
+    });
+
+    expect(initialWizardCatalogModelOrder(plan, [source])).toBeNull();
+  });
+
   it("忽略历史目录中的空值和非对象条目，保留有效模型", () => {
     const source = provider({
       settingsConfig: {
@@ -329,7 +365,7 @@ describe("codexMultiRouterWizard helpers", () => {
     expect(inferWizardApiFormat(openaiBackup)).toBe("openai_responses");
   });
 
-  it("uses successful Responses probes to override stale chat metadata before route generation", () => {
+  it("stores protocol probe results on the canonical provider model", () => {
     const relay = provider({
       id: "relay",
       name: "Relay",
@@ -338,7 +374,10 @@ describe("codexMultiRouterWizard helpers", () => {
       settingsConfig: {
         apiFormat: "openai_chat",
         modelCatalog: {
-          models: [{ model: "gpt-5.5", upstreamModel: "gpt-5.5" }],
+          models: [
+            { model: "gpt-5.5", upstreamModel: "gpt-5.5" },
+            { model: "qwen3.8", upstreamModel: "qwen3.8" },
+          ],
         },
       },
     });
@@ -354,15 +393,33 @@ describe("codexMultiRouterWizard helpers", () => {
           canContinue: true,
           detail: "直接 /v1/responses 探测通过。",
         },
+        {
+          providerId: "relay",
+          providerName: "Relay",
+          model: "qwen3.8",
+          status: "warn",
+          canContinue: true,
+          recommendedApiFormat: "openai_chat",
+          detail: "Responses 不可用，Chat Completions 可用。",
+        },
       ],
     );
 
-    expect(inferWizardApiFormat(resolvedRelay)).toBe("openai_responses");
-    expect(
-      buildWizardRoutesFromSources([resolvedRelay])[0].upstream,
-    ).toMatchObject({
-      apiFormat: "openai_responses",
+    expect(resolvedRelay.settingsConfig.modelCatalog.models).toEqual([
+      expect.objectContaining({
+        model: "gpt-5.5",
+        apiFormat: "openai_responses",
+      }),
+      expect.objectContaining({ model: "qwen3.8", apiFormat: "openai_chat" }),
+    ]);
+    expect(inferWizardApiFormat(resolvedRelay)).toBe("openai_chat");
+    expect(buildWizardRoutesFromSources([resolvedRelay])[0]).toMatchObject({
+      targetProviderId: "relay",
+      modelSelection: { mode: "all" },
     });
+    expect(buildWizardRoutesFromSources([resolvedRelay])[0]).not.toHaveProperty(
+      "upstream",
+    );
   });
 
   it("keeps stale chat metadata when Responses probes warn or fail", () => {
@@ -426,11 +483,9 @@ describe("codexMultiRouterWizard helpers", () => {
     );
 
     expect(inferWizardApiFormat(resolvedRelay)).toBe("openai_chat");
-    expect(
-      buildWizardRoutesFromSources([resolvedRelay])[0].upstream,
-    ).toMatchObject({
-      apiFormat: "openai_chat",
-    });
+    expect(buildWizardRoutesFromSources([resolvedRelay])[0]).not.toHaveProperty(
+      "upstream",
+    );
   });
 
   it("groups generated routes by provider and infers common model prefixes", () => {
@@ -460,30 +515,17 @@ describe("codexMultiRouterWizard helpers", () => {
     const routes = buildWizardRoutesFromSources([openai, deepseek, qwen]);
 
     expect(routes).toHaveLength(3);
-    expect(routes[0].match.prefixes).toEqual(
+    expect(routes[0].matchPrefixes).toEqual(
       expect.arrayContaining(["gpt", "o"]),
     );
-    expect(routes[1].match.prefixes).toContain("deepseek");
-    expect(routes[2].match.prefixes).toContain("qwen");
+    expect(routes[1].matchPrefixes).toContain("deepseek");
+    expect(routes[2].matchPrefixes).toContain("qwen");
     expect(routes.map((route) => route.targetProviderId)).toEqual([
       "openai",
       "deepseek",
       "qwen-local",
     ]);
-    expect(routes[0].capabilities?.codexCache).toMatchObject({
-      cacheMode: "openai_prompt_cache",
-      supportsPromptCacheKey: true,
-    });
-    expect(routes[1].capabilities?.codexCache).toMatchObject({
-      cacheMode: "deepseek_context_cache",
-      usageFields: [
-        "usage.prompt_cache_hit_tokens",
-        "usage.prompt_cache_miss_tokens",
-      ],
-    });
-    expect(routes[2].capabilities?.codexCache).toMatchObject({
-      cacheMode: "qwen_context_cache",
-    });
+    expect(routes.every((route) => !("capabilities" in route))).toBe(true);
   });
 
   it("keeps OpenAI cache parameters off automatic-prefix providers", () => {
@@ -505,7 +547,7 @@ describe("codexMultiRouterWizard helpers", () => {
     });
   });
 
-  it("builds a MultiRouter plan whose routes and catalog expose the same visible models", () => {
+  it("builds a schema v2 plan whose routes inherit the provider catalog", () => {
     const deepseek = provider({
       id: "deepseek",
       name: "DeepSeek",
@@ -529,20 +571,55 @@ describe("codexMultiRouterWizard helpers", () => {
       [deepseek, qwen],
       [deepseek, qwen],
     );
-    const routeModels = new Set(
-      plan.settingsConfig.codexRouting.routes.flatMap(
-        (route: { match: { models: string[] } }) => route.match.models,
-      ),
-    );
-    const catalogModels = new Set(
-      plan.settingsConfig.modelCatalog.models.map(
-        (model: { model: string }) => model.model,
-      ),
-    );
-
+    expect(plan.settingsConfig.codexRouting.schemaVersion).toBe(2);
     expect(plan.settingsConfig.codexRouting.routes).toHaveLength(2);
-    expect(routeModels).toEqual(catalogModels);
+    expect(plan.settingsConfig.codexRouting.routes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          targetProviderId: "deepseek",
+          modelSelection: { mode: "all" },
+        }),
+        expect.objectContaining({
+          targetProviderId: "qwen",
+          modelSelection: { mode: "all" },
+        }),
+      ]),
+    );
+    expect(plan.settingsConfig).not.toHaveProperty("modelCatalog");
     expect(plan.settingsConfig.base_url).toBe("http://127.0.0.1:15721/v1");
+  });
+
+  it("does not copy provider model capabilities into a schema v2 route", () => {
+    const reasoning = {
+      supported: true as const,
+      supportedEfforts: ["low", "high"] as const,
+      defaultEffort: "high" as const,
+      disableAllowed: false,
+      upstream: {
+        format: "string" as const,
+        parameter: "reasoning_effort",
+      },
+      source: "builtin" as const,
+    };
+    const step = provider({
+      id: "step",
+      name: "StepFun",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "step-3.5-flash", reasoning }],
+        },
+      },
+    });
+
+    const { plan } = buildCodexMultiRouterWizardPlan([step], [step]);
+
+    expect(plan.settingsConfig).not.toHaveProperty("modelCatalog");
+    expect(plan.settingsConfig.codexRouting.routes[0]).not.toHaveProperty(
+      "capabilities",
+    );
+    expect(step.settingsConfig.modelCatalog.models[0].reasoning).toEqual(
+      reasoning,
+    );
   });
 
   it("applies wizard plan name, final catalog order, and spawn agent order", () => {
@@ -567,19 +644,15 @@ describe("codexMultiRouterWizard helpers", () => {
     });
 
     expect(plan.name).toBe("Work MultiRouter");
-    expect(
-      plan.settingsConfig.modelCatalog.models.map(
-        (model: { model: string }) => model.model,
-      ),
-    ).toEqual(["model-c", "model-a"]);
-    expect(plan.settingsConfig.modelCatalog.spawnAgentModels).toEqual([
+    expect(plan.settingsConfig).not.toHaveProperty("modelCatalog");
+    expect(plan.settingsConfig.codexRouting.spawnAgentModels).toEqual([
       "model-a",
       "model-c",
     ]);
-    expect(plan.settingsConfig.codexRouting.routes[0].match.models).toEqual([
-      "model-c",
-      "model-a",
-    ]);
+    expect(plan.settingsConfig.codexRouting.routes[0].modelSelection).toEqual({
+      mode: "include",
+      models: ["model-c", "model-a"],
+    });
   });
 
   it("persists hosted tool switches on the wizard plan", () => {
@@ -658,10 +731,9 @@ describe("codexMultiRouterWizard helpers", () => {
     expect(getWizardConfigIssues([official])).toEqual([]);
 
     const [route] = buildWizardRoutesFromSources([official]);
-    expect(route.match.models).toEqual(["gpt-5.6-sol"]);
-    expect(route.upstream.auth).toEqual({
+    expect(route.modelSelection).toEqual({ mode: "all" });
+    expect(route.authPolicy).toEqual({
       source: "managed_codex_oauth",
-      authProvider: "codex_oauth",
       accountId: "acct_123",
     });
   });
@@ -679,7 +751,7 @@ describe("codexMultiRouterWizard helpers", () => {
     });
 
     const [route] = buildWizardRoutesFromSources([official]);
-    expect(route.upstream.auth).toEqual({ source: "native_codex_auth" });
+    expect(route.authPolicy).toEqual({ source: "native_codex_auth" });
   });
 
   it("persists an explicit account-pool choice on the Router and official route", () => {
@@ -700,10 +772,8 @@ describe("codexMultiRouterWizard helpers", () => {
       { officialAuth: { mode: "account_pool" } },
     );
 
-    expect(plan.settingsConfig.codexRouting.officialAuth).toEqual({
-      mode: "account_pool",
-    });
-    expect(plan.settingsConfig.codexRouting.routes[0].upstream.auth).toEqual({
+    expect(plan.settingsConfig.codexRouting.schemaVersion).toBe(2);
+    expect(plan.settingsConfig.codexRouting.routes[0].authPolicy).toEqual({
       source: "account_pool",
     });
   });
@@ -751,11 +821,8 @@ describe("codexMultiRouterWizard helpers", () => {
       [official],
       legacyPlan,
     );
-    expect(plan.settingsConfig.codexRouting.officialAuth).toEqual({
-      mode: "managed_oauth",
-      accountId: "acct-legacy",
-    });
-    expect(plan.settingsConfig.codexRouting.routes[0].upstream.auth).toEqual({
+    expect(plan.settingsConfig.codexRouting).not.toHaveProperty("officialAuth");
+    expect(plan.settingsConfig.codexRouting.routes[0].authPolicy).toEqual({
       source: "managed_codex_oauth",
       authProvider: "codex_oauth",
       accountId: "acct-legacy",
@@ -866,6 +933,129 @@ describe("codexMultiRouterWizard helpers", () => {
     ]);
   });
 
+  it("stores canonical include models when a visible collision alias is selected", () => {
+    const official = provider({
+      id: "openai-official",
+      name: "OpenAI Official",
+      category: "official",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "gpt-5.5" }] },
+      },
+    });
+    const relay = provider({
+      id: "relay",
+      name: "Relay",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "gpt-5.5" }, { model: "relay-only" }],
+        },
+      },
+    });
+
+    const { plan } = buildCodexMultiRouterWizardPlan(
+      [official, relay],
+      [official, relay],
+      null,
+      { catalogModelOrder: ["gpt-5.5-relay"] },
+    );
+
+    expect(plan.settingsConfig.codexRouting.routes).toEqual([
+      expect.objectContaining({
+        targetProviderId: "relay",
+        modelSelection: { mode: "include", models: ["gpt-5.5"] },
+        aliases: { "gpt-5.5-relay": "gpt-5.5" },
+      }),
+    ]);
+  });
+
+  it("keeps a materialized route alias stable after the provider is renamed", () => {
+    const official = provider({
+      id: "openai-official",
+      name: "OpenAI Official",
+      category: "official",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "gpt-5.5" }] },
+      },
+    });
+    const renamedRelay = provider({
+      id: "relay",
+      name: "Renamed Relay",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "gpt-5.5" }] },
+      },
+    });
+    const existingPlan = provider({
+      id: "router",
+      name: "Router",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "router-relay",
+              label: "Old Relay",
+              enabled: true,
+              targetProviderId: "relay",
+              modelSelection: { mode: "include", models: ["gpt-5.5"] },
+              matchPrefixes: [],
+              aliases: { "gpt-5.5-relay": "gpt-5.5" },
+            },
+          ],
+        },
+      },
+    });
+
+    const { plan, sourceProviders } = buildCodexMultiRouterWizardPlan(
+      [official, renamedRelay, existingPlan],
+      [official, renamedRelay],
+      existingPlan,
+    );
+
+    expect(
+      plan.settingsConfig.codexRouting.routes.find(
+        (route: { targetProviderId?: string }) =>
+          route.targetProviderId === "relay",
+      ),
+    ).toEqual(
+      expect.objectContaining({
+        targetProviderId: "relay",
+        aliases: { "gpt-5.5-relay": "gpt-5.5" },
+      }),
+    );
+    expect(sourceProviders[1].settingsConfig.modelCatalog.models).toEqual([
+      { model: "gpt-5.5" },
+    ]);
+  });
+
+  it("reports aliases whose canonical target is no longer selected", () => {
+    const relay = provider({
+      id: "relay",
+      name: "Relay",
+      settingsConfig: {
+        modelCatalog: {
+          models: [{ model: "kept" }, { model: "removed" }],
+        },
+      },
+    });
+    const route = {
+      id: "relay-route",
+      label: "relay-route",
+      targetProviderId: "relay",
+      modelSelection: { mode: "include" as const, models: ["kept"] },
+      aliases: { "removed-alias": "removed" },
+    };
+
+    expect(collectWizardRouteAliasSelectionIssues([route], [relay])).toEqual([
+      expect.objectContaining({
+        routeId: "relay-route",
+        alias: "removed-alias",
+        canonicalModel: "removed",
+        routeLabel: "Relay",
+      }),
+    ]);
+  });
+
   it("treats failed direct Responses probes as blocking for native Responses providers", () => {
     const responsesProvider = provider({
       id: "responses",
@@ -904,7 +1094,7 @@ describe("codexMultiRouterWizard helpers", () => {
     expect(canContinueAfterConnectivity([result])).toBe(true);
   });
 
-  it("splits DeepSeek V4 Flash native Responses from V4 Pro Chat routes", () => {
+  it("keeps DeepSeek model protocol overrides on provider models instead of splitting routes", () => {
     const deepseek = provider({
       id: "codex-deepseek",
       name: "DeepSeek",
@@ -912,8 +1102,8 @@ describe("codexMultiRouterWizard helpers", () => {
       settingsConfig: {
         modelCatalog: {
           models: [
-            { model: "deepseek-v4-flash" },
-            { model: "deepseek-v4-pro" },
+            { model: "deepseek-v4-flash", apiFormat: "openai_responses" },
+            { model: "deepseek-v4-pro", apiFormat: "openai_chat" },
           ],
         },
       },
@@ -921,22 +1111,13 @@ describe("codexMultiRouterWizard helpers", () => {
 
     const routes = buildWizardRoutesFromSources([deepseek]);
 
-    expect(routes).toHaveLength(2);
+    expect(routes).toHaveLength(1);
     expect(routes[0]).toMatchObject({
       id: "router-codex-deepseek",
-      match: {
-        models: ["deepseek-v4-flash"],
-        prefixes: ["deepseek-v4-flash"],
-      },
-      upstream: { apiFormat: "openai_responses" },
+      targetProviderId: "codex-deepseek",
+      modelSelection: { mode: "all" },
     });
-    expect(routes[1]).toMatchObject({
-      id: "router-codex-deepseek-chat",
-      match: {
-        models: ["deepseek-v4-pro"],
-        prefixes: ["deepseek-v4-pro"],
-      },
-      upstream: { apiFormat: "openai_chat" },
-    });
+    expect(routes[0]).not.toHaveProperty("upstream");
+    expect(routes[0]).not.toHaveProperty("capabilities");
   });
 });

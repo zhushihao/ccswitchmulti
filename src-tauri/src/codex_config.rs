@@ -1,16 +1,41 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::app_config::AppType;
+use crate::codex_subagent_profiles::{
+    compile_subagent_v2_profiles, initialize_legacy_subagent_v2, normalize_profile_key,
+    parse_persisted_subagent_v2, parse_persisted_subagent_v2_tolerant, render_generated_role_toml,
+    CatalogModel as SubagentCatalogModel, CodexSubagentProfileConfig,
+    CompileError as SubagentCompileError, CompileOutput as SubagentCompileOutput,
+    CompileRequest as SubagentCompileRequest, DiagnosticReasonCode as SubagentDiagnosticReasonCode,
+    InputModality as SubagentInputModality, ModelReasoningEffort as SubagentReasoningEffort,
+    ParsedProfileEntry, ProfileStatusCode as SubagentProfileStatusCode,
+    ProviderKind as SubagentProviderKind, ReasoningRuntimePolicy as SubagentReasoningRuntimePolicy,
+    SubagentVersion as ProfileSubagentVersion,
+};
+use crate::config::write_json_file;
 use crate::config::{
-    atomic_write, delete_file, get_home_dir, read_json_file, sanitize_provider_name,
-    write_json_file, write_text_file,
+    atomic_write, delete_file, get_home_dir, path_is_within, read_json_file,
+    sanitize_provider_name, serialize_json_file_contents, write_text_file,
 };
 use crate::error::AppError;
 use crate::model_capabilities::{image_input_capability_from_modalities, ImageInputCapability};
+use crate::provider::Provider;
+use crate::proxy::providers::codex_reasoning::{
+    ReasoningSupportKind, ResolvedSubagentReasoningCapability,
+};
+use crate::proxy::providers::{
+    codex_route_target_provider_id_from_route, codex_route_uses_official_agent_backend,
+    is_codex_official_provider, resolve_codex_primary_route_from_settings,
+};
+use crate::services::ProviderService;
+use crate::store::AppState;
 use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::process::{Command, Stdio};
+use tauri::State;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, TableLike};
 
 pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "custom";
@@ -25,14 +50,14 @@ pub const CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalo
 ///
 /// `request_max_retries` 只覆盖流建立前的传输/HTTP 5xx 重试；`error sending request`
 /// 这类连接/构造失败必须允许 Codex 重试，否则网络短暂恢复后当前 turn 已经直接失败。
-/// `stream_max_retries` 保持 0：Codex 在收到 `response.output_item.done` 时会立即
-/// 通过 `record_conversation_items` 写入会话历史，流级重试在再次请求前用
-/// `clone_history` 重建 input；因此任何已完成的部分 message/tool call 都会进入
-/// 重试 prompt，形成重复或半截历史。当前 Codex 没有“流未 completed 就回滚已写
-/// item”的机制，故这里不允许流级整轮重放。对可能已在途的响应体读取/超时错误，
-/// CCSM 映射为 429 + Retry-After，而 Codex 的 provider retry policy 明确不重试 429。
+/// `stream_max_retries` 与 Codex 官方默认值 5 对齐：CCSM 只在尚未向客户端发出
+/// 语义事件时做透明 SSE 重连；一旦正文、reasoning 或工具事件已经交付，代理封死
+/// 自身重放通道，把缺少 `response.completed` 的流错误交还 Codex。只有 Codex 拥有
+/// session/turn 历史和工具执行状态，流已开始后的 sampling retry 必须由客户端负责。
+/// 对可能已在途的响应体读取/超时错误，CCSM 仍映射为 429 + Retry-After，而 Codex
+/// 的 provider retry policy 明确不重试 429，避免把未知结果的请求误归为普通断流。
 pub(crate) const CODEX_MANAGED_REQUEST_MAX_RETRIES: u64 = 2;
-pub(crate) const CODEX_MANAGED_STREAM_MAX_RETRIES: u64 = 0;
+pub(crate) const CODEX_MANAGED_STREAM_MAX_RETRIES: u64 = 5;
 const CODEX_MODELS_CACHE_FILENAME: &str = "models_cache.json";
 const CODEX_MODELS_CACHE_BACKUP_FILENAME: &str = "models_cache.cc-switch-backup.json";
 const CC_SWITCH_CODEX_MODELS_CACHE_ETAG: &str = "cc-switch-model-catalog";
@@ -47,6 +72,8 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 // CODEX_HOME and seed different model templates.
 #[cfg(not(test))]
 static CODEX_MODEL_CATALOG_TEMPLATE_CACHE: OnceCell<Value> = OnceCell::new();
+#[cfg(not(test))]
+static CODEX_BUNDLED_MODELS_CACHE: OnceCell<Option<Vec<Value>>> = OnceCell::new();
 
 /// Top-level `config.toml` key that controls Codex's built-in web-search tool.
 pub(crate) const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
@@ -66,8 +93,215 @@ const CODEX_WEB_SEARCH_REJECT_MODEL_PREFIXES: &[&str] =
 const CODEX_MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.5";
 const CODEX_OPENAI_MODEL_PROVIDER_ID: &str = "openai";
 const CODEX_PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
+
+#[cfg(test)]
+static TEST_CONCURRENCY_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_PROVIDER_MERGE_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_CONFIG_TRANSFORM_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_CONFIG_TRANSFORM_AGENT_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<(PathBuf, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_PRE_WRITER_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_COMPANION_PREWRITE_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<(PathBuf, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_CONFIG_AFTER_WRITE_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_AUTH_AFTER_CAPTURE_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_AUTH_AFTER_COMMIT_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_COMPANION_AFTER_CONFIG_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<(PathBuf, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn maybe_mutate_codex_config_for_test(path: &Path) {
+    let queue =
+        TEST_CONCURRENCY_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock test concurrency mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated concurrent config");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_config_after_provider_merge_for_test(path: &Path) {
+    let queue =
+        TEST_PROVIDER_MERGE_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock provider merge test mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write provider merge concurrent config");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_config_after_transform_for_test(path: &Path) {
+    let queue =
+        TEST_CONFIG_TRANSFORM_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock config transform test mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write config transform concurrent config");
+    }
+    maybe_mutate_codex_agent_after_transform_for_test();
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_agent_after_transform_for_test() {
+    let queue = TEST_CONFIG_TRANSFORM_AGENT_MUTATIONS
+        .get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock config transform agent mutation queue")
+        .pop_front();
+    if let Some((path, contents)) = next {
+        std::fs::write(path, contents).expect("write agent transform concurrent config");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_config_before_writer_snapshot_for_test(path: &Path) {
+    let queue = TEST_PRE_WRITER_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock pre-writer mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated pre-writer config mutation");
+    }
+}
+
+/// Test-only seam used by structural concurrency regressions to place an
+/// external write immediately before a raw writer's first snapshot.
+#[cfg(test)]
+pub(crate) fn set_test_pre_writer_mutations_for_test(contents: &[&str]) {
+    let queue = TEST_PRE_WRITER_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let mut queue = queue.lock().expect("lock pre-writer mutation queue");
+    queue.clear();
+    queue.extend(contents.iter().map(|value| (*value).to_string()));
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_companion_prewrite_mutation_for_test(path: &Path, contents: &str) {
+    let queue =
+        TEST_COMPANION_PREWRITE_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let mut queue = queue
+        .lock()
+        .expect("lock companion pre-write mutation queue");
+    queue.clear();
+    queue.push_back((path.to_path_buf(), contents.to_string()));
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_config_after_write_for_test(path: &Path) {
+    let queue =
+        TEST_CONFIG_AFTER_WRITE_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock config after-write mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated after-write config mutation");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_auth_after_capture_for_test(path: &Path) {
+    let queue =
+        TEST_AUTH_AFTER_CAPTURE_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock auth after-capture mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated auth mutation after capture");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_auth_after_commit_for_test(path: &Path) {
+    let queue =
+        TEST_AUTH_AFTER_COMMIT_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock auth after-commit mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated auth mutation after commit");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_companion_after_config_commit_for_test() {
+    let queue = TEST_COMPANION_AFTER_CONFIG_MUTATIONS
+        .get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock companion after-config mutation queue")
+        .pop_front();
+    if let Some((target, contents)) = next {
+        std::fs::write(target, contents).expect("write simulated after-config companion mutation");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_companion_before_write_for_test(path: &Path) {
+    let queue =
+        TEST_COMPANION_PREWRITE_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let mut queue = queue
+        .lock()
+        .expect("lock companion pre-write mutation queue");
+    let should_apply = queue.front().is_some_and(|(target, _)| target == path);
+    if should_apply {
+        let (target, contents) = queue
+            .pop_front()
+            .expect("companion pre-write mutation queue entry");
+        std::fs::write(target, contents).expect("write simulated companion mutation");
+    }
+}
+
 const CC_SWITCH_MANAGED_AGENT_MARKER: &str =
     "# Managed by CCSwitchMulti. Do not edit this file by hand.";
+const CC_SWITCH_SUBAGENT_V2_POLICY_BEGIN: &str = "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_BEGIN]";
+const CC_SWITCH_SUBAGENT_V2_POLICY_END: &str = "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_END]";
 const CC_SWITCH_CODEX_AGENT_THREADS: i64 = 10;
 const CC_SWITCH_CODEX_AGENT_DEPTH: i64 = 1;
 const CODEX_REASONING_EFFORTS: &[(&str, &str)] = &[
@@ -80,6 +314,7 @@ const CODEX_REASONING_EFFORTS: &[(&str, &str)] = &[
     ("xhigh", "Extra high reasoning depth for complex problems"),
 ];
 const CODEX_DEFAULT_REASONING_EFFORT: &str = "medium";
+const DEEPSEEK_WINDOWS_EXECUTION_GUIDANCE: &str = "On Windows, use PowerShell syntax and minimal directed commands. For content, use `rg <pattern> <named-path>`; for file discovery, use `rg --files <named-path>`. Use narrow `-g` includes and excludes, including `-g '!node_modules/**'`, `-g '!.git/**'`, `-g '!target/**'`, `-g '!dist/**'`, and `-g '!generated/**'`. First identify a narrow source or test subtree; never recursively scan a user profile/home, drive root, or broad repository root.\nDo not use Unix-only commands such as `wc`, and do not assume `Select-String -Recurse` exists; if `rg` is unavailable, only after identifying a narrow target use `Get-ChildItem -LiteralPath <narrow-target> -File -Recurse | Select-String`.\nFor ordinary read-only inspection, call tools without escalation metadata or a justification.\nStop and report as soon as the requested evidence is sufficient; do not keep scanning merely to be exhaustive.";
 
 /// Codex model catalog 的工具配置画像。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +328,7 @@ pub enum CodexCatalogToolProfile {
     /// tools — the Responses→Anthropic transform keeps only `function` tools.
     /// Additionally the Codex `web_search` hosted tool is unusable on this path
     /// (the transform drops it), so it is always disabled — see
-    /// `prepare_codex_config_text_with_model_catalog`.
+    /// `prepare_codex_config_text_with_model_catalog_impl`.
     Anthropic,
 }
 
@@ -215,10 +450,19 @@ pub fn delete_codex_provider_config(
 }
 
 /// 原子写 Codex 的 `auth.json` 与 `config.toml`，在第二步失败时回滚第一步
-pub fn write_codex_live_atomic(
+pub(crate) fn missing_codex_live_config_error() -> AppError {
+    AppError::localized(
+        "provider.codex.config.missing",
+        "Codex 缺少 config.toml 配置，已停止写入以保护现有配置",
+        "Codex config.toml is missing; the write was stopped to protect the existing configuration",
+    )
+}
+
+pub(crate) fn write_codex_live_atomic(
     auth: &Value,
     config_text_opt: Option<&str>,
 ) -> Result<(), AppError> {
+    let config_text_opt = config_text_opt.ok_or_else(missing_codex_live_config_error)?;
     let auth_path = get_codex_auth_path();
     let config_path = get_codex_config_path();
 
@@ -239,10 +483,7 @@ pub fn write_codex_live_atomic(
     };
 
     // 准备写入内容
-    let cfg_text = match config_text_opt {
-        Some(s) => s.to_string(),
-        None => String::new(),
-    };
+    let cfg_text = normalize_codex_config_text_for_live_read(config_text_opt)?;
     if !cfg_text.trim().is_empty() {
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
@@ -251,7 +492,7 @@ pub fn write_codex_live_atomic(
     write_json_file(&auth_path, auth)?;
 
     // 第二步：写 config.toml（失败则回滚 auth.json）
-    if let Err(e) = write_text_file(&config_path, &cfg_text) {
+    if let Err(e) = write_codex_live_config_optimistic(&config_path, &cfg_text) {
         // 回滚 auth.json
         if let Some(bytes) = old_auth {
             let _ = atomic_write(&auth_path, &bytes);
@@ -262,6 +503,59 @@ pub fn write_codex_live_atomic(
     }
 
     Ok(())
+}
+
+pub(crate) fn write_codex_provider_config_reconciled(
+    auth: &Value,
+    config_text: &str,
+) -> Result<(), AppError> {
+    write_codex_live_config_reconcile(&get_codex_config_path(), |live_config| {
+        let merged = merge_codex_provider_config_texts(live_config, config_text)?;
+        prepare_codex_provider_live_config(auth, &merged)
+    })
+}
+
+pub(crate) fn write_codex_provider_auth_and_config_reconciled(
+    auth: &Value,
+    config_text: &str,
+) -> Result<(), AppError> {
+    write_codex_provider_auth_and_config_reconciled_with_receipt(auth, config_text).map(|_| ())
+}
+
+/// Receipt-bearing variant of the legacy auth+config snapshot writer.  The
+/// auth attempt is captured before the guarded config reconcile, so rollback
+/// can prove ownership of both files independently.
+pub(crate) fn write_codex_provider_auth_and_config_reconciled_with_receipt(
+    auth: &Value,
+    config_text: &str,
+) -> Result<CodexProviderWriteReceipt, AppError> {
+    let auth_path = get_codex_auth_path();
+    let auth_attempt = CodexAuthWriteAttempt::capture_and_write(&auth_path, auth)?;
+    let mut companions = CodexProjectionSideEffectsAttempt::capture()?;
+    let config_attempt = match write_codex_live_config_reconcile_with_attempt(
+        &get_codex_config_path(),
+        |live_config| {
+            let merged = merge_codex_provider_config_texts(live_config, config_text)?;
+            prepare_codex_provider_live_config(auth, &merged)
+        },
+    ) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            return Err(restore_codex_auth_after_error(
+                error,
+                Some(&auth_attempt),
+                &auth_path,
+            ));
+        }
+    };
+    companions.mark_unmodified_as_after();
+    Ok(CodexProviderWriteReceipt {
+        projection: CodexProjectionCommitReceipt {
+            config_attempt,
+            companion_attempt: companions,
+        },
+        auth_attempt: Some(auth_attempt),
+    })
 }
 
 /// 读取 `~/.codex/config.toml`，若不存在返回空字符串
@@ -284,11 +578,508 @@ pub fn validate_config_toml(text: &str) -> Result<(), AppError> {
         .map_err(|e| AppError::toml(Path::new("config.toml"), e))
 }
 
+fn line_toggles_toml_multiline_string(line: &str, delimiter: &str) -> bool {
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    while let Some(relative) = line[offset..].find(delimiter) {
+        let index = offset + relative;
+        if delimiter == "'''"
+            || index == 0
+            || line.as_bytes().get(index.wrapping_sub(1)) != Some(&b'\\')
+        {
+            count += 1;
+        }
+        offset = index + delimiter.len();
+    }
+    count % 2 == 1
+}
+
+fn escape_unescaped_toml_windows_path(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return None;
+    }
+
+    let mut output = String::with_capacity(value.len() + 8);
+    let mut chars = value.chars().peekable();
+    let mut repaired = false;
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+
+        let mut run = 1usize;
+        while chars.peek() == Some(&'\\') {
+            chars.next();
+            run += 1;
+        }
+        if run % 2 == 1 {
+            repaired = true;
+        }
+        for _ in 0..run.div_ceil(2) {
+            output.push_str("\\\\");
+        }
+    }
+
+    repaired.then_some(output)
+}
+
+fn repair_root_notify_windows_path_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let notify_tail = trimmed.strip_prefix("notify")?;
+    if !notify_tail.trim_start().starts_with('=') {
+        return None;
+    }
+    let array_start = line.find('[')?;
+    let array_tail = &line[array_start + 1..];
+    let quote_offset = match (array_tail.find('"'), array_tail.find('\'')) {
+        (Some(basic), Some(literal)) => basic.min(literal),
+        (Some(basic), None) => basic,
+        (None, Some(literal)) => literal,
+        (None, None) => return None,
+    };
+    let quote_start = quote_offset + array_start + 1;
+    let quote = line.as_bytes()[quote_start] as char;
+    let value_start = quote_start + 1;
+    let quote_end = line[value_start..].find(quote)? + value_start;
+    let value = &line[value_start..quote_end];
+    let escaped = escape_unescaped_toml_windows_path(value)?;
+
+    let mut output = String::with_capacity(line.len() + escaped.len() - value.len());
+    output.push_str(&line[..value_start]);
+    output.push_str(&escaped);
+    output.push_str(&line[quote_end..]);
+    Some(output)
+}
+
+fn repair_projects_windows_path_table_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let prefix = "[projects.\"";
+    let path_start_in_trimmed = prefix.len();
+    if !trimmed.starts_with(prefix) {
+        return None;
+    }
+
+    let suffix_start_in_trimmed =
+        trimmed[path_start_in_trimmed..].find("\"]")? + path_start_in_trimmed;
+    let path = &trimmed[path_start_in_trimmed..suffix_start_in_trimmed];
+    if !looks_like_windows_path(path) {
+        return None;
+    }
+    let escaped = escape_unescaped_toml_windows_path(path)?;
+    let indentation_len = line.len() - trimmed.len();
+    let path_start = indentation_len + path_start_in_trimmed;
+    let path_end = indentation_len + suffix_start_in_trimmed;
+
+    let mut output = String::with_capacity(line.len() + escaped.len() - path.len());
+    output.push_str(&line[..path_start]);
+    output.push_str(&escaped);
+    output.push_str(&line[path_end..]);
+    Some(output)
+}
+
+fn looks_like_windows_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+/// Codex Desktop 的 Windows Computer Use 初始化器曾生成过裸反斜杠的根级
+/// `notify = ["C:\Users\...", ...]`。在 TOML basic string 中 `\U` 会被解释为
+/// 8 位 Unicode 转义并使整个 Live 配置不可解析。这里只在原文本确实无效时，
+/// 对首个 table 之前、且不在多行字符串内的根级 notify 命令路径做规范化；用户
+/// 的其他 TOML、说明文字和已经合法的双反斜杠保持逐字不变。
+fn normalize_codex_config_text_for_live_read(text: &str) -> Result<String, AppError> {
+    if validate_config_toml(text).is_ok() {
+        return Ok(text.to_string());
+    }
+
+    let mut output = String::with_capacity(text.len() + 16);
+    let mut in_basic_multiline = false;
+    let mut in_literal_multiline = false;
+    let mut root_scope = true;
+    let mut repaired = false;
+
+    for line in text.split_inclusive('\n') {
+        let outside_multiline = !in_basic_multiline && !in_literal_multiline;
+        if outside_multiline && root_scope && line.trim_start().starts_with('[') {
+            root_scope = false;
+        }
+
+        if outside_multiline {
+            if let Some(next) = repair_projects_windows_path_table_line(line) {
+                output.push_str(&next);
+                repaired = true;
+            } else if root_scope {
+                if let Some(next) = repair_root_notify_windows_path_line(line) {
+                    output.push_str(&next);
+                    repaired = true;
+                } else {
+                    output.push_str(line);
+                }
+            } else {
+                output.push_str(line);
+            }
+        } else if in_basic_multiline {
+            if let Some(next) = repair_root_notify_windows_path_line(line) {
+                output.push_str(&next);
+                repaired = true;
+            } else {
+                output.push_str(line);
+            }
+        } else {
+            output.push_str(line);
+        }
+
+        if !in_literal_multiline && line_toggles_toml_multiline_string(line, "\"\"\"") {
+            in_basic_multiline = !in_basic_multiline;
+        }
+        if !in_basic_multiline && line_toggles_toml_multiline_string(line, "'''") {
+            in_literal_multiline = !in_literal_multiline;
+        }
+    }
+
+    if repaired {
+        validate_config_toml(&output)?;
+        log::warn!("Normalized an invalid unescaped Windows path in Codex Live configuration");
+        return Ok(output);
+    }
+
+    validate_config_toml(text)?;
+    Ok(text.to_string())
+}
+
 /// 读取并校验 `~/.codex/config.toml`，返回文本（可能为空）
 pub fn read_and_validate_codex_config_text() -> Result<String, AppError> {
     let s = read_codex_config_text()?;
-    validate_config_toml(&s)?;
-    Ok(s)
+    normalize_codex_config_text_for_live_read(&s)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexConfigFingerprint {
+    len: u64,
+    hash: u64,
+}
+
+fn codex_bytes_fingerprint(bytes: &[u8]) -> CodexConfigFingerprint {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    CodexConfigFingerprint {
+        len: bytes.len() as u64,
+        hash: hasher.finish(),
+    }
+}
+
+/// One coherent read of the Codex live file.
+///
+/// The bytes and fingerprint intentionally come from the same `fs::read` call.  A
+/// caller must not read the text first and fingerprint it later: that creates a
+/// window in which Codex Desktop can replace the file and the writer would still
+/// believe that its candidate was based on the latest contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactCodexSnapshot {
+    pub(crate) bytes: Option<Vec<u8>>,
+    fingerprint: Option<CodexConfigFingerprint>,
+}
+
+impl ExactCodexSnapshot {
+    pub(crate) fn read(path: &Path) -> Result<Self, AppError> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(AppError::io(path, error)),
+        };
+        let fingerprint = bytes.as_deref().map(codex_bytes_fingerprint);
+        Ok(Self { bytes, fingerprint })
+    }
+
+    pub(crate) fn text(&self, path: &Path) -> Result<String, AppError> {
+        match &self.bytes {
+            Some(bytes) => String::from_utf8(bytes.clone()).map_err(|error| {
+                AppError::Message(format!("读取 Codex {} 失败: {error}", path.display()))
+            }),
+            None => Ok(String::new()),
+        }
+    }
+
+    pub(crate) fn fingerprint(&self) -> Option<CodexConfigFingerprint> {
+        self.fingerprint
+    }
+
+    pub(crate) fn from_fingerprint(fingerprint: Option<CodexConfigFingerprint>) -> Self {
+        Self {
+            bytes: None,
+            fingerprint,
+        }
+    }
+}
+
+/// The ownership proof returned by a reconciled live-file write.
+///
+/// Rollback code may restore `before` only while the file still has
+/// `after_fingerprint`.  If another process (including a different CCSM
+/// attempt) has written since this attempt, restoration is deferred and the
+/// newer bytes are preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedCodexAttempt {
+    pub(crate) before: ExactCodexSnapshot,
+    pub(crate) after_fingerprint: Option<CodexConfigFingerprint>,
+}
+
+impl CommittedCodexAttempt {
+    pub(crate) fn restore_if_unchanged(&self, path: &Path) -> Result<bool, AppError> {
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != self.after_fingerprint {
+            return Ok(false);
+        }
+
+        match &self.before.bytes {
+            Some(bytes) => atomic_write(path, bytes)?,
+            None => delete_file(path)?,
+        }
+        Ok(true)
+    }
+}
+
+/// Ownership proof for an `auth.json` write.
+///
+/// Auth is not part of the TOML reconcile loop, so it needs its own guarded
+/// capture/commit boundary.  The candidate fingerprint is calculated from the
+/// exact serialized bytes that are passed to `atomic_write`; rollback is
+/// conditional on those bytes still being present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexAuthWriteAttempt {
+    pub(crate) before: ExactCodexSnapshot,
+    /// `Some` for a file written by this attempt; `None` means the attempt
+    /// intentionally deleted auth.json.  Keeping the optional fingerprint is
+    /// what makes a missing-file after-state an ownership proof rather than a
+    /// special case that force-repair cannot roll back.
+    pub(crate) written_fingerprint: Option<CodexConfigFingerprint>,
+}
+
+impl CodexAuthWriteAttempt {
+    /// Write auth bytes only if the caller's earlier exact snapshot is still
+    /// current.  Recovery/snapshot flows capture auth before they inspect the
+    /// rest of the live state; recapturing here would incorrectly treat a new
+    /// OAuth login as this attempt's baseline and overwrite it.
+    pub(crate) fn write_if_snapshot_unchanged(
+        path: &Path,
+        before: &ExactCodexSnapshot,
+        auth: &Value,
+    ) -> Result<Self, AppError> {
+        let bytes = serialize_json_file_contents(auth)?;
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != before.fingerprint() {
+            return Err(concurrent_modification_deferred_error());
+        }
+        atomic_write(path, &bytes)?;
+        Ok(Self {
+            before: before.clone(),
+            written_fingerprint: Some(codex_bytes_fingerprint(&bytes)),
+        })
+    }
+
+    pub(crate) fn capture_and_write(path: &Path, auth: &Value) -> Result<Self, AppError> {
+        let before = ExactCodexSnapshot::read(path)?;
+        let bytes = serialize_json_file_contents(auth)?;
+
+        #[cfg(test)]
+        maybe_mutate_codex_auth_after_capture_for_test(path);
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != before.fingerprint() {
+            return Err(concurrent_modification_deferred_error());
+        }
+
+        atomic_write(path, &bytes)?;
+        #[cfg(test)]
+        maybe_mutate_codex_auth_after_commit_for_test(path);
+        Ok(Self {
+            before,
+            written_fingerprint: Some(codex_bytes_fingerprint(&bytes)),
+        })
+    }
+
+    pub(crate) fn restore_if_unchanged(&self, path: &Path) -> Result<bool, AppError> {
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != self.written_fingerprint {
+            return Ok(false);
+        }
+
+        match &self.before.bytes {
+            Some(bytes) => atomic_write(path, bytes)?,
+            None => delete_file(path)?,
+        }
+        Ok(true)
+    }
+}
+
+fn restore_codex_auth_after_error(
+    error: AppError,
+    attempt: Option<&CodexAuthWriteAttempt>,
+    path: &Path,
+) -> AppError {
+    let Some(attempt) = attempt else {
+        return error;
+    };
+    match attempt.restore_if_unchanged(path) {
+        Ok(true) => error,
+        Ok(false) => AppError::Message(format!(
+            "{error}; Codex auth.json rollback deferred because an external update was detected"
+        )),
+        Err(restore_error) => AppError::Message(format!(
+            "{error}; Codex auth.json rollback failed: {restore_error}"
+        )),
+    }
+}
+
+fn concurrent_modification_deferred_error() -> AppError {
+    AppError::localized(
+        "codex.live.concurrent_modification_deferred",
+        "Codex 配置正在被其他程序修改，已保留最新文件并暂缓写入",
+        "Codex configuration changed concurrently; the latest file was preserved and the write was deferred",
+    )
+}
+
+/// Write Codex's config with an optimistic fingerprint check.  The provider
+/// payload has already been prepared by the caller; if another process writes
+/// the file between our read and replacement, merge the requested provider
+/// fields onto that newer live text and retry a small, bounded number of times.
+fn write_codex_live_config_optimistic(
+    config_path: &Path,
+    config_text: &str,
+) -> Result<(), AppError> {
+    let mut candidate = normalize_codex_config_text_for_live_read(config_text)?;
+    const MAX_RETRIES: usize = 2;
+
+    for _attempt in 0..=MAX_RETRIES {
+        #[cfg(test)]
+        maybe_mutate_codex_config_before_writer_snapshot_for_test(config_path);
+        let before = ExactCodexSnapshot::read(config_path)?;
+
+        #[cfg(test)]
+        maybe_mutate_codex_config_for_test(config_path);
+
+        let observed = ExactCodexSnapshot::read(config_path)?;
+        if before.fingerprint() != observed.fingerprint() {
+            let latest = observed.text(config_path)?;
+            candidate = if candidate.trim().is_empty() {
+                strip_codex_provider_owned_fields_from_live(&latest)?
+            } else {
+                merge_codex_provider_config_texts(&latest, &candidate)?
+            };
+            continue;
+        }
+
+        write_text_file(config_path, &candidate)?;
+        return Ok(());
+    }
+
+    let error = concurrent_modification_deferred_error();
+    let mut outcome = crate::services::recovery_outcome::RecoveryOutcome::for_app(
+        crate::services::recovery_outcome::RecoveryOutcomeKind::ConcurrentModificationDeferred,
+        "codex",
+    );
+    outcome.next_step = Some("retryCodexConfigWrite".to_string());
+    outcome.details = Some(error.to_string());
+    if let Err(record_error) = crate::services::recovery_outcome::record_recovery_outcome(outcome) {
+        log::warn!("保存 Codex 并发写入延迟结果失败: {record_error}");
+    }
+    Err(error)
+}
+
+/// Reconcile Codex's live `config.toml` from the current bytes with an
+/// optimistic fingerprint check.
+///
+/// MCP projection is intentionally live-as-base: the caller supplies a
+/// closure that parses the currently observed text and applies only its
+/// owned changes.  The file is fingerprinted again immediately before the
+/// atomic replacement.  If Codex (or another CCSwitchMulti process) wrote the
+/// file in between, the closure is run again against the newer bytes.  After
+/// two retries the latest external bytes are left untouched and the caller
+/// receives the same deferred error used by provider writes.
+pub(crate) fn write_codex_live_config_reconcile<F>(
+    config_path: &Path,
+    reconcile: F,
+) -> Result<(), AppError>
+where
+    F: FnMut(&str) -> Result<String, AppError>,
+{
+    write_codex_live_config_reconcile_with_attempt(config_path, reconcile).map(|_| ())
+}
+
+/// Reconcile Codex live config and return the exact ownership proof for the
+/// committed attempt.  Every retry obtains one byte snapshot, transforms that
+/// snapshot, then compares a second byte snapshot immediately before commit.
+pub(crate) fn write_codex_live_config_reconcile_with_attempt<F>(
+    config_path: &Path,
+    mut reconcile: F,
+) -> Result<CommittedCodexAttempt, AppError>
+where
+    F: FnMut(&str) -> Result<String, AppError>,
+{
+    const MAX_RETRIES: usize = 2;
+
+    for _attempt in 0..=MAX_RETRIES {
+        #[cfg(test)]
+        maybe_mutate_codex_config_before_writer_snapshot_for_test(config_path);
+        let before = ExactCodexSnapshot::read(config_path)?;
+        let live = before.text(config_path)?;
+        let candidate = reconcile(&live)?;
+
+        #[cfg(test)]
+        maybe_mutate_codex_config_for_test(config_path);
+
+        let observed = ExactCodexSnapshot::read(config_path)?;
+        if before.fingerprint() != observed.fingerprint() {
+            continue;
+        }
+
+        // Avoid rewriting a byte-identical no-op only after the fingerprint
+        // check.  A concurrent write can happen while the closure is
+        // reconciling even when it ultimately returns the original text.
+        if candidate == live {
+            return Ok(CommittedCodexAttempt {
+                before,
+                after_fingerprint: observed.fingerprint(),
+            });
+        }
+
+        write_text_file(config_path, &candidate)?;
+        #[cfg(test)]
+        maybe_mutate_codex_config_after_write_for_test(config_path);
+        return Ok(CommittedCodexAttempt {
+            before,
+            after_fingerprint: Some(codex_bytes_fingerprint(candidate.as_bytes())),
+        });
+    }
+
+    let error = concurrent_modification_deferred_error();
+    let mut outcome = crate::services::recovery_outcome::RecoveryOutcome::for_app(
+        crate::services::recovery_outcome::RecoveryOutcomeKind::ConcurrentModificationDeferred,
+        "codex",
+    );
+    outcome.next_step = Some("retryCodexConfigWrite".to_string());
+    outcome.details = Some(error.to_string());
+    if let Err(record_error) = crate::services::recovery_outcome::record_recovery_outcome(outcome) {
+        log::warn!("保存 Codex MCP 并发写入延迟结果失败: {record_error}");
+    }
+    Err(error)
+}
+
+pub(crate) fn codex_provider_noop_projection_receipt(
+    config_path: &Path,
+) -> Result<CodexProjectionCommitReceipt, AppError> {
+    let before = ExactCodexSnapshot::read(config_path)?;
+    let mut companions = CodexProjectionSideEffectsAttempt::capture()?;
+    companions.mark_unmodified_as_after();
+    Ok(CodexProjectionCommitReceipt {
+        config_attempt: CommittedCodexAttempt {
+            before: before.clone(),
+            after_fingerprint: before.fingerprint(),
+        },
+        companion_attempt: companions,
+    })
 }
 
 fn active_codex_model_provider_id(doc: &DocumentMut) -> Option<String> {
@@ -312,18 +1103,18 @@ pub(crate) fn is_custom_codex_model_provider_id(id: &str) -> bool {
 /// Codex login state lives in `auth.json`; provider routing, endpoint, model,
 /// and provider-scoped bearer tokens live in `config.toml`. Provider switches
 /// should not overwrite the user's ChatGPT login cache.
-pub fn write_codex_live_config_atomic(config_text_opt: Option<&str>) -> Result<(), AppError> {
+pub(crate) fn write_codex_live_config_atomic(
+    config_text_opt: Option<&str>,
+) -> Result<(), AppError> {
+    let config_text_opt = config_text_opt.ok_or_else(missing_codex_live_config_error)?;
     let config_path = get_codex_config_path();
-    let cfg_text = match config_text_opt {
-        Some(config_text) => config_text.to_string(),
-        None => String::new(),
-    };
+    let cfg_text = normalize_codex_config_text_for_live_read(config_text_opt)?;
 
     if !cfg_text.trim().is_empty() {
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
 
-    write_text_file(&config_path, &cfg_text)
+    write_codex_live_config_optimistic(&config_path, &cfg_text)
 }
 
 pub fn extract_codex_auth_api_key(auth: &Value) -> Option<String> {
@@ -531,21 +1322,42 @@ pub fn codex_live_auth_is_stale_third_party_residue(live_auth: &Value) -> bool {
 pub fn clear_stale_codex_live_auth_after_official_switch(
     db_auth: &Value,
 ) -> Result<bool, AppError> {
+    Ok(clear_stale_codex_live_auth_after_official_switch_with_receipt(db_auth)?.is_some())
+}
+
+/// Delete stale third-party auth.json and return an ownership receipt for the
+/// optional-file transition.  A missing after-file (`written_fingerprint =
+/// None`) is deliberate: force-repair can restore the old auth only while the
+/// file remains absent, and will report deferred if Codex creates a new login
+/// between cleanup and rollback.
+pub(crate) fn clear_stale_codex_live_auth_after_official_switch_with_receipt(
+    db_auth: &Value,
+) -> Result<Option<CodexAuthWriteAttempt>, AppError> {
     if codex_auth_has_login_material(db_auth) {
         // A material-carrying official provider gets a full auth write;
         // nothing stale can remain.
-        return Ok(false);
+        return Ok(None);
     }
     let auth_path = get_codex_auth_path();
     if !auth_path.exists() {
-        return Ok(false);
+        return Ok(None);
     }
+    let before = ExactCodexSnapshot::read(&auth_path)?;
     let live_auth: Value = read_json_file(&auth_path)?;
+    #[cfg(test)]
+    maybe_mutate_codex_auth_after_capture_for_test(&auth_path);
+    let current = ExactCodexSnapshot::read(&auth_path)?;
+    if current.fingerprint() != before.fingerprint() {
+        return Err(concurrent_modification_deferred_error());
+    }
     if !codex_live_auth_is_stale_third_party_residue(&live_auth) {
-        return Ok(false);
+        return Ok(None);
     }
     delete_file(&auth_path)?;
-    Ok(true)
+    Ok(Some(CodexAuthWriteAttempt {
+        before,
+        written_fingerprint: None,
+    }))
 }
 
 pub fn should_restore_codex_provider_token_for_backfill(
@@ -695,7 +1507,7 @@ fn extract_codex_top_level_string(config_text: &str, field: &str) -> Option<Stri
 
 /// 判断模型是否只能按文本模型写入 Codex catalog。
 ///
-/// Spark 和 DeepSeek V4 兼容 Responses 文本工具调用，但 Codex 会根据
+/// Spark 和已确认的 DeepSeek V4 文本模型兼容 Responses 文本工具调用，但 Codex 会根据
 /// `input_modalities` 里的 `image` 自动注入 hosted `image_generation` 工具；
 /// 这些模型不支持该工具，所以生成 catalog 时必须覆盖模板里的图片模态。
 fn codex_catalog_model_name_is_text_only(model: &str) -> bool {
@@ -705,7 +1517,10 @@ fn codex_catalog_model_name_is_text_only(model: &str) -> bool {
         .flat_map(|ch| ch.to_lowercase())
         .collect::<String>();
 
-    normalized == "gpt53codexspark" || normalized.starts_with("deepseekv4")
+    matches!(
+        normalized.as_str(),
+        "gpt53codexspark" | "deepseekv4flash" | "deepseekv4pro"
+    )
 }
 
 /// 判断生成 catalog 时是否保留 OpenAI 官方 GPT 的速度/服务档。
@@ -768,6 +1583,8 @@ fn codex_catalog_route_matches_model(route: &Value, model: &str) -> bool {
     let match_config = route.get("match").unwrap_or(route);
     if match_config
         .get("models")
+        .or_else(|| route.get("models"))
+        .or_else(|| route.pointer("/modelSelection/models"))
         .and_then(|value| value.as_array())
         .into_iter()
         .flatten()
@@ -778,17 +1595,35 @@ fn codex_catalog_route_matches_model(route: &Value, model: &str) -> bool {
     }
 
     let lower_model = model.to_ascii_lowercase();
-    match_config
+    let prefix_match = match_config
         .get("prefixes")
+        .or_else(|| match_config.get("matchPrefixes"))
+        .or_else(|| match_config.get("match_prefixes"))
         .or_else(|| match_config.get("modelPrefixes"))
         .or_else(|| match_config.get("model_prefixes"))
+        .or_else(|| route.get("matchPrefixes"))
+        .or_else(|| route.get("match_prefixes"))
         .and_then(|value| value.as_array())
         .into_iter()
         .flatten()
         .filter_map(|value| value.as_str())
         .map(str::trim)
         .filter(|prefix| !prefix.is_empty())
-        .any(|prefix| lower_model.starts_with(&prefix.to_ascii_lowercase()))
+        .any(|prefix| lower_model.starts_with(&prefix.to_ascii_lowercase()));
+    prefix_match && codex_catalog_route_include_allows(route, model)
+}
+
+fn codex_catalog_route_include_allows(route: &Value, model: &str) -> bool {
+    let Some(models) = route
+        .pointer("/modelSelection/models")
+        .and_then(Value::as_array)
+    else {
+        return true;
+    };
+    models
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|candidate| candidate.trim().eq_ignore_ascii_case(model))
 }
 
 /// 根据 route capability 判断 catalog 是否应写成 text-only。
@@ -852,7 +1687,7 @@ fn codex_catalog_capabilities_for_model<'a>(settings: &'a Value, model: &str) ->
 /// `supportedReasoningEfforts[].reasoningEffort`。这里保留 snake_case 源字段，
 /// 额外投影 camelCase 别名，避免 app-server 或 renderer 只认其中一种形态。
 fn codex_desktop_reasoning_efforts_from_levels(levels: Option<&Value>) -> Value {
-    let mut efforts = levels
+    let efforts = levels
         .and_then(|value| value.as_array())
         .map(|levels| {
             levels
@@ -879,19 +1714,49 @@ fn codex_desktop_reasoning_efforts_from_levels(levels: Option<&Value>) -> Value 
         })
         .unwrap_or_default();
 
-    if efforts.is_empty() {
-        efforts = CODEX_REASONING_EFFORTS
-            .iter()
-            .map(|(effort, description)| {
-                json!({
-                    "reasoningEffort": effort,
-                    "description": description,
-                })
-            })
-            .collect();
-    }
-
     Value::Array(efforts)
+}
+
+/// 把 Provider 原生档位与已确认映射归一为 Codex 可选择的 reasoning levels。
+fn apply_codex_model_reasoning_capability(
+    entry_obj: &mut serde_json::Map<String, Value>,
+    capability: Option<&crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability>,
+) {
+    for field in [
+        "default_reasoning_level",
+        "default_reasoning_effort",
+        "defaultReasoningEffort",
+        "supported_reasoning_levels",
+        "supported_reasoning_efforts",
+        "supportedReasoningEfforts",
+    ] {
+        entry_obj.remove(field);
+    }
+    entry_obj.insert(
+        "supported_reasoning_levels".to_string(),
+        Value::Array(Vec::new()),
+    );
+    let resolved =
+        crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(capability);
+    if let Some(default_effort) = resolved.provider_default_effort {
+        entry_obj.insert(
+            "default_reasoning_level".to_string(),
+            json!(default_effort.as_str()),
+        );
+    }
+    entry_obj.insert(
+        "supported_reasoning_levels".to_string(),
+        Value::Array(
+            resolved
+                .codex_selectable_efforts
+                .iter()
+                .map(|effort| {
+                    let effort = effort.as_str();
+                    json!({ "effort": effort, "description": format!("{effort} effort") })
+                })
+                .collect(),
+        ),
+    );
 }
 
 /// 为最新版 Codex `ModelInfo` 保留 snake_case reasoning levels。
@@ -945,8 +1810,7 @@ fn project_codex_desktop_model_fields(
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|effort| !effort.is_empty())
-        .unwrap_or(CODEX_DEFAULT_REASONING_EFFORT)
-        .to_string();
+        .map(ToString::to_string);
     let supported_reasoning_efforts =
         codex_desktop_reasoning_efforts_from_levels(entry_obj.get("supported_reasoning_levels"));
     let supported_reasoning_levels =
@@ -956,22 +1820,29 @@ fn project_codex_desktop_model_fields(
     entry_obj.insert("displayName".to_string(), json!(spec.display_name));
     entry_obj.insert("contextWindow".to_string(), json!(spec.context_window));
     entry_obj.insert("maxContextWindow".to_string(), json!(spec.context_window));
-    entry_obj.insert(
-        "default_reasoning_level".to_string(),
-        json!(default_reasoning_effort.clone()),
-    );
-    entry_obj.insert(
-        "defaultReasoningEffort".to_string(),
-        json!(default_reasoning_effort),
-    );
-    entry_obj.insert(
-        "supported_reasoning_levels".to_string(),
-        supported_reasoning_levels,
-    );
-    entry_obj.insert(
-        "supportedReasoningEfforts".to_string(),
-        supported_reasoning_efforts,
-    );
+    if let Some(default_reasoning_effort) = default_reasoning_effort {
+        entry_obj.insert(
+            "default_reasoning_level".to_string(),
+            json!(default_reasoning_effort.clone()),
+        );
+        entry_obj.insert(
+            "defaultReasoningEffort".to_string(),
+            json!(default_reasoning_effort),
+        );
+    }
+    if supported_reasoning_efforts
+        .as_array()
+        .is_some_and(|efforts| !efforts.is_empty())
+    {
+        entry_obj.insert(
+            "supported_reasoning_levels".to_string(),
+            supported_reasoning_levels,
+        );
+        entry_obj.insert(
+            "supportedReasoningEfforts".to_string(),
+            supported_reasoning_efforts,
+        );
+    }
     entry_obj.insert("visibility".to_string(), json!("list"));
     entry_obj.insert("show_in_picker".to_string(), json!(true));
     entry_obj.insert("supported_in_api".to_string(), json!(true));
@@ -1042,12 +1913,24 @@ fn codex_catalog_model_entry(
     };
     entry_obj.insert("input_modalities".to_string(), json!(input_modalities));
     entry_obj.insert("inputModalities".to_string(), json!(input_modalities));
+    // Codex may emit `detail=original` for image-capable routes. Chat-compatible
+    // upstreams receive the best equivalent their schema supports (`high`) at
+    // the shared media boundary, so this is an adapter capability rather than
+    // a claim that the upstream accepts the Responses-only enum verbatim.
+    let supports_adapted_original_detail = !spec.text_only;
+    entry_obj.insert(
+        "supports_image_detail_original".to_string(),
+        json!(supports_adapted_original_detail),
+    );
+    entry_obj.insert(
+        "supportsImageDetailOriginal".to_string(),
+        json!(supports_adapted_original_detail),
+    );
     if spec.text_only {
-        entry_obj.insert("supports_image_detail_original".to_string(), json!(false));
-        entry_obj.insert("supportsImageDetailOriginal".to_string(), json!(false));
         entry_obj.insert("web_search_tool_type".to_string(), json!("text"));
         entry_obj.insert("webSearchToolType".to_string(), json!("text"));
     }
+    apply_codex_model_reasoning_capability(entry_obj, spec.reasoning.as_ref());
     project_codex_desktop_model_fields(entry_obj, spec);
 
     if profile != CodexCatalogToolProfile::ProxyChat {
@@ -1092,6 +1975,12 @@ struct CodexCatalogModelSpec {
     supports_parallel_tool_calls: Option<bool>,
     input_modalities: Option<Vec<String>>,
     base_instructions: Option<String>,
+    reasoning: Option<crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability>,
+    /// P2：reasoning 能力指纹（与请求/Sub-Agent/inspect 同源，四层一致）。
+    reasoning_fingerprint: String,
+    /// P2：reasoning 能力来源（user_config/detection/library/builtin/official/unknown）。
+    reasoning_source: String,
+    sort_index: Option<u32>,
 }
 
 /// 为 Codex 多 Agent 工具的模型说明生成稳定排序键。
@@ -1162,21 +2051,86 @@ fn sort_codex_catalog_specs_for_picker(
 ) -> Vec<CodexCatalogModelSpec> {
     let mut indexed_specs = specs.into_iter().enumerate().collect::<Vec<_>>();
     indexed_specs.sort_by_key(|(original_index, spec)| {
+        // 优先级1: 用户设置的 sortIndex（数字越小越靠前）
+        if let Some(sort_idx) = spec.sort_index {
+            return (0_u8, sort_idx as usize, *original_index);
+        }
+
+        // 优先级2: spawn_agent_model_priority 列表
         if let Some(priority_index) =
             codex_spawn_agent_model_priority_index(spawn_agent_model_priority, &spec.model)
         {
-            return (0_u8, priority_index, *original_index);
+            return (1_u8, priority_index, *original_index);
         }
 
+        // 优先级3: 默认供应商排序逻辑
         let (provider_rank, fallback_index) =
             codex_catalog_model_priority_key(spec, *original_index);
         (
-            provider_rank.saturating_add(1),
+            provider_rank.saturating_add(2),
             fallback_index,
             *original_index,
         )
     });
     indexed_specs.into_iter().map(|(_, spec)| spec).collect()
+}
+
+/// 读取 Codex 官方模型缓存（models 数组）。
+///
+/// CC Switch 接管后会把路由目录写进 models_cache.json（etag 标记为 CC_SWITCH 拥有），
+/// 官方原始档位在 backup 文件里。此处与 enrich_codex_catalog_with_official_metadata
+/// 保持同一选择逻辑：缓存被 CC Switch 拥有时优先读 backup。
+/// backup 缺失或为空时再读取 Codex CLI 的 bundled 官方目录；这是新模型也能自动
+/// 获得官方服务档/推理档的来源，不依赖维护模型名单。
+/// 任何读取/解析失败都返回 None（静默降级，不阻断投影）。
+///
+/// P2：公开给 reasoning resolver 作为 official 来源（仅未知平台生效）。
+pub fn codex_official_models_cache() -> Option<Vec<Value>> {
+    let cache_path = get_codex_models_cache_path();
+    let backup_path = get_codex_models_cache_backup_path();
+    let existing_cache = read_json_file_if_exists(&cache_path).ok().flatten();
+    let backup_cache = read_json_file_if_exists(&backup_path).ok().flatten();
+    official_models_with_bundled_fallback(
+        existing_cache.as_ref(),
+        backup_cache.as_ref(),
+        load_codex_bundled_models().as_deref(),
+    )
+}
+
+fn official_models_with_bundled_fallback(
+    existing_cache: Option<&Value>,
+    backup_cache: Option<&Value>,
+    bundled_models: Option<&[Value]>,
+) -> Option<Vec<Value>> {
+    let official_cache = match existing_cache {
+        Some(cache) if codex_models_cache_is_cc_switch_owned(cache) => backup_cache.or(Some(cache)),
+        _ => existing_cache,
+    };
+    let mut models = official_cache
+        .and_then(|cache| cache.get("models"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut model_indexes = HashMap::new();
+    for (index, model) in models.iter().enumerate() {
+        if let Some(model_id) = codex_model_stable_id(model) {
+            model_indexes.insert(model_id, index);
+        }
+    }
+    if let Some(bundled_models) = bundled_models {
+        for bundled in bundled_models {
+            let Some(model_id) = codex_model_stable_id(bundled) else {
+                continue;
+            };
+            if let Some(index) = model_indexes.get(&model_id).copied() {
+                models[index] = bundled.clone();
+            } else {
+                model_indexes.insert(model_id, models.len());
+                models.push(bundled.clone());
+            }
+        }
+    }
+    (!models.is_empty()).then_some(models)
 }
 
 fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCatalogModelSpec> {
@@ -1194,6 +2148,11 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
     let cached_context_windows = codex_cached_model_context_windows();
     let mut seen = std::collections::HashSet::new();
     let mut specs = Vec::new();
+    let official_models = codex_official_models_cache().unwrap_or_default();
+    let mut resolver_settings = settings.clone();
+    if !config_text.trim().is_empty() {
+        resolver_settings["config"] = json!(config_text);
+    }
 
     for model_config in models {
         let Some(model) = model_config
@@ -1204,6 +2163,14 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
         else {
             continue;
         };
+
+        if model_config
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .is_some_and(|enabled| !enabled)
+        {
+            continue;
+        }
 
         if !seen.insert(model.to_string()) {
             continue;
@@ -1273,6 +2240,44 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(ToString::to_string);
+        // P2：catalog 投影与请求/Sub-Agent/inspect 走同一 resolver 核心，保证同一模型
+        // 四层 fingerprint 一致。catalog 是 provider-agnostic 投影：platform=None
+        // （official 来源生效）、detection=None（静态投影不读 TTL 检测缓存）。
+        // 若 catalog 模型名是别名、上游模型名命中不同来源，则用上游名重试一次。
+        let library = crate::reasoning_capabilities::catalog::global_library();
+        let mut resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
+            &resolver_settings,
+            None,
+            model,
+            None,
+            library.as_ref(),
+            &official_models,
+        );
+        if resolved.capability.is_none() {
+            if let Some(upstream) = upstream_model.as_deref() {
+                let upstream_resolved =
+                    crate::reasoning_capabilities::resolve_codex_model_capability_core(
+                        &resolver_settings,
+                        None,
+                        upstream,
+                        None,
+                        library.as_ref(),
+                        &official_models,
+                    );
+                if upstream_resolved.capability.is_some() {
+                    resolved = upstream_resolved;
+                }
+            }
+        }
+        let reasoning = resolved.capability;
+        let reasoning_fingerprint = resolved.fingerprint;
+        let reasoning_source = resolved.source.as_str().to_string();
+
+        let sort_index = model_config
+            .get("sortIndex")
+            .or_else(|| model_config.get("sort_index"))
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok());
 
         specs.push(CodexCatalogModelSpec {
             model: model.to_string(),
@@ -1286,6 +2291,10 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
             supports_parallel_tool_calls,
             input_modalities,
             base_instructions,
+            reasoning,
+            reasoning_fingerprint,
+            reasoning_source,
+            sort_index,
         });
     }
 
@@ -1501,7 +2510,8 @@ fn codex_bundled_models_command(candidate: &Path) -> Command {
     command
 }
 
-fn load_codex_model_template_from_bundled() -> Result<Option<Value>, AppError> {
+#[cfg(not(test))]
+fn load_codex_bundled_models_uncached() -> Option<Vec<Value>> {
     for candidate in codex_cli_candidates() {
         let candidate_label = candidate.to_string_lossy();
         let output = match codex_bundled_models_command(&candidate).output() {
@@ -1527,12 +2537,34 @@ fn load_codex_model_template_from_bundled() -> Result<Option<Value>, AppError> {
                 continue;
             }
         };
-        if let Some(template) = find_codex_model_template(&catalog) {
-            return Ok(Some(template));
+        let models = catalog
+            .get("models")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !models.is_empty() {
+            return Some(models);
         }
     }
 
-    Ok(None)
+    None
+}
+
+#[cfg(not(test))]
+fn load_codex_bundled_models() -> Option<Vec<Value>> {
+    CODEX_BUNDLED_MODELS_CACHE
+        .get_or_init(load_codex_bundled_models_uncached)
+        .clone()
+}
+
+#[cfg(test)]
+fn load_codex_bundled_models() -> Option<Vec<Value>> {
+    None
+}
+
+fn load_codex_model_template_from_bundled() -> Result<Option<Value>, AppError> {
+    let models = load_codex_bundled_models();
+    Ok(models.and_then(|models| find_codex_model_template(&json!({ "models": models }))))
 }
 
 fn load_codex_model_template_static() -> Option<Value> {
@@ -1823,6 +2855,45 @@ fn codex_provider_reasoning_efforts_toml_array(
     toml_edit::Value::Array(array)
 }
 
+/// 把 catalog 中的字符串数组投影到 provider inline model。
+fn codex_provider_string_toml_array(value: Option<&Value>) -> Option<toml_edit::Value> {
+    let values = value?.as_array()?;
+    let mut array = Array::default();
+    for value in values {
+        let value = value.as_str()?.trim();
+        if !value.is_empty() {
+            array.push(value);
+        }
+    }
+    Some(toml_edit::Value::Array(array))
+}
+
+/// 把官方 service tier 对象数组无损投影到 provider inline model。
+///
+/// Codex 当前字段均为标量；遇到未来新增的复合字段时返回 None，让 JSON catalog
+/// 继续作为权威来源，避免生成一个结构错误的 TOML 条目。
+fn codex_provider_service_tiers_toml_array(value: Option<&Value>) -> Option<toml_edit::Value> {
+    let tiers = value?.as_array()?;
+    let mut array = Array::default();
+    for tier in tiers {
+        let tier = tier.as_object()?;
+        let mut inline = InlineTable::new();
+        for (field, value) in tier {
+            let value = match value {
+                Value::String(value) => value.as_str().into(),
+                Value::Bool(value) => (*value).into(),
+                Value::Number(value) if value.is_i64() => value.as_i64()?.into(),
+                Value::Number(value) if value.is_f64() => value.as_f64()?.into(),
+                Value::Null => continue,
+                _ => return None,
+            };
+            inline.insert(field, value);
+        }
+        array.push(toml_edit::Value::InlineTable(inline));
+    }
+    Some(toml_edit::Value::Array(array))
+}
+
 fn codex_model_catalog_from_settings(
     settings: &Value,
     config_text: &str,
@@ -1945,6 +3016,68 @@ fn codex_provider_models_toml_array(
                 "reasoningEffort",
             ),
         );
+        if let Some(speed_tiers) = codex_provider_string_toml_array(
+            catalog_entry.and_then(|entry| entry.get("additional_speed_tiers")),
+        ) {
+            model.insert("additional_speed_tiers", speed_tiers.clone());
+            model.insert("additionalSpeedTiers", speed_tiers);
+        }
+        if let Some(service_tiers) = codex_provider_service_tiers_toml_array(
+            catalog_entry.and_then(|entry| entry.get("service_tiers")),
+        ) {
+            model.insert("service_tiers", service_tiers.clone());
+            model.insert("serviceTiers", service_tiers);
+        }
+        if let Some(default_service_tier) = catalog_entry
+            .and_then(|entry| entry.get("default_service_tier"))
+            .and_then(Value::as_str)
+        {
+            model.insert("default_service_tier", default_service_tier.into());
+            model.insert("defaultServiceTier", default_service_tier.into());
+        }
+        if let Some(input_modalities) =
+            codex_provider_string_toml_array(catalog_entry.and_then(|entry| {
+                entry
+                    .get("input_modalities")
+                    .or_else(|| entry.get("inputModalities"))
+            }))
+        {
+            model.insert("input_modalities", input_modalities.clone());
+            model.insert("inputModalities", input_modalities);
+        }
+        if let Some(multi_agent_version) = catalog_entry
+            .and_then(|entry| {
+                entry
+                    .get("multi_agent_version")
+                    .or_else(|| entry.get("multiAgentVersion"))
+            })
+            .and_then(Value::as_str)
+        {
+            model.insert("multi_agent_version", multi_agent_version.into());
+            model.insert("multiAgentVersion", multi_agent_version.into());
+        }
+        if let Some(supports_personality) = catalog_entry
+            .and_then(|entry| {
+                entry
+                    .get("supports_personality")
+                    .or_else(|| entry.get("supportsPersonality"))
+            })
+            .and_then(Value::as_bool)
+        {
+            model.insert("supports_personality", supports_personality.into());
+            model.insert("supportsPersonality", supports_personality.into());
+        }
+        if let Some(model_specialty) = catalog_entry
+            .and_then(|entry| {
+                entry
+                    .get("model_specialty")
+                    .or_else(|| entry.get("modelSpecialty"))
+            })
+            .and_then(Value::as_str)
+        {
+            model.insert("model_specialty", model_specialty.into());
+            model.insert("modelSpecialty", model_specialty.into());
+        }
         model.insert("visibility", "list".into());
         model.insert("show_in_picker", true.into());
         model.insert("supported_in_api", true.into());
@@ -2022,8 +3155,8 @@ fn set_codex_model_catalog_json_field(
         .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
 
     match catalog_path {
-        Some(_) => {
-            doc["model_catalog_json"] = toml_edit::value(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        Some(path) => {
+            doc["model_catalog_json"] = toml_edit::value(path.to_string_lossy().as_ref());
         }
         None => {
             let should_remove = doc
@@ -2052,11 +3185,15 @@ fn set_codex_model_catalog_projection_fields(
         .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
 
     match (catalog_path, specs) {
-        (Some(_), Some(specs)) => {
-            doc["model_catalog_json"] = toml_edit::value(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        (Some(path), Some(specs)) => {
+            doc["model_catalog_json"] = toml_edit::value(path.to_string_lossy().as_ref());
             set_active_codex_provider_models(&mut doc, specs, catalog);
             ensure_codex_agents_defaults(&mut doc);
-            ensure_codex_multi_agent_reserved_schema_compatible(&mut doc);
+            ensure_codex_multi_agent_reserved_schema_compatible(
+                &mut doc,
+                CodexSubagentVersion::V2,
+                false,
+            );
         }
         _ => {
             let should_remove = doc
@@ -2097,10 +3234,9 @@ fn codex_multi_router_is_enabled(settings: &Value) -> bool {
 
 /// 判断当前 MultiRouter 是否包含需要跨 provider 投递的启用 route。
 ///
-/// 混合路由仍保留 Multi-Agent V2；代理会在 official parent 出站时移除协作工具
-/// message 参数的加密标记，让 Codex 生成 V2 明文 agent_message。这里仅负责确保整个
-/// 混合任务的模型目录都声明 V2。旧 route 没有认证来源时按跨 provider 处理。
-fn codex_multi_router_requires_plaintext_multi_agent(settings: &Value) -> bool {
+/// 混合路由仍保留 Multi-Agent V2，并通过非保留工具 namespace 让 Codex 直接向
+/// 第三方 child 投递明文任务。旧 route 没有认证来源时按跨 provider 处理。
+fn codex_multi_router_requires_non_reserved_agent_namespace(settings: &Value) -> bool {
     let Some(routing) = settings.get("codexRouting") else {
         return false;
     };
@@ -2121,40 +3257,44 @@ fn codex_multi_router_requires_plaintext_multi_agent(settings: &Value) -> bool {
             .get("enabled")
             .and_then(Value::as_bool)
             .unwrap_or(true)
-            && !codex_route_uses_official_backend_agent_delivery(route)
+            && !codex_route_uses_official_agent_backend(route)
     })
 }
 
-/// 只有显式指向 ChatGPT Codex backend 的官方 route 才具备 V2 密文解密能力。
-fn codex_route_uses_official_backend_agent_delivery(route: &Value) -> bool {
-    let upstream = route.get("upstream").unwrap_or(route);
-    let auth = upstream
-        .get("auth")
-        .or_else(|| route.get("auth"))
-        .unwrap_or(upstream);
-    auth.get("source")
-        .and_then(Value::as_str)
-        .is_some_and(|source| {
-            matches!(
-                source.to_ascii_lowercase().as_str(),
-                "native_codex_auth" | "managed_codex_oauth" | "managed_account" | "account_pool"
-            )
-        })
-        || auth
-            .get("authProvider")
-            .or_else(|| auth.get("auth_provider"))
-            .and_then(Value::as_str)
-            .is_some_and(|provider| provider.eq_ignore_ascii_case("codex_oauth"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexSubagentVersion {
+    V1,
+    V2,
 }
 
-/// 在官方同 slug 元数据合并完成后应用混合路由的 V2 协议策略。
-///
-/// Codex 会在任务首轮锁定协议版本。官方 parent 与第三方 child 必须都留在 V2 候选
-/// 集合中，正文是否加密由出站工具 schema 单独控制，不能再把混合目录降为 V1。
+impl CodexSubagentVersion {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+}
+
+/// 旧方案和非法值都保持当前 V2 行为；只有显式 `v1` 才启用兼容协议。
+fn codex_subagent_version(settings: &Value) -> CodexSubagentVersion {
+    match settings
+        .get("codexRouting")
+        .and_then(Value::as_object)
+        .and_then(|routing| routing.get("subagentVersion"))
+        .and_then(Value::as_str)
+    {
+        Some("v1") => CodexSubagentVersion::V1,
+        _ => CodexSubagentVersion::V2,
+    }
+}
+
+/// 在官方同 slug 元数据合并完成后，把 MultiRouter 的所有模型统一投影为用户选择的协议。
 fn apply_codex_multi_agent_transport_policy(catalog: &mut Value, settings: &Value) {
-    if !codex_multi_router_requires_plaintext_multi_agent(settings) {
+    if !codex_multi_router_is_enabled(settings) {
         return;
     }
+    let version = codex_subagent_version(settings).as_str();
     let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) else {
         return;
     };
@@ -2162,8 +3302,70 @@ fn apply_codex_multi_agent_transport_policy(catalog: &mut Value, settings: &Valu
         let Some(model) = model.as_object_mut() else {
             continue;
         };
-        model.insert("multi_agent_version".to_string(), json!("v2"));
-        model.insert("multiAgentVersion".to_string(), json!("v2"));
+        model.insert("multi_agent_version".to_string(), json!(version));
+        model.insert("multiAgentVersion".to_string(), json!(version));
+        // Ultra 的主动委派语义仅存在于 V2。V1 中它只会被 Codex 降为 max，
+        // 因此不要把 Ultra 暴露为可选入口，避免用户以为会自动调用 Sub-Agent。
+        if version == "v1" {
+            for field in [
+                "supported_reasoning_levels",
+                "supported_reasoning_efforts",
+                "supportedReasoningEfforts",
+            ] {
+                if let Some(levels) = model.get_mut(field).and_then(Value::as_array_mut) {
+                    levels.retain(|level| {
+                        level
+                            .as_str()
+                            .or_else(|| level.get("effort").and_then(Value::as_str))
+                            .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
+                            .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
+                            != Some("ultra")
+                    });
+                }
+            }
+            let fallback_default = [
+                "supported_reasoning_levels",
+                "supported_reasoning_efforts",
+                "supportedReasoningEfforts",
+            ]
+            .iter()
+            .find_map(|field| model.get(*field).and_then(Value::as_array))
+            .and_then(|levels| {
+                levels
+                    .iter()
+                    .find_map(|level| {
+                        level
+                            .as_str()
+                            .or_else(|| level.get("effort").and_then(Value::as_str))
+                            .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
+                            .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
+                            .filter(|effort| *effort == "max")
+                    })
+                    .or_else(|| {
+                        levels.iter().find_map(|level| {
+                            level
+                                .as_str()
+                                .or_else(|| level.get("effort").and_then(Value::as_str))
+                                .or_else(|| level.get("reasoning_effort").and_then(Value::as_str))
+                                .or_else(|| level.get("reasoningEffort").and_then(Value::as_str))
+                        })
+                    })
+                    .map(ToString::to_string)
+            });
+            for field in [
+                "default_reasoning_level",
+                "default_reasoning_effort",
+                "defaultReasoningEffort",
+            ] {
+                if model.get(field).and_then(Value::as_str) == Some("ultra") {
+                    if let Some(default_effort) = &fallback_default {
+                        model.insert(field.to_string(), json!(default_effort));
+                    } else {
+                        model.remove(field);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2207,17 +3409,22 @@ fn set_codex_native_web_search_field(config_text: &str, disable: bool) -> Result
     Ok(doc.to_string())
 }
 
-/// 让 Codex multi_agent_v2 使用新版模型认可的保留工具 schema。
+/// 让 Codex multi_agent_v2 使用与当前路由拓扑兼容的工具 schema。
 ///
 /// 新版 GPT/Codex 后端把 `collaboration.spawn_agent` 视为保留函数工具，
 /// 并要求客户端提交的 schema 与后端配置完全一致。旧版 CCSwitchMulti 曾通过
 /// `hide_spawn_agent_metadata=false` 暴露 `model` / `reasoning_effort` /
 /// `service_tier` 参数；这些额外字段会让新模型直接拒绝请求。
 ///
-/// CCSwitchMulti 现在通过 `~/.codex/agents/*.toml` 托管 role 文件固定子 Agent
-/// 模型，因此这里只保留用户原本的启用状态，并强制隐藏 metadata，让工具 schema
-/// 回到 Codex 官方保留形态。
-fn ensure_codex_multi_agent_reserved_schema_compatible(doc: &mut DocumentMut) {
+/// CCSwitchMulti 通过 `~/.codex/agents/*.toml` 托管 role 文件固定子 Agent 模型，
+/// 因此始终隐藏 metadata。混合官方/第三方路由不能使用后端保留的
+/// `collaboration` namespace：若用户没有选择 namespace，或仍使用该保留名，改用
+/// Codex 原生支持的 `agents`。用户已有其它非保留 namespace 时保持不变。
+fn ensure_codex_multi_agent_reserved_schema_compatible(
+    doc: &mut DocumentMut,
+    version: CodexSubagentVersion,
+    mixed_provider_delivery: bool,
+) {
     if doc.get("features").is_none() {
         doc["features"] = toml_edit::table();
     }
@@ -2225,10 +3432,6 @@ fn ensure_codex_multi_agent_reserved_schema_compatible(doc: &mut DocumentMut) {
         return;
     };
 
-    let existing_enabled = features
-        .get("multi_agent_v2")
-        .and_then(|item| item.as_bool())
-        .map(toml_edit::value);
     if features
         .get("multi_agent_v2")
         .and_then(|item| item.as_table())
@@ -2240,10 +3443,26 @@ fn ensure_codex_multi_agent_reserved_schema_compatible(doc: &mut DocumentMut) {
         .get_mut("multi_agent_v2")
         .and_then(|item| item.as_table_mut())
     {
-        if let Some(enabled) = existing_enabled {
-            multi_agent_v2["enabled"] = enabled;
+        match version {
+            CodexSubagentVersion::V1 => {
+                multi_agent_v2["enabled"] = toml_edit::value(false);
+                return;
+            }
+            CodexSubagentVersion::V2 => {
+                multi_agent_v2["enabled"] = toml_edit::value(true);
+            }
         }
         multi_agent_v2["hide_spawn_agent_metadata"] = toml_edit::value(true);
+        let namespace_requires_replacement = multi_agent_v2
+            .get("tool_namespace")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .is_none_or(|namespace| {
+                namespace.is_empty() || namespace.eq_ignore_ascii_case("collaboration")
+            });
+        if mixed_provider_delivery && namespace_requires_replacement {
+            multi_agent_v2["tool_namespace"] = toml_edit::value("agents");
+        }
     }
 }
 
@@ -2259,12 +3478,112 @@ fn ensure_codex_agents_defaults(doc: &mut DocumentMut) {
         return;
     };
 
-    if !agents.contains_key("max_threads") {
-        agents["max_threads"] = toml_edit::value(CC_SWITCH_CODEX_AGENT_THREADS);
-    }
+    let max_concurrent_threads = agents
+        .get("max_concurrent_threads_per_session")
+        .and_then(|value| value.as_integer())
+        .or_else(|| {
+            agents
+                .get("max_threads")
+                .and_then(|value| value.as_integer())
+        })
+        .unwrap_or(CC_SWITCH_CODEX_AGENT_THREADS);
+    agents.remove("max_threads");
+    agents["max_concurrent_threads_per_session"] = toml_edit::value(max_concurrent_threads);
     if !agents.contains_key("max_depth") {
         agents["max_depth"] = toml_edit::value(CC_SWITCH_CODEX_AGENT_DEPTH);
     }
+}
+
+/// Result of the narrow, format-preserving repair used before a forced Codex switch.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexLiveConfigRepairOutcome {
+    pub config_text: String,
+    pub repaired_fields: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Canonicalize legacy Codex fields without replacing the user's configuration document.
+///
+/// The caller is responsible for backing up and atomically writing the returned text. This
+/// function intentionally edits only schema aliases CCSwitchMulti knows how to migrate. MCP,
+/// projects, plugins, memories and user-authored agent configuration remain untouched.
+pub fn repair_codex_live_config_text_for_force_switch(
+    config_text: &str,
+) -> Result<CodexLiveConfigRepairOutcome, AppError> {
+    let normalized = normalize_codex_config_text_for_live_read(config_text)?;
+    let mut doc = if normalized.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        normalized
+            .parse::<DocumentMut>()
+            .map_err(|error| AppError::Message(format!("Invalid Codex config.toml: {error}")))?
+    };
+    let had_legacy_threads = doc
+        .get("agents")
+        .and_then(|item| item.as_table())
+        .is_some_and(|agents| agents.contains_key("max_threads"));
+    let had_canonical_threads = doc
+        .get("agents")
+        .and_then(|item| item.as_table())
+        .is_some_and(|agents| agents.contains_key("max_concurrent_threads_per_session"));
+
+    ensure_codex_agents_defaults(&mut doc);
+
+    let mut repaired_fields = Vec::new();
+    let mut warnings = Vec::new();
+    if had_legacy_threads {
+        repaired_fields.push("agents.max_threads".to_string());
+        if had_canonical_threads {
+            warnings.push(
+                "Removed duplicate agents.max_threads alias; preserved max_concurrent_threads_per_session"
+                    .to_string(),
+            );
+        }
+    }
+    if normalized != config_text {
+        repaired_fields.push("notify".to_string());
+        warnings.push("Escaped a legacy Windows notify path so the TOML remains valid".to_string());
+    }
+
+    let repaired = doc.to_string();
+    validate_config_toml(&repaired)?;
+    Ok(CodexLiveConfigRepairOutcome {
+        config_text: repaired,
+        repaired_fields,
+        warnings,
+    })
+}
+
+/// Restore user-owned root tables after the normal switch pipeline has projected CCSM state.
+///
+/// Existing post-switch values win; entries that disappeared solely because they are not in
+/// CCSwitchMulti's database are filled from the pre-switch document. Provider/model routing is
+/// deliberately excluded so stale endpoints or bearer tokens cannot be resurrected.
+pub fn restore_codex_user_owned_tables_after_force_switch(
+    before_switch: &str,
+    after_switch: &str,
+) -> Result<String, AppError> {
+    let before = before_switch
+        .parse::<DocumentMut>()
+        .map_err(|error| AppError::Message(format!("Invalid pre-switch Codex config: {error}")))?;
+    let mut after = after_switch
+        .parse::<DocumentMut>()
+        .map_err(|error| AppError::Message(format!("Invalid post-switch Codex config: {error}")))?;
+
+    for key in ["mcp_servers", "projects", "plugins", "memories"] {
+        let Some(original) = before.get(key) else {
+            continue;
+        };
+        match after.as_table_mut().get_mut(key) {
+            Some(current) => merge_missing_codex_toml_item(current, original),
+            None => {
+                after.as_table_mut().insert(key, original.clone());
+            }
+        }
+    }
+
+    Ok(after.to_string())
 }
 
 /// 根据模型 slug 生成官方 custom agent 的稳定角色名。
@@ -2306,10 +3625,10 @@ fn codex_agent_description_for_model(model: &str) -> String {
         return "Low-cost Qwen worker for read-heavy exploration, summaries, and bounded helper tasks.".to_string();
     }
     if lower.contains("deepseek-v4-flash") {
-        return "DeepSeek V4 Flash worker for long-context code reading, architecture tracing, and implementation support.".to_string();
+        return "DeepSeek V4 Flash worker for long-context code reading, read-heavy exploration, architecture tracing, parallel evidence collection, and lightweight verification.".to_string();
     }
     if lower.contains("deepseek-v4-pro") {
-        return "DeepSeek V4 Pro worker for higher-depth debugging, review, and complex code changes.".to_string();
+        return "DeepSeek V4 Pro worker for complex debugging, cross-module reasoning, architecture decisions, high-risk review, and complex implementation.".to_string();
     }
     if lower.contains("codex-spark") || lower.contains("spark") {
         return "Codex Spark worker for fast, focused edits, formatting, and quick verification."
@@ -2327,12 +3646,24 @@ fn codex_agent_reasoning_effort_for_model(model: &str) -> Option<&'static str> {
     if lower.starts_with("qwen") {
         return None;
     }
+    if lower.contains("deepseek-v4-flash") || lower.contains("deepseek-v4-pro") {
+        return Some("high");
+    }
     if lower.contains("spark") {
         Some("low")
     } else if lower.contains("pro") {
         Some("high")
     } else {
         Some("medium")
+    }
+}
+
+fn codex_agent_execution_guidance_for_model(model: &str) -> Option<&'static str> {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("deepseek-v4-flash") || lower.contains("deepseek-v4-pro") {
+        Some(DEEPSEEK_WINDOWS_EXECUTION_GUIDANCE)
+    } else {
+        None
     }
 }
 
@@ -2351,9 +3682,30 @@ fn codex_agent_nickname_candidates_for_role(role: &str) -> Vec<&'static str> {
 
 /// 判断已有 custom agent 文件是否由 CCSwitchMulti 管理。
 fn codex_agent_file_is_cc_switch_managed(path: &Path) -> bool {
-    fs::read_to_string(path)
-        .map(|content| content.contains(CC_SWITCH_MANAGED_AGENT_MARKER))
-        .unwrap_or(false)
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    if content.lines().next() != Some(CC_SWITCH_MANAGED_AGENT_MARKER) {
+        return false;
+    }
+    let Ok(document) = content.parse::<toml::Value>() else {
+        return false;
+    };
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let provider = document.get("model_provider").and_then(toml::Value::as_str);
+    document.get("name").and_then(toml::Value::as_str) == Some(stem)
+        && document
+            .get("model")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|model| !model.trim().is_empty())
+        && provider.is_some_and(|provider| {
+            matches!(
+                provider,
+                "codex_model_router" | CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID
+            )
+        })
 }
 
 /// 判断旧版 CC Switch 生成但没有托管标记的 role 文件。
@@ -2361,9 +3713,46 @@ fn codex_agent_file_is_legacy_cc_switch_role(path: &Path, spec: &CodexCatalogMod
     let Ok(content) = fs::read_to_string(path) else {
         return false;
     };
-
-    content.contains(r#"model_provider = "codex_model_router""#)
-        && content.contains(&format!(r#"model = "{}""#, spec.model))
+    if content.lines().next() == Some(CC_SWITCH_MANAGED_AGENT_MARKER) {
+        return false;
+    }
+    let Ok(document) = content.parse::<toml::Value>() else {
+        return false;
+    };
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let expected_description = codex_agent_description_for_model(&spec.model);
+    let expected_nicknames = codex_agent_nickname_candidates_for_role(stem);
+    document.get("name").and_then(toml::Value::as_str) == Some(stem)
+        && document.get("model").and_then(toml::Value::as_str) == Some(spec.model.as_str())
+        && document.get("model_provider").and_then(toml::Value::as_str)
+            == Some("codex_model_router")
+        && document.get("description").and_then(toml::Value::as_str)
+            == Some(expected_description.as_str())
+        && document
+            .get("developer_instructions")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|instructions| {
+                instructions.contains(&format!(
+                    "You are a CCSwitchMulti managed Codex subagent pinned to `{}`.",
+                    spec.model
+                ))
+            })
+        && document
+            .get("nickname_candidates")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|nicknames| {
+                nicknames.len() == expected_nicknames.len()
+                    && nicknames
+                        .iter()
+                        .zip(expected_nicknames)
+                        .all(|(actual, expected)| actual.as_str() == Some(expected))
+            })
+        && document
+            .get("model_context_window")
+            .and_then(toml::Value::as_integer)
+            == i64::try_from(spec.context_window).ok()
 }
 
 /// 为用户手写同名 role 选择一个不会覆盖的备用 role 名。
@@ -2385,6 +3774,7 @@ fn codex_managed_agent_role_name(
 /// 渲染官方 custom agent TOML。
 fn render_codex_managed_agent_toml(role: &str, spec: &CodexCatalogModelSpec) -> String {
     let description = codex_agent_description_for_model(&spec.model);
+    let execution_guidance = codex_agent_execution_guidance_for_model(&spec.model).unwrap_or("");
     let effort_line = codex_agent_reasoning_effort_for_model(&spec.model)
         .map(|effort| format!("model_reasoning_effort = \"{effort}\"\n"))
         .unwrap_or_default();
@@ -2405,7 +3795,7 @@ developer_instructions = """
 You are a CCSwitchMulti managed Codex subagent pinned to `{model}`.
 Stay within the delegated task, report concrete file paths and verification results, and escalate risky decisions to the parent agent.
 Do not change unrelated files or override user-owned worktree changes.
-"""
+{execution_guidance}"""
 nickname_candidates = [{nicknames}]
 model = "{model}"
 model_provider = "{model_provider}"
@@ -2414,47 +3804,2398 @@ model_provider = "{model_provider}"
     )
 }
 
-/// 同步 CCSwitchMulti 托管的官方 custom agent TOML 文件。
-///
-/// 已有用户手写同名文件不会被覆盖；这种情况下使用 `ccswitch-<role>` 作为托管角色名。
-fn sync_codex_managed_agent_files(specs: &[CodexCatalogModelSpec]) -> Result<(), AppError> {
-    let agents_dir = get_codex_agents_dir();
-    fs::create_dir_all(&agents_dir).map_err(|e| AppError::io(&agents_dir, e))?;
+#[derive(Debug)]
+struct LegacyManagedAgentRole<'a> {
+    requested_role_name: String,
+    effective_role_name: String,
+    path: PathBuf,
+    spec: &'a CodexCatalogModelSpec,
+}
 
+/// 复用 legacy sync 的角色筛选与用户文件所有权解析，但不创建目录或写入文件。
+fn inspect_legacy_codex_managed_agent_roles<'a>(
+    specs: &'a [CodexCatalogModelSpec],
+    agents_dir: &Path,
+) -> Vec<LegacyManagedAgentRole<'a>> {
     let mut seen_roles = HashSet::new();
-    let mut desired_paths = HashSet::new();
-    for spec in specs.iter().take(5) {
-        let base_role = codex_agent_role_name_for_model(&spec.model);
-        if base_role.is_empty() {
+    let mut roles = Vec::new();
+    for spec in specs {
+        let requested_role_name = codex_agent_role_name_for_model(&spec.model);
+        if requested_role_name.is_empty() {
             continue;
         }
-        let base_path = agents_dir.join(format!("{base_role}.toml"));
-        let role = codex_managed_agent_role_name(&base_role, &base_path, spec);
-        if !seen_roles.insert(role.clone()) {
+        let base_path = agents_dir.join(format!("{requested_role_name}.toml"));
+        let effective_role_name =
+            codex_managed_agent_role_name(&requested_role_name, &base_path, spec);
+        if !seen_roles.insert(effective_role_name.clone()) {
             continue;
         }
-        let path = agents_dir.join(format!("{role}.toml"));
+        let path = agents_dir.join(format!("{effective_role_name}.toml"));
         if path.exists()
             && !codex_agent_file_is_cc_switch_managed(&path)
             && !codex_agent_file_is_legacy_cc_switch_role(&path, spec)
         {
             continue;
         }
-        desired_paths.insert(path.clone());
-        write_text_file(&path, &render_codex_managed_agent_toml(&role, spec))?;
+        roles.push(LegacyManagedAgentRole {
+            requested_role_name,
+            effective_role_name,
+            path,
+            spec,
+        });
+    }
+    roles
+}
+
+/// 同步 CCSwitchMulti 托管的官方 custom agent TOML 文件。
+///
+/// 已有用户手写同名文件不会被覆盖；这种情况下使用 `ccswitch-<role>` 作为托管角色名。
+#[cfg(test)]
+fn sync_codex_managed_agent_files(
+    specs: &[CodexCatalogModelSpec],
+    version: CodexSubagentVersion,
+) -> Result<(), AppError> {
+    let mut attempt = CodexProjectionSideEffectsAttempt::capture()?;
+    let result = sync_codex_managed_agent_files_with_attempt(specs, version, &mut attempt);
+    if result.is_err() {
+        let _ = attempt.restore_if_unchanged();
+    }
+    result
+}
+
+fn sync_codex_managed_agent_files_with_attempt(
+    specs: &[CodexCatalogModelSpec],
+    version: CodexSubagentVersion,
+    attempt: &mut CodexProjectionSideEffectsAttempt,
+) -> Result<(), AppError> {
+    let agents_dir = get_codex_agents_dir();
+    fs::create_dir_all(&agents_dir).map_err(|e| AppError::io(&agents_dir, e))?;
+
+    if version == CodexSubagentVersion::V1 {
+        return prune_stale_codex_managed_agent_files_with_attempt(
+            &agents_dir,
+            &HashSet::new(),
+            attempt,
+        );
     }
 
-    prune_stale_codex_managed_agent_files(&agents_dir, &desired_paths)?;
+    let mut desired_paths = HashSet::new();
+    for role in inspect_legacy_codex_managed_agent_roles(specs, &agents_dir) {
+        if role.path.exists()
+            && !codex_agent_file_is_cc_switch_managed(&role.path)
+            && !codex_agent_file_is_legacy_cc_switch_role(&role.path, role.spec)
+        {
+            continue;
+        }
+        desired_paths.insert(role.path.clone());
+        attempt.capture_path_for_managed_write(&role.path)?;
+        attempt.write_text_if_unchanged(
+            &role.path,
+            &render_codex_managed_agent_toml(&role.effective_role_name, role.spec),
+        )?;
+    }
+
+    prune_stale_codex_managed_agent_files_with_attempt(&agents_dir, &desired_paths, attempt)?;
 
     Ok(())
 }
 
-/// 删除已经不属于当前前五候选窗口的 CCSwitchMulti 托管 agent 文件。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProviderClassificationContext {
+    provider_kinds: HashMap<String, SubagentProviderKind>,
+    provider_models: HashMap<String, HashSet<String>>,
+}
+
+impl ProviderClassificationContext {
+    pub(crate) fn from_providers<'a>(providers: impl IntoIterator<Item = &'a Provider>) -> Self {
+        let mut provider_kinds = HashMap::new();
+        let mut provider_models = HashMap::new();
+        for provider in providers {
+            provider_kinds.insert(
+                provider.id.clone(),
+                if codex_provider_record_is_official(provider) {
+                    SubagentProviderKind::Official
+                } else {
+                    SubagentProviderKind::ThirdParty
+                },
+            );
+            let models = provider
+                .settings_config
+                .get("modelCatalog")
+                .or_else(|| provider.settings_config.get("model_catalog"))
+                .and_then(|catalog| catalog.get("models"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.get("model").and_then(Value::as_str))
+                .map(|model| model.trim().to_ascii_lowercase())
+                .filter(|model| !model.is_empty())
+                .collect::<HashSet<_>>();
+            provider_models.insert(provider.id.clone(), models);
+        }
+        Self {
+            provider_kinds,
+            provider_models,
+        }
+    }
+
+    fn get(&self, provider_id: &str) -> Option<SubagentProviderKind> {
+        self.provider_kinds.get(provider_id).copied()
+    }
+
+    /// mode=all 兜底匹配用的"provider → 模型名集合"映射。
+    pub(crate) fn provider_models(&self) -> &HashMap<String, HashSet<String>> {
+        &self.provider_models
+    }
+}
+
+fn codex_resolve_route_with_mode_all<'a>(
+    settings: &'a Value,
+    model: &str,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Option<&'a Value> {
+    if let Some(route) = resolve_codex_primary_route_from_settings(settings, model) {
+        return Some(route);
+    }
+    let model = model.trim().to_ascii_lowercase();
+    let context = provider_context?;
+    settings
+        .pointer("/codexRouting/routes")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|route| {
+            route
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+                && route
+                    .pointer("/modelSelection/mode")
+                    .and_then(Value::as_str)
+                    == Some("all")
+                && codex_route_target_provider_id_from_route(route).is_some_and(|provider_id| {
+                    context
+                        .provider_models
+                        .get(provider_id)
+                        .is_some_and(|models| models.contains(&model))
+                })
+        })
+}
+
+fn codex_provider_record_is_official(provider: &Provider) -> bool {
+    provider.category.as_deref() == Some("official")
+        || is_codex_official_provider(provider)
+        || provider.is_codex_oauth()
+        || provider
+            .settings_config
+            .pointer("/auth/auth_mode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("chatgpt"))
+        || provider
+            .settings_config
+            .get("config")
+            .and_then(Value::as_str)
+            .is_some_and(|config| config.contains("chatgpt.com/backend-api/codex"))
+}
+
+pub(crate) fn codex_provider_classification_context(
+    db: &crate::database::Database,
+) -> Result<ProviderClassificationContext, AppError> {
+    let providers = db.get_all_providers("codex")?;
+    Ok(ProviderClassificationContext::from_providers(
+        providers.values(),
+    ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RouteClassification {
+    provider_kind: SubagentProviderKind,
+    warning: Option<&'static str>,
+}
+
+fn codex_subagent_route_classification_with_context(
+    settings: &Value,
+    model: &str,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Option<RouteClassification> {
+    let route = codex_resolve_route_with_mode_all(settings, model, provider_context)?;
+    if let Some(target_provider_id) = codex_route_target_provider_id_from_route(route) {
+        if let Some(provider_kind) =
+            provider_context.and_then(|context| context.get(target_provider_id))
+        {
+            return Some(RouteClassification {
+                provider_kind,
+                warning: None,
+            });
+        }
+        return Some(RouteClassification {
+            provider_kind: if codex_route_uses_official_agent_backend(route) {
+                SubagentProviderKind::Official
+            } else {
+                SubagentProviderKind::ThirdParty
+            },
+            warning: Some("target_provider_record_unavailable_inline_auth_fallback"),
+        });
+    }
+    Some(RouteClassification {
+        provider_kind: if codex_route_uses_official_agent_backend(route) {
+            SubagentProviderKind::Official
+        } else {
+            SubagentProviderKind::ThirdParty
+        },
+        warning: None,
+    })
+}
+
+fn occupied_user_codex_agent_names(agents_dir: &Path) -> Result<Vec<String>, AppError> {
+    if !agents_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(agents_dir).map_err(|error| AppError::io(agents_dir, error))? {
+        let entry = entry.map_err(|error| AppError::io(agents_dir, error))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("toml")
+            || codex_agent_file_is_cc_switch_managed(&path)
+        {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+            names.push(stem.to_string());
+        }
+        if let Ok(contents) = fs::read_to_string(&path) {
+            if let Some(declared_name) = contents
+                .parse::<toml::Value>()
+                .ok()
+                .and_then(|document| document.get("name")?.as_str().map(ToString::to_string))
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+            {
+                names.push(declared_name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+#[derive(Debug)]
+struct ConfiguredCodexSubagentCompilation {
+    persisted: crate::codex_subagent_profiles::CodexSubagentV2,
+    output: SubagentCompileOutput,
+    route_classifications: HashMap<String, RouteClassification>,
+    reasoning_capabilities: HashMap<String, ResolvedSubagentReasoningCapability>,
+}
+
+fn public_codex_subagent_validation_code(error: &SubagentCompileError) -> &str {
+    let SubagentCompileError::Validation { code, .. } = error;
+    if matches!(
+        code.as_str(),
+        "invalid_subagent_v2"
+            | "missing_schema_version"
+            | "unsupported_schema_version"
+            | "invalid_selection_policy"
+            | "missing_profiles"
+            | "invalid_profiles"
+            | "invalid_profile"
+            | "missing_model"
+            | "invalid_model"
+            | "empty_model"
+            | "missing_enabled"
+            | "invalid_enabled"
+            | "missing_questionnaire"
+            | "invalid_questionnaire"
+            | "missing_task_strengths"
+            | "unknown_task_strength"
+            | "strength_count"
+            | "duplicate_task_strength"
+            | "missing_optimization"
+            | "invalid_optimization"
+            | "missing_write_scope"
+            | "invalid_write_scope"
+            | "missing_preference"
+            | "invalid_preference"
+            | "missing_reasoning_effort"
+            | "invalid_reasoning_effort"
+            | "invalid_override_effort"
+            | "missing_reasoning_policy"
+            | "invalid_reasoning_policy"
+            | "missing_fixed_reasoning_effort"
+            | "unexpected_reasoning_effort"
+            | "invalid_input_modalities"
+            | "legacy_reasoning_effort_in_schema_v2"
+            | "legacy_override_effort_in_schema_v2"
+            | "invalid_overrides"
+            | "missing_default_reasoning_effort"
+            | "unsupported_reasoning_effort"
+            | "reasoning_disable_unsupported"
+            | "profile_key_model_mismatch"
+            | "empty_description"
+            | "empty_developer_instructions"
+            | "nickname_count"
+            | "empty_nickname"
+            | "invalid_nickname"
+            | "duplicate_nickname"
+            | "empty_role_name"
+            | "reserved_role_name"
+            | "toml_serialization"
+    ) {
+        code
+    } else {
+        "invalid_configuration"
+    }
+}
+
+fn codex_subagent_validation_error(error: &SubagentCompileError) -> AppError {
+    AppError::InvalidInput(format!(
+        "Codex subagent V2 configuration is invalid ({})",
+        public_codex_subagent_validation_code(error)
+    ))
+}
+
+fn compile_configured_codex_subagent_roles(
+    settings: &Value,
+    specs: &[CodexCatalogModelSpec],
+    version: CodexSubagentVersion,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<Option<ConfiguredCodexSubagentCompilation>, AppError> {
+    let Some(raw) = settings
+        .get("codexRouting")
+        .and_then(|value| value.get("subagentV2"))
+    else {
+        return Ok(None);
+    };
+    let persisted = parse_persisted_subagent_v2_tolerant(raw)
+        .map_err(|error| codex_subagent_validation_error(&error))?;
+    let mut route_classifications = HashMap::new();
+    let catalog_models: Vec<SubagentCatalogModel> = specs
+        .iter()
+        .map(|spec| {
+            let classification = codex_subagent_route_classification_with_context(
+                settings,
+                &spec.model,
+                provider_context,
+            );
+            if let Some(warning) = classification.as_ref().and_then(|value| value.warning) {
+                log::warn!(
+                    "Codex subagent route classification warning for model {}: {warning}",
+                    spec.model
+                );
+            }
+            if let Some(classification) = classification.clone() {
+                route_classifications.insert(spec.model.to_ascii_lowercase(), classification);
+            }
+            SubagentCatalogModel {
+                model: spec.model.clone(),
+                provider_kind: classification
+                    .as_ref()
+                    .map(|value| value.provider_kind)
+                    .unwrap_or(SubagentProviderKind::ThirdParty),
+                routable: classification.is_some(),
+                context_window: spec.context_window,
+                reasoning:
+                    crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
+                        spec.reasoning.as_ref(),
+                    ),
+            }
+        })
+        .collect();
+    let reasoning_capabilities = catalog_models
+        .iter()
+        .map(|model| (model.model.to_ascii_lowercase(), model.reasoning.clone()))
+        .collect();
+    let mut compile_persisted = persisted.clone();
+    for entry in &mut compile_persisted.profiles {
+        let crate::codex_subagent_profiles::ParsedProfileEntry::Valid(profile) = entry else {
+            continue;
+        };
+        if profile.input_modalities.is_some() {
+            continue;
+        }
+        profile.input_modalities = specs
+            .iter()
+            .find(|spec| {
+                normalize_profile_key(&spec.model) == normalize_profile_key(&profile.model)
+            })
+            .and_then(codex_subagent_profile_input_modalities)
+            .map(|modalities| {
+                modalities
+                    .into_iter()
+                    .filter_map(|value| match value.as_str() {
+                        "text" => Some(crate::codex_subagent_profiles::InputModality::Text),
+                        "image" => Some(crate::codex_subagent_profiles::InputModality::Image),
+                        _ => None,
+                    })
+                    .collect()
+            });
+    }
+    let output = compile_subagent_v2_profiles(&SubagentCompileRequest {
+        subagent_version: if version == CodexSubagentVersion::V1 {
+            ProfileSubagentVersion::V1
+        } else {
+            ProfileSubagentVersion::V2
+        },
+        persisted_subagent_v2: Some(compile_persisted),
+        catalog_models,
+        occupied_role_names: occupied_user_codex_agent_names(&get_codex_agents_dir())?,
+    })
+    .map_err(|error| codex_subagent_validation_error(&error))?;
+    Ok(Some(ConfiguredCodexSubagentCompilation {
+        persisted,
+        output,
+        route_classifications,
+        reasoning_capabilities,
+    }))
+}
+
+fn validate_codex_subagent_reasoning_completeness(
+    compilation: &ConfiguredCodexSubagentCompilation,
+) -> Result<(), AppError> {
+    for (entry, compiled_status) in compilation
+        .persisted
+        .profiles
+        .iter()
+        .zip(compilation.output.profile_statuses.iter())
+    {
+        let crate::codex_subagent_profiles::ParsedProfileEntry::Valid(profile) = entry else {
+            continue;
+        };
+        if !profile.enabled || compiled_status.status != SubagentProfileStatusCode::Routable {
+            continue;
+        }
+        let capability = compilation
+            .reasoning_capabilities
+            .get(&profile.model.to_ascii_lowercase());
+        if capability.is_none()
+            || capability.is_some_and(|value| value.support_kind == ReasoningSupportKind::Unknown)
+        {
+            return Err(AppError::InvalidInput(
+                "Codex subagent V2 configuration is incomplete (unknown_reasoning_capability_requires_declaration)".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn strip_codex_subagent_v2_policy_block(value: &str) -> String {
+    let Some(begin) = value.find(CC_SWITCH_SUBAGENT_V2_POLICY_BEGIN) else {
+        return value.to_string();
+    };
+    let mut prefix = value[..begin].to_string();
+    if prefix.ends_with("\n\n") {
+        prefix.truncate(prefix.len() - 2);
+    }
+    let suffix = value[begin..]
+        .find(CC_SWITCH_SUBAGENT_V2_POLICY_END)
+        .map(|relative_end| &value[begin + relative_end + CC_SWITCH_SUBAGENT_V2_POLICY_END.len()..])
+        .unwrap_or("");
+    prefix.push_str(suffix);
+    prefix
+}
+
+fn render_codex_subagent_v2_parent_policy(
+    compilation: &ConfiguredCodexSubagentCompilation,
+) -> Option<String> {
+    if compilation.output.generated_roles.is_empty() {
+        return None;
+    }
+    let selection_policy = match compilation.persisted.selection_policy {
+        crate::codex_subagent_profiles::SelectionPolicy::Balanced => "balanced",
+        crate::codex_subagent_profiles::SelectionPolicy::OfficialFirst => "official_first",
+        crate::codex_subagent_profiles::SelectionPolicy::ThirdPartyFirst => "third_party_first",
+    };
+    let mut lines = vec![
+        CC_SWITCH_SUBAGENT_V2_POLICY_BEGIN.to_string(),
+        format!(
+            "CCSwitchMulti Sub-Agent V2 selection policy is `{selection_policy}`. When the user requests delegation, compare the task with every CCSwitchMulti custom role below before choosing a built-in role. Follow each role's preferred, eligible, or fallback boundary exactly."
+        ),
+        "When a matching preferred custom role exists, select it through `agent_type` instead of `default`, `worker`, or `explorer`. Use built-in roles for final integration, release decisions, tasks excluded by all custom roles, and any case where the configured policy or role guidance keeps the work on the official/current path.".to_string(),
+        "For CCSwitchMulti custom roles, use `fork_turns=none` or a positive turn count, never `fork_turns=all`. If the runtime rejects a custom role because of fork-history compatibility, retry the same `agent_type` with a compatible `fork_turns`; never drop `agent_type` as a workaround.".to_string(),
+        "Available CCSwitchMulti custom roles:".to_string(),
+    ];
+    for role in &compilation.output.generated_roles {
+        lines.push(format!(
+            "- If the task matches this guidance, select `{}` via `agent_type`: {}",
+            role.effective_role_name, role.description
+        ));
+    }
+    lines.push(CC_SWITCH_SUBAGENT_V2_POLICY_END.to_string());
+    Some(lines.join("\n"))
+}
+
+fn project_codex_subagent_v2_parent_instructions(
+    settings: &Value,
+    config_text: &str,
+    specs: &[CodexCatalogModelSpec],
+    version: CodexSubagentVersion,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<String, AppError> {
+    let mut doc = if config_text.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        config_text
+            .parse::<DocumentMut>()
+            .map_err(|error| AppError::Message(format!("Invalid Codex config.toml: {error}")))?
+    };
+    let existing = match doc.get("developer_instructions") {
+        Some(item) => item.as_str().ok_or_else(|| {
+            AppError::Message(
+                "Invalid Codex config.toml: developer_instructions must be a string".to_string(),
+            )
+        })?,
+        None => "",
+    };
+    let user_instructions = strip_codex_subagent_v2_policy_block(existing);
+    let policy = if version == CodexSubagentVersion::V2 {
+        compile_configured_codex_subagent_roles(settings, specs, version, provider_context)?
+            .as_ref()
+            .and_then(render_codex_subagent_v2_parent_policy)
+    } else {
+        None
+    };
+    let projected = match policy {
+        Some(policy) if user_instructions.is_empty() => policy,
+        Some(policy) => format!("{user_instructions}\n\n{policy}"),
+        None => user_instructions,
+    };
+    if projected.is_empty() {
+        doc.as_table_mut().remove("developer_instructions");
+    } else {
+        // Do not retain an existing multiline representation. Codex Desktop's
+        // notify updater scans line-shaped assignments and can mistake a line
+        // inside developer instructions for the root `notify` setting. A fresh
+        // value uses an escaped representation, so instruction text cannot be
+        // rewritten as live configuration on a later Desktop startup.
+        let basic_repr = serde_json::to_string(&projected).map_err(|error| {
+            AppError::Message(format!(
+                "Failed to encode Codex developer instructions: {error}"
+            ))
+        })?;
+        let projected_value = basic_repr.parse::<toml_edit::Value>().map_err(|error| {
+            AppError::Message(format!(
+                "Failed to encode Codex developer instructions: {error}"
+            ))
+        })?;
+        doc.as_table_mut().remove("developer_instructions");
+        doc["developer_instructions"] = toml_edit::Item::Value(projected_value);
+    }
+    Ok(doc.to_string())
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentV2ReconcileAction {
+    SyncCatalog,
+    RemoveAllInvalid,
+    RecoverAllInvalidFromCatalog,
+    PruneUnroutable,
+}
+
+fn codex_subagent_profile_input_modalities(spec: &CodexCatalogModelSpec) -> Option<Vec<String>> {
+    if spec.text_only {
+        return Some(vec!["text".to_string()]);
+    }
+    spec.input_modalities.as_ref().and_then(|modalities| {
+        let has_text = modalities
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("text"));
+        let has_image = modalities
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("image"));
+        if has_text && has_image {
+            Some(vec!["text".to_string(), "image".to_string()])
+        } else if has_text {
+            Some(vec!["text".to_string()])
+        } else {
+            None
+        }
+    })
+}
+
+fn routable_codex_subagent_catalog(
+    settings: &Value,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Vec<(String, String, Option<Vec<String>>)> {
+    codex_catalog_model_specs(settings, "")
+        .into_iter()
+        .filter(|spec| {
+            codex_resolve_route_with_mode_all(settings, &spec.model, provider_context).is_some()
+        })
+        .map(|spec| {
+            let input_modalities = codex_subagent_profile_input_modalities(&spec);
+            (
+                normalize_profile_key(&spec.model),
+                spec.model,
+                input_modalities,
+            )
+        })
+        .filter(|(identity, _, _)| !identity.is_empty())
+        .collect()
+}
+
+pub(crate) fn hydrate_codex_subagent_v2_input_modalities(
+    settings: &Value,
+    raw_subagent_v2: &Value,
+) -> Value {
+    // Catalog-derived input modalities are runtime metadata, not profile state.
+    // Keeping them out of persistence prevents a stale catalog snapshot from
+    // being mistaken for a user override after MultiRouter refreshes a model.
+    let _ = settings;
+    raw_subagent_v2.clone()
+}
+
+fn catalog_profile_draft(
+    model: &str,
+    enabled_preferred: bool,
+    input_modalities: Option<&[String]>,
+) -> Result<Value, AppError> {
+    let identity = normalize_profile_key(model);
+    let defaults = serde_json::to_value(initialize_legacy_subagent_v2().map_err(|error| {
+        AppError::Message(format!(
+            "Unable to initialize Codex subagent defaults: {error:?}"
+        ))
+    })?)
+    .map_err(|error| AppError::Message(format!("Unable to serialize defaults: {error}")))?;
+    if let Some(mut preset) = defaults.pointer(&format!("/profiles/{identity}")).cloned() {
+        preset["model"] = Value::String(model.to_string());
+        preset["enabled"] = Value::Bool(enabled_preferred);
+        if !enabled_preferred {
+            preset["questionnaire"]["preference"] = Value::String("eligible".to_string());
+        }
+        let _ = input_modalities;
+        return Ok(preset);
+    }
+    let profile = json!({
+        "model": model,
+        "enabled": false,
+        "questionnaire": {
+            "taskStrengths": ["repository_exploration"],
+            "optimization": "balanced",
+            "writeScope": "read_only",
+            "preference": "eligible"
+        },
+        "reasoning": { "policy": "delegated" }
+    });
+    let _ = input_modalities;
+    Ok(profile)
+}
+
+pub(crate) fn initialize_codex_subagent_v2_for_candidate(
+    settings: &Value,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<Value, AppError> {
+    let mut initialized = json!({
+        "schemaVersion": 2,
+        "selectionPolicy": "balanced",
+        "profiles": {}
+    });
+    let profiles = initialized
+        .get_mut("profiles")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| AppError::Message("Initialized profiles are not an object".to_string()))?;
+    for (identity, model, input_modalities) in
+        routable_codex_subagent_catalog(settings, provider_context)
+    {
+        let preferred = matches!(identity.as_str(), "deepseek-v4-flash" | "deepseek-v4-pro");
+        profiles.insert(
+            identity,
+            catalog_profile_draft(&model, preferred, input_modalities.as_deref())?,
+        );
+    }
+    Ok(initialized)
+}
+
+fn profile_is_strictly_valid_under_identity(
+    schema_version: &Value,
+    selection_policy: &Value,
+    identity: &str,
+    raw_profile: &Value,
+) -> bool {
+    let mut profiles = serde_json::Map::new();
+    profiles.insert(identity.to_string(), raw_profile.clone());
+    let candidate = json!({
+        "schemaVersion": schema_version,
+        "selectionPolicy": selection_policy,
+        "profiles": profiles
+    });
+    parse_persisted_subagent_v2(&candidate).is_ok()
+}
+
+pub(crate) fn reconcile_codex_subagent_v2_for_candidate(
+    settings: &Value,
+    action: CodexSubagentV2ReconcileAction,
+    draft: Option<&Value>,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<Value, AppError> {
+    let source = draft.ok_or_else(|| {
+        AppError::InvalidInput("Reconcile actions require the current subagentV2 draft".to_string())
+    })?;
+    let parsed = parse_persisted_subagent_v2_tolerant(source)
+        .map_err(|error| codex_subagent_validation_error(&error))?;
+    let invalid = parsed
+        .profiles
+        .iter()
+        .filter_map(|entry| match entry {
+            ParsedProfileEntry::Invalid { key, raw, .. } => Some((
+                key.clone(),
+                raw.get("model")
+                    .and_then(Value::as_str)
+                    .map(normalize_profile_key)
+                    .filter(|identity| !identity.is_empty()),
+            )),
+            ParsedProfileEntry::Valid(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let mut valid_identities = parsed
+        .profiles
+        .iter()
+        .filter_map(|entry| match entry {
+            ParsedProfileEntry::Valid(profile) => Some(normalize_profile_key(&profile.model)),
+            ParsedProfileEntry::Invalid { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut reconciled = serde_json::to_value(&parsed)
+        .map_err(|error| AppError::Message(format!("Unable to serialize profiles: {error}")))?;
+    let schema_version = reconciled["schemaVersion"].clone();
+    let selection_policy = reconciled["selectionPolicy"].clone();
+    let profiles = reconciled
+        .get_mut("profiles")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| AppError::Message("Reconciled profiles are not an object".to_string()))?;
+    let routable = routable_codex_subagent_catalog(settings, provider_context);
+    let routable_by_identity = routable
+        .iter()
+        .map(|(identity, model, modalities)| {
+            (identity.clone(), (model.clone(), modalities.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+
+    match action {
+        CodexSubagentV2ReconcileAction::SyncCatalog => {
+            let existing_identities = parsed
+                .profiles
+                .iter()
+                .map(|entry| match entry {
+                    ParsedProfileEntry::Valid(profile) => normalize_profile_key(&profile.model),
+                    ParsedProfileEntry::Invalid { key, raw, .. } => raw
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(normalize_profile_key)
+                        .filter(|identity| !identity.is_empty())
+                        .unwrap_or_else(|| normalize_profile_key(key)),
+                })
+                .collect::<HashSet<_>>();
+            for (identity, model, input_modalities) in routable {
+                if existing_identities.contains(&identity) {
+                    continue;
+                }
+                if codex_subagent_route_classification_with_context(
+                    settings,
+                    &model,
+                    provider_context,
+                )
+                .is_some_and(|classification| {
+                    classification.provider_kind == SubagentProviderKind::Official
+                }) {
+                    continue;
+                }
+                let preferred =
+                    matches!(identity.as_str(), "deepseek-v4-flash" | "deepseek-v4-pro");
+                profiles.insert(
+                    identity,
+                    catalog_profile_draft(&model, preferred, input_modalities.as_deref())?,
+                );
+            }
+        }
+        CodexSubagentV2ReconcileAction::RemoveAllInvalid => {
+            for (key, _) in invalid {
+                profiles.shift_remove(&key);
+            }
+        }
+        CodexSubagentV2ReconcileAction::RecoverAllInvalidFromCatalog => {
+            let mut invalid_by_key = invalid.into_iter().collect::<HashMap<_, _>>();
+            let current_profiles = std::mem::take(profiles);
+            for (key, raw_profile) in current_profiles {
+                let Some(identity) = invalid_by_key.remove(&key) else {
+                    profiles.insert(key, raw_profile);
+                    continue;
+                };
+                let Some(identity) = identity else {
+                    profiles.insert(key, raw_profile);
+                    continue;
+                };
+                let Some((model, input_modalities)) = routable_by_identity.get(&identity) else {
+                    profiles.insert(key, raw_profile);
+                    continue;
+                };
+                if !valid_identities.insert(identity.clone()) {
+                    continue;
+                }
+                let recovered = if profile_is_strictly_valid_under_identity(
+                    &schema_version,
+                    &selection_policy,
+                    &identity,
+                    &raw_profile,
+                ) {
+                    raw_profile
+                } else {
+                    catalog_profile_draft(model, false, input_modalities.as_deref())?
+                };
+                profiles.insert(identity, recovered);
+            }
+        }
+        CodexSubagentV2ReconcileAction::PruneUnroutable => {
+            // 删除模型已离开可路由 catalog 的 profile（parse-valid 但 unroutable）。
+            // 这是显式“与目录同步”动作：用户主动要求让 V2 列表跟随 MultiRouter 模型库。
+            let keys: Vec<String> = profiles.keys().cloned().collect();
+            for key in keys {
+                let identity = profiles
+                    .get(&key)
+                    .and_then(|raw| raw.get("model"))
+                    .and_then(Value::as_str)
+                    .map(normalize_profile_key)
+                    .filter(|identity| !identity.is_empty())
+                    .unwrap_or_else(|| normalize_profile_key(&key));
+                if !routable_by_identity.contains_key(&identity) {
+                    profiles.shift_remove(&key);
+                }
+            }
+        }
+    }
+    Ok(hydrate_codex_subagent_v2_input_modalities(
+        settings,
+        &reconciled,
+    ))
+}
+
+pub(crate) fn validate_codex_subagent_v2_candidate(
+    settings: &Value,
+    provider_context: Option<&ProviderClassificationContext>,
+    require_strict_storage: bool,
+) -> Result<(), AppError> {
+    let raw = settings
+        .pointer("/codexRouting/subagentV2")
+        .ok_or_else(|| {
+            AppError::InvalidInput("Candidate has no subagentV2 document".to_string())
+        })?;
+    if require_strict_storage {
+        parse_persisted_subagent_v2(raw)
+            .map_err(|error| codex_subagent_validation_error(&error))?;
+    } else {
+        parse_persisted_subagent_v2_tolerant(raw)
+            .map_err(|error| codex_subagent_validation_error(&error))?;
+    }
+    let specs = codex_catalog_model_specs(settings, "");
+    let compilation = compile_configured_codex_subagent_roles(
+        settings,
+        &specs,
+        codex_subagent_version(settings),
+        provider_context,
+    )?;
+    if let Some(compilation) = compilation.as_ref() {
+        validate_codex_subagent_reasoning_completeness(compilation)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentProfileStatusMode {
+    V1,
+    V2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentProfileGenerationSource {
+    LegacyManagedRoles,
+    ConfiguredProfiles,
+    InactiveV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentProfileStatusCode {
+    Generated,
+    Disabled,
+    Unroutable,
+    Invalid,
+    Collision,
+    InactiveV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentNonGenerationReason {
+    Disabled,
+    Unroutable,
+    Invalid,
+    Collision,
+    InactiveV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentFieldSource {
+    Automatic,
+    Override,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentProfileFieldSources {
+    role_name: CodexSubagentFieldSource,
+    description: CodexSubagentFieldSource,
+    developer_instructions: CodexSubagentFieldSource,
+    nickname_candidates: CodexSubagentFieldSource,
+    model_reasoning_effort: CodexSubagentFieldSource,
+}
+
+/// 输入能力（纯文本 vs 多模态）判定链中，最终结论的来源。
+///
+/// 用户遇到问题时不需要理解整条判定链，只需要知道"这个结论是哪一段给的"。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentInputModalitySource {
+    /// profile 里显式声明的 inputModalities（与 catalog 推导值不同，视为用户覆盖）
+    ProfileExplicit,
+    /// route 能力声明（MultiRouter 规则侧覆盖项）
+    Route,
+    /// 模型 catalog 条目声明（inputModalities/supportsImage/textOnly）
+    Catalog,
+    /// 内置"已确认纯文本"模型名注册表
+    NameRegistry,
+    /// 没有任何来源声明，结论为未知
+    Unknown,
+}
+
+/// 判定链中单个来源的声明，用于把整条链逐段呈现给用户。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentModalityDeclaration {
+    source: CodexSubagentInputModalitySource,
+    /// 该来源声明的模态：["text"] / ["text","image"]；None 表示该来源未声明
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared: Option<Vec<String>>,
+    /// 该来源的声明是否被采纳（赢得判定）
+    adopted: bool,
+}
+
+/// 输入能力判定链的完整呈现：最终结论 + 来源 + 逐段声明 + 冲突。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentInputModalityInfo {
+    /// 最终模态：["text"] / ["text","image"]；None 表示未知
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modalities: Option<Vec<String>>,
+    /// 最终结论的来源
+    source: CodexSubagentInputModalitySource,
+    /// 判定链逐段声明（按优先级：profile > route > catalog > 名字注册表）
+    declarations: Vec<CodexSubagentModalityDeclaration>,
+    /// 各来源声明不一致时的人类可读冲突说明
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conflict: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentProfileStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_kind: Option<SubagentProviderKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    routable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field_sources: Option<CodexSubagentProfileFieldSources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_modality: Option<CodexSubagentInputModalityInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_role_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_role_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_reasoning_effort: Option<SubagentReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_policy: Option<SubagentReasoningRuntimePolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_capability: Option<ResolvedSubagentReasoningCapability>,
+    status: CodexSubagentProfileStatusCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    non_generation_reason: Option<CodexSubagentNonGenerationReason>,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentProfileStatuses {
+    mode: CodexSubagentProfileStatusMode,
+    generation_source: CodexSubagentProfileGenerationSource,
+    profiles: Vec<CodexSubagentProfileStatus>,
+    warnings: Vec<String>,
+}
+
+fn public_subagent_status_code(
+    status: SubagentProfileStatusCode,
+) -> CodexSubagentProfileStatusCode {
+    match status {
+        SubagentProfileStatusCode::Routable => CodexSubagentProfileStatusCode::Generated,
+        SubagentProfileStatusCode::Disabled => CodexSubagentProfileStatusCode::Disabled,
+        SubagentProfileStatusCode::Unroutable => CodexSubagentProfileStatusCode::Unroutable,
+        SubagentProfileStatusCode::Invalid => CodexSubagentProfileStatusCode::Invalid,
+        SubagentProfileStatusCode::Collision => CodexSubagentProfileStatusCode::Collision,
+        SubagentProfileStatusCode::InactiveV1 => CodexSubagentProfileStatusCode::InactiveV1,
+    }
+}
+
+fn public_subagent_non_generation_reason(
+    reason: SubagentDiagnosticReasonCode,
+) -> CodexSubagentNonGenerationReason {
+    match reason {
+        SubagentDiagnosticReasonCode::Disabled => CodexSubagentNonGenerationReason::Disabled,
+        SubagentDiagnosticReasonCode::Unroutable => CodexSubagentNonGenerationReason::Unroutable,
+        SubagentDiagnosticReasonCode::Invalid => CodexSubagentNonGenerationReason::Invalid,
+        SubagentDiagnosticReasonCode::Collision => CodexSubagentNonGenerationReason::Collision,
+        SubagentDiagnosticReasonCode::InactiveV1 => CodexSubagentNonGenerationReason::InactiveV1,
+    }
+}
+
+fn field_source(present: bool) -> CodexSubagentFieldSource {
+    if present {
+        CodexSubagentFieldSource::Override
+    } else {
+        CodexSubagentFieldSource::Automatic
+    }
+}
+
+fn configured_profile_field_sources(
+    profile: &crate::codex_subagent_profiles::ParsedCodexSubagentProfile,
+) -> CodexSubagentProfileFieldSources {
+    CodexSubagentProfileFieldSources {
+        role_name: field_source(profile.overrides.role_name.is_some()),
+        description: field_source(profile.overrides.description.is_some()),
+        developer_instructions: field_source(profile.overrides.developer_instructions.is_some()),
+        nickname_candidates: field_source(profile.overrides.nickname_candidates.is_some()),
+        model_reasoning_effort: field_source(
+            profile.reasoning.policy == SubagentReasoningRuntimePolicy::Fixed,
+        ),
+    }
+}
+
+/// 从能力对象（route capabilities 或 catalog 条目）提取其正向声明的模态。
+/// 优先级：inputModalities 数组 > supportsImage/vision 布尔 > textOnly 布尔（仅 true 视为声明）。
+/// textOnly=false 是否定声明（"非纯文本"），不视为对模态的正向声明，返回 None。
+fn declared_modalities_from_capabilities(capabilities: &Value) -> Option<Vec<String>> {
+    if let Some(items) = capabilities
+        .get("inputModalities")
+        .or_else(|| capabilities.get("input_modalities"))
+        .and_then(Value::as_array)
+    {
+        let normalized: Vec<String> = items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if !normalized.is_empty() {
+            return Some(normalized);
+        }
+    }
+    if let Some(supports) = capabilities
+        .get("supportsImage")
+        .or_else(|| capabilities.get("supports_image"))
+        .or_else(|| capabilities.get("vision"))
+        .and_then(Value::as_bool)
+    {
+        return Some(if supports {
+            vec!["text".to_string(), "image".to_string()]
+        } else {
+            vec!["text".to_string()]
+        });
+    }
+    if capabilities
+        .get("textOnly")
+        .or_else(|| capabilities.get("text_only"))
+        .and_then(Value::as_bool)
+        .is_some_and(|text_only| text_only)
+    {
+        return Some(vec!["text".to_string()]);
+    }
+    None
+}
+
+/// 把 profile 的 InputModality 枚举转成字符串列表（["text"] / ["text","image"]）。
+fn profile_input_modalities_as_strings(
+    modalities: Option<&[SubagentInputModality]>,
+) -> Option<Vec<String>> {
+    let items = modalities?;
+    let normalized: Vec<String> = items
+        .iter()
+        .map(|modality| match modality {
+            SubagentInputModality::Text => "text".to_string(),
+            SubagentInputModality::Image => "image".to_string(),
+        })
+        .collect();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn format_modality_label(modalities: &[String]) -> &'static str {
+    if modalities.iter().any(|m| m.eq_ignore_ascii_case("image")) {
+        "文本+图像"
+    } else {
+        "纯文本"
+    }
+}
+
+/// 检测判定链各来源之间的模态声明冲突，返回人类可读说明。
+fn detect_modality_conflict(
+    profile: Option<&[String]>,
+    route: Option<&[String]>,
+    catalog: Option<&[String]>,
+    name: Option<&[String]>,
+) -> Option<String> {
+    let sources: [(&str, Option<&[String]>); 4] = [
+        ("profile", profile),
+        ("route", route),
+        ("模型目录", catalog),
+        ("内置注册表", name),
+    ];
+    let declared: Vec<(&str, &[String])> = sources
+        .into_iter()
+        .filter_map(|(label, value)| value.map(|value| (label, value)))
+        .collect();
+    if declared.len() < 2 {
+        return None;
+    }
+    let first = declared[0].1;
+    if declared.iter().all(|(_, value)| *value == first) {
+        return None;
+    }
+    let parts: Vec<String> = declared
+        .iter()
+        .map(|(label, value)| format!("{label} 声明{}", format_modality_label(value)))
+        .collect();
+    Some(format!("输入能力声明冲突：{}", parts.join("，")))
+}
+
+/// 解析输入能力判定链：最终结论 + 来源 + 逐段声明 + 冲突。
+///
+/// 最终模态 = profile 的 inputModalities（hydration 后，即实际用于角色生成的值）；
+/// 若 profile 未声明则回退到 catalog 推导值。来源归属：profile 值与 catalog 推导值
+/// 不同视为用户覆盖（ProfileExplicit），否则按 route > catalog > 名字注册表 > 未知归属。
+fn resolve_input_modality_provenance(
+    settings: &Value,
+    profile: &crate::codex_subagent_profiles::ParsedCodexSubagentProfile,
+) -> CodexSubagentInputModalityInfo {
+    let model = &profile.model;
+    let profile_declared = profile_input_modalities_as_strings(profile.input_modalities.as_deref());
+
+    let route_caps = codex_routing_capabilities_for_model(settings, model);
+    let route_declared = route_caps.and_then(declared_modalities_from_capabilities);
+    let catalog_caps = codex_catalog_capabilities_for_model(settings, model);
+    let catalog_declared = catalog_caps.and_then(declared_modalities_from_capabilities);
+    let name_declared = crate::model_capabilities::is_confirmed_text_only_model(model)
+        .then(|| vec!["text".to_string()]);
+
+    // 这里只接受 catalog 自己的显式能力字段。不要把 catalog spec 中由
+    // 模型名注册表或 route 推导出的 text_only 再归属给 catalog，否则来源
+    // 展示会把 name_registry/route 的证据伪装成 catalog 声明。
+    let catalog_effective = catalog_declared;
+
+    // 唯一的生效优先级：用户显式 profile > route > catalog > 名字注册表。
+    // 即使 profile 恰好与 catalog 相同，它仍然是用户明确选择，不能因为
+    // route 发生冲突就把“来源”标成 route、却继续返回 profile 的值。
+    let (modalities, source) = if let Some(value) = profile_declared.clone() {
+        (
+            Some(value),
+            CodexSubagentInputModalitySource::ProfileExplicit,
+        )
+    } else if let Some(value) = route_declared.clone() {
+        (Some(value), CodexSubagentInputModalitySource::Route)
+    } else if let Some(value) = catalog_effective.clone() {
+        (Some(value), CodexSubagentInputModalitySource::Catalog)
+    } else if let Some(value) = name_declared.clone() {
+        (Some(value), CodexSubagentInputModalitySource::NameRegistry)
+    } else {
+        (None, CodexSubagentInputModalitySource::Unknown)
+    };
+
+    let conflict = detect_modality_conflict(
+        profile_declared.as_deref(),
+        route_declared.as_deref(),
+        catalog_effective.as_deref(),
+        name_declared.as_deref(),
+    );
+
+    let declarations = vec![
+        CodexSubagentModalityDeclaration {
+            source: CodexSubagentInputModalitySource::ProfileExplicit,
+            declared: profile_declared,
+            adopted: source == CodexSubagentInputModalitySource::ProfileExplicit,
+        },
+        CodexSubagentModalityDeclaration {
+            source: CodexSubagentInputModalitySource::Route,
+            declared: route_declared,
+            adopted: source == CodexSubagentInputModalitySource::Route,
+        },
+        CodexSubagentModalityDeclaration {
+            source: CodexSubagentInputModalitySource::Catalog,
+            declared: catalog_effective,
+            adopted: source == CodexSubagentInputModalitySource::Catalog,
+        },
+        CodexSubagentModalityDeclaration {
+            source: CodexSubagentInputModalitySource::NameRegistry,
+            declared: name_declared,
+            adopted: source == CodexSubagentInputModalitySource::NameRegistry,
+        },
+    ];
+
+    CodexSubagentInputModalityInfo {
+        modalities,
+        source,
+        declarations,
+        conflict,
+    }
+}
+
+fn absolute_codex_role_path(path: &Path) -> Result<String, AppError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                AppError::Message(format!("Unable to resolve current directory: {error}"))
+            })?
+            .join(path)
+    };
+    Ok(absolute.to_string_lossy().into_owned())
+}
+
+fn push_unique_warning(warnings: &mut Vec<String>, warning: &str) {
+    if !warnings.iter().any(|existing| existing == warning) {
+        warnings.push(warning.to_string());
+    }
+}
+
+fn configured_codex_subagent_profile_statuses(
+    settings: &Value,
+    compilation: ConfiguredCodexSubagentCompilation,
+    agents_dir: &Path,
+) -> Result<(Vec<CodexSubagentProfileStatus>, Vec<String>), AppError> {
+    let expected_profile_count = compilation.persisted.profiles.len();
+    let compiled_status_count = compilation.output.profile_statuses.len();
+    let mut generated_roles = compilation.output.generated_roles.into_iter();
+    let mut profiles = Vec::with_capacity(expected_profile_count);
+    let mut aggregate_warnings = Vec::new();
+
+    for (entry, compiled_status) in compilation
+        .persisted
+        .profiles
+        .iter()
+        .zip(compilation.output.profile_statuses.iter())
+    {
+        let status = public_subagent_status_code(compiled_status.status);
+        let non_generation_reason = compiled_status
+            .reason
+            .map(public_subagent_non_generation_reason);
+        let crate::codex_subagent_profiles::ParsedProfileEntry::Valid(profile) = entry else {
+            profiles.push(CodexSubagentProfileStatus {
+                profile_key: None,
+                model: None,
+                provider_kind: None,
+                enabled: None,
+                routable: false,
+                field_sources: None,
+                input_modality: None,
+                requested_role_name: None,
+                effective_role_name: None,
+                role_file_path: None,
+                model_provider: None,
+                model_reasoning_effort: None,
+                reasoning_policy: None,
+                reasoning_capability: None,
+                status,
+                non_generation_reason,
+                warnings: Vec::new(),
+            });
+            continue;
+        };
+
+        let classification = compilation
+            .route_classifications
+            .get(&profile.model.to_ascii_lowercase());
+        let mut warnings = Vec::new();
+        if let Some(warning) = classification.and_then(|value| value.warning) {
+            push_unique_warning(&mut warnings, warning);
+            push_unique_warning(&mut aggregate_warnings, warning);
+        }
+        let mut public_status = CodexSubagentProfileStatus {
+            profile_key: Some(compiled_status.key.clone()),
+            model: compiled_status.model.clone(),
+            provider_kind: classification.map(|value| value.provider_kind),
+            enabled: Some(profile.enabled),
+            routable: false,
+            field_sources: Some(configured_profile_field_sources(profile)),
+            input_modality: Some(resolve_input_modality_provenance(settings, profile)),
+            requested_role_name: None,
+            effective_role_name: None,
+            role_file_path: None,
+            model_provider: None,
+            model_reasoning_effort: None,
+            reasoning_policy: Some(profile.reasoning.policy),
+            reasoning_capability: compilation
+                .reasoning_capabilities
+                .get(&profile.model.to_ascii_lowercase())
+                .cloned(),
+            status,
+            non_generation_reason,
+            warnings,
+        };
+        if compiled_status.status == SubagentProfileStatusCode::Routable {
+            let role = generated_roles.next().ok_or_else(|| {
+                AppError::Message(
+                    "Codex subagent compiler omitted a generated role for a routable status"
+                        .to_string(),
+                )
+            })?;
+            public_status.routable = true;
+            public_status.requested_role_name = Some(role.requested_role_name);
+            public_status.effective_role_name = Some(role.effective_role_name.clone());
+            public_status.role_file_path = Some(absolute_codex_role_path(
+                &agents_dir.join(format!("{}.toml", role.effective_role_name)),
+            )?);
+            public_status.model_provider = Some(role.model_provider);
+            public_status.model_reasoning_effort = role.effort;
+            for warning in role.warnings {
+                push_unique_warning(&mut public_status.warnings, &warning);
+                push_unique_warning(&mut aggregate_warnings, &warning);
+            }
+        }
+        profiles.push(public_status);
+    }
+
+    if profiles.len() != expected_profile_count
+        || profiles.len() != compiled_status_count
+        || generated_roles.next().is_some()
+    {
+        return Err(AppError::Message(
+            "Codex subagent compiler returned inconsistent profile status metadata".to_string(),
+        ));
+    }
+    Ok((profiles, aggregate_warnings))
+}
+
+fn legacy_reasoning_effort(model: &str) -> Option<SubagentReasoningEffort> {
+    match codex_agent_reasoning_effort_for_model(model) {
+        Some("low") => Some(SubagentReasoningEffort::Low),
+        Some("medium") => Some(SubagentReasoningEffort::Medium),
+        Some("high") => Some(SubagentReasoningEffort::High),
+        Some("xhigh") => Some(SubagentReasoningEffort::XHigh),
+        _ => None,
+    }
+}
+
+fn legacy_codex_subagent_profile_statuses(
+    settings: &Value,
+    specs: &[CodexCatalogModelSpec],
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<(Vec<CodexSubagentProfileStatus>, Vec<String>), AppError> {
+    let agents_dir = get_codex_agents_dir();
+    let mut profiles = Vec::new();
+    let mut aggregate_warnings = Vec::new();
+    for role in inspect_legacy_codex_managed_agent_roles(specs, &agents_dir) {
+        let classification = codex_subagent_route_classification_with_context(
+            settings,
+            &role.spec.model,
+            provider_context,
+        );
+        let mut warnings = Vec::new();
+        if let Some(warning) = classification.as_ref().and_then(|value| value.warning) {
+            push_unique_warning(&mut warnings, warning);
+            push_unique_warning(&mut aggregate_warnings, warning);
+        }
+        profiles.push(CodexSubagentProfileStatus {
+            profile_key: None,
+            model: Some(role.spec.model.clone()),
+            provider_kind: classification.as_ref().map(|value| value.provider_kind),
+            enabled: None,
+            routable: classification.is_some(),
+            field_sources: None,
+            input_modality: None,
+            requested_role_name: Some(role.requested_role_name),
+            effective_role_name: Some(role.effective_role_name),
+            role_file_path: Some(absolute_codex_role_path(&role.path)?),
+            model_provider: Some(CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID.to_string()),
+            model_reasoning_effort: legacy_reasoning_effort(&role.spec.model),
+            reasoning_policy: None,
+            reasoning_capability: None,
+            status: CodexSubagentProfileStatusCode::Generated,
+            non_generation_reason: None,
+            warnings,
+        });
+    }
+    Ok((profiles, aggregate_warnings))
+}
+
+fn get_codex_subagent_profile_statuses_with_context(
+    settings_config: Value,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<CodexSubagentProfileStatuses, AppError> {
+    let version = codex_subagent_version(&settings_config);
+    let mode = if version == CodexSubagentVersion::V1 {
+        CodexSubagentProfileStatusMode::V1
+    } else {
+        CodexSubagentProfileStatusMode::V2
+    };
+    let specs = codex_catalog_model_specs(&settings_config, "");
+    match compile_configured_codex_subagent_roles(
+        &settings_config,
+        &specs,
+        version,
+        provider_context,
+    )? {
+        Some(compilation) => {
+            let (profiles, warnings) = configured_codex_subagent_profile_statuses(
+                &settings_config,
+                compilation,
+                &get_codex_agents_dir(),
+            )?;
+            Ok(CodexSubagentProfileStatuses {
+                mode,
+                generation_source: if version == CodexSubagentVersion::V1 {
+                    CodexSubagentProfileGenerationSource::InactiveV1
+                } else {
+                    CodexSubagentProfileGenerationSource::ConfiguredProfiles
+                },
+                profiles,
+                warnings,
+            })
+        }
+        None if version == CodexSubagentVersion::V1 => Ok(CodexSubagentProfileStatuses {
+            mode,
+            generation_source: CodexSubagentProfileGenerationSource::InactiveV1,
+            profiles: Vec::new(),
+            warnings: Vec::new(),
+        }),
+        None => {
+            let (profiles, warnings) =
+                legacy_codex_subagent_profile_statuses(&settings_config, &specs, provider_context)?;
+            Ok(CodexSubagentProfileStatuses {
+                mode,
+                generation_source: CodexSubagentProfileGenerationSource::LegacyManagedRoles,
+                profiles,
+                warnings,
+            })
+        }
+    }
+}
+
+fn get_codex_subagent_profile_statuses_from_db(
+    db: &crate::database::Database,
+    settings_config: Value,
+) -> Result<CodexSubagentProfileStatuses, String> {
+    let provider_context = codex_provider_classification_context(db)
+        .map_err(|error| format!("Unable to load Codex provider records: {error}"))?;
+    get_codex_subagent_profile_statuses_with_context(settings_config, Some(&provider_context))
+        .map_err(|error| format!("Unable to inspect Codex subagent profiles: {error}"))
+}
+
+fn get_codex_subagent_reasoning_capabilities_from_settings(
+    settings: &Value,
+) -> BTreeMap<String, ResolvedSubagentReasoningCapability> {
+    codex_catalog_model_specs(settings, "")
+        .into_iter()
+        .map(|spec| {
+            let capability =
+                crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
+                    spec.reasoning.as_ref(),
+                );
+            (spec.model, capability)
+        })
+        .collect()
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn get_codex_subagent_reasoning_capabilities(
+    settingsConfig: Value,
+) -> BTreeMap<String, ResolvedSubagentReasoningCapability> {
+    get_codex_subagent_reasoning_capabilities_from_settings(&settingsConfig)
+}
+
+/// P3：单模型推理能力解析结果（与 catalog/请求/Sub-Agent 同源）。
+///
+/// 返回 resolved capability + 来源 + 指纹 + 当前检测候选状态，供模型卡片
+/// 展示与 unknown 状态动作（重新检测/采用检测结果）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelReasoningResolution {
+    pub model: String,
+    pub capability: Option<crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability>,
+    pub source: String,
+    pub fingerprint: String,
+    pub resolved: ResolvedSubagentReasoningCapability,
+    /// 是否存在有效 TTL 检测候选快照（供「采用检测结果」动作）。
+    pub has_detection_candidate: bool,
+    pub detection: Option<crate::reasoning_capabilities::ProviderCapabilitySnapshot>,
+}
+
+fn resolve_codex_model_reasoning_capability_value(
+    settings_config: &Value,
+    provider_id: &str,
+    model: &str,
+) -> CodexModelReasoningResolution {
+    let model = model.trim().to_string();
+    let detection = crate::reasoning_capabilities::current_detection(provider_id, &model);
+    let library = crate::reasoning_capabilities::catalog::global_library();
+    let official_models = codex_official_models_cache().unwrap_or_default();
+    let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
+        settings_config,
+        None,
+        &model,
+        detection.as_ref(),
+        library.as_ref(),
+        &official_models,
+    );
+    let resolved_capability =
+        crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
+            resolved.capability.as_ref(),
+        );
+    CodexModelReasoningResolution {
+        model,
+        capability: resolved.capability,
+        source: resolved.source.as_str().to_string(),
+        fingerprint: resolved.fingerprint,
+        resolved: resolved_capability,
+        has_detection_candidate: detection.is_some(),
+        detection,
+    }
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn resolve_codex_model_reasoning_capability(
+    settingsConfig: Value,
+    providerId: String,
+    model: String,
+) -> CodexModelReasoningResolution {
+    resolve_codex_model_reasoning_capability_value(&settingsConfig, &providerId, &model)
+}
+
+/// P3：触发单模型只读检测（异步，调用发现适配器并写入 TTL 缓存）。
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn trigger_codex_model_reasoning_detection(
+    provider: crate::provider::Provider,
+    model: String,
+) -> Result<crate::reasoning_capabilities::DiscoveryOutcome, String> {
+    let model = model.trim().to_string();
+    let outcome = crate::reasoning_capabilities::provider_metadata::discover_provider_capability(
+        &provider, &model,
+    )
+    .await;
+    if let crate::reasoning_capabilities::DiscoveryOutcome::Found(snapshot) = &outcome {
+        let mut cache = crate::reasoning_capabilities::detection_cache()
+            .lock()
+            .expect("detection cache poisoned");
+        cache.insert(snapshot.clone());
+    }
+    Ok(outcome)
+}
+
+/// P4：只读 reasoning inspect 的稳定诊断项。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningDiagnostic {
+    pub level: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningProviderSummary {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningInspectResponse {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub revision: String,
+    pub provider: CodexReasoningProviderSummary,
+    pub model: String,
+    pub persisted: Value,
+    pub resolved: CodexModelReasoningResolution,
+    pub codex_projection: Value,
+    pub provider_projection: Value,
+    pub diagnostics: Vec<CodexReasoningDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningListItem {
+    pub model: String,
+    pub source: String,
+    pub fingerprint: String,
+    pub resolved: ResolvedSubagentReasoningCapability,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningProviderList {
+    pub provider: CodexReasoningProviderSummary,
+    pub revision: String,
+    pub items: Vec<CodexReasoningListItem>,
+    pub diagnostics: Vec<CodexReasoningDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningListResponse {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub providers: Vec<CodexReasoningProviderList>,
+    pub diagnostics: Vec<CodexReasoningDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningValidationResponse {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub revision: String,
+    pub provider: CodexReasoningProviderSummary,
+    pub valid: bool,
+    pub model_count: usize,
+    pub diagnostics: Vec<CodexReasoningDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexReasoningExportResponse {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub revision: String,
+    pub redacted: bool,
+    pub provider: CodexReasoningProviderSummary,
+    pub models: Vec<Value>,
+    pub provider_reasoning: Option<crate::provider::CodexChatReasoningConfig>,
+    pub diagnostics: Vec<CodexReasoningDiagnostic>,
+}
+
+fn reasoning_provider_summary(provider: &Provider) -> CodexReasoningProviderSummary {
+    CodexReasoningProviderSummary {
+        id: provider.id.clone(),
+        name: provider.name.clone(),
+    }
+}
+
+fn reasoning_request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn reasoning_revision(provider: &Provider) -> String {
+    use sha2::{Digest, Sha256};
+
+    let input = json!({
+        "providerId": provider.id,
+        "providerName": provider.name,
+        "models": provider
+            .settings_config
+            .get("modelCatalog")
+            .and_then(|catalog| catalog.get("models"))
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+        "providerReasoning": provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.codex_chat_reasoning.clone()),
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&input).unwrap_or_default());
+    format!("{:x}", hasher.finalize())
+}
+
+fn codex_catalog_spec_for_model(settings: &Value, model: &str) -> Option<CodexCatalogModelSpec> {
+    codex_catalog_model_specs(settings, "")
+        .into_iter()
+        .find(|spec| spec.model.eq_ignore_ascii_case(model.trim()))
+}
+
+fn reasoning_persisted_projection(
+    spec: Option<&CodexCatalogModelSpec>,
+    provider: &Provider,
+) -> Value {
+    json!({
+        "model": spec.map(|spec| json!({
+            "model": spec.model,
+            "displayName": spec.display_name,
+            "upstreamModel": spec.upstream_model,
+            "reasoning": spec.reasoning,
+        })),
+        "providerReasoning": provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.codex_chat_reasoning.clone()),
+    })
+}
+
+fn reasoning_diagnostics(
+    spec: Option<&CodexCatalogModelSpec>,
+    resolution: &CodexModelReasoningResolution,
+) -> Vec<CodexReasoningDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if spec.is_none() {
+        diagnostics.push(CodexReasoningDiagnostic {
+            level: "warning".into(),
+            code: "model_not_in_catalog".into(),
+            message: "模型不在当前 Provider 的 modelCatalog 中，解析结果仅供诊断。".into(),
+        });
+    }
+    if resolution.source == "unknown" {
+        diagnostics.push(CodexReasoningDiagnostic {
+            level: "warning".into(),
+            code: "unknown_capability".into(),
+            message: "没有足够的模型能力证据，将使用服务端默认且不注入推理参数。".into(),
+        });
+    }
+    diagnostics
+}
+
+fn build_codex_reasoning_inspect(
+    provider: &Provider,
+    model: &str,
+) -> CodexReasoningInspectResponse {
+    let model = model.trim().to_string();
+    let spec = codex_catalog_spec_for_model(&provider.settings_config, &model);
+    let resolved = resolve_codex_model_reasoning_capability_value(
+        &provider.settings_config,
+        &provider.id,
+        &model,
+    );
+    let provider_reasoning = crate::proxy::providers::resolve_codex_chat_reasoning_config(
+        provider,
+        &json!({ "model": model }),
+    );
+    let diagnostics = reasoning_diagnostics(spec.as_ref(), &resolved);
+
+    CodexReasoningInspectResponse {
+        schema_version: 1,
+        request_id: reasoning_request_id(),
+        revision: reasoning_revision(provider),
+        provider: reasoning_provider_summary(provider),
+        model: model.clone(),
+        persisted: reasoning_persisted_projection(spec.as_ref(), provider),
+        codex_projection: json!({
+            "source": resolved.source,
+            "fingerprint": resolved.fingerprint,
+            "resolved": resolved.resolved,
+        }),
+        provider_projection: json!({
+            "platform": crate::reasoning_capabilities::provider_metadata::detect_platform(provider),
+            "model": model,
+            "reasoning": provider_reasoning,
+        }),
+        resolved,
+        diagnostics,
+    }
+}
+
+fn build_codex_reasoning_provider_list(provider: &Provider) -> CodexReasoningProviderList {
+    let specs = codex_catalog_model_specs(&provider.settings_config, "");
+    let items = specs
+        .iter()
+        .map(|spec| {
+            let resolved = resolve_codex_model_reasoning_capability_value(
+                &provider.settings_config,
+                &provider.id,
+                &spec.model,
+            );
+            CodexReasoningListItem {
+                model: spec.model.clone(),
+                source: resolved.source,
+                fingerprint: resolved.fingerprint,
+                resolved: resolved.resolved,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut diagnostics = Vec::new();
+    if specs.is_empty() {
+        diagnostics.push(CodexReasoningDiagnostic {
+            level: "warning".into(),
+            code: "no_models".into(),
+            message: "Provider 没有可检查的 modelCatalog 模型。".into(),
+        });
+    }
+    if items.iter().any(|item| item.source == "unknown") {
+        diagnostics.push(CodexReasoningDiagnostic {
+            level: "warning".into(),
+            code: "unknown_capability".into(),
+            message: "至少一个模型的推理能力未知。".into(),
+        });
+    }
+    CodexReasoningProviderList {
+        provider: reasoning_provider_summary(provider),
+        revision: reasoning_revision(provider),
+        items,
+        diagnostics,
+    }
+}
+
+fn build_codex_reasoning_validation(provider: &Provider) -> CodexReasoningValidationResponse {
+    let models = provider
+        .settings_config
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut diagnostics = Vec::new();
+    for model in &models {
+        let model_name = model
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if let Some(reasoning) = model.get("reasoning") {
+            let parsed = serde_json::from_value::<
+                crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability,
+            >(reasoning.clone())
+            .ok()
+            .and_then(|capability| capability.validate().ok().map(|_| capability));
+            if parsed.is_none() {
+                diagnostics.push(CodexReasoningDiagnostic {
+                    level: "error".into(),
+                    code: "invalid_reasoning_declaration".into(),
+                    message: format!("模型 {model_name} 的 reasoning 声明无法通过 schema 校验。"),
+                });
+            }
+        }
+    }
+    let listing = build_codex_reasoning_provider_list(provider);
+    diagnostics.extend(listing.diagnostics);
+    CodexReasoningValidationResponse {
+        schema_version: 1,
+        request_id: reasoning_request_id(),
+        revision: reasoning_revision(provider),
+        provider: reasoning_provider_summary(provider),
+        valid: !diagnostics.iter().any(|item| item.level == "error"),
+        model_count: models.len(),
+        diagnostics,
+    }
+}
+
+fn build_codex_reasoning_export(provider: &Provider) -> CodexReasoningExportResponse {
+    let models = codex_catalog_model_specs(&provider.settings_config, "")
+        .iter()
+        .map(|spec| {
+            json!({
+                "model": spec.model,
+                "displayName": spec.display_name,
+                "upstreamModel": spec.upstream_model,
+                "reasoning": spec.reasoning,
+            })
+        })
+        .collect::<Vec<_>>();
+    CodexReasoningExportResponse {
+        schema_version: 1,
+        request_id: reasoning_request_id(),
+        revision: reasoning_revision(provider),
+        redacted: true,
+        provider: reasoning_provider_summary(provider),
+        models,
+        provider_reasoning: provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.codex_chat_reasoning.clone()),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn codex_provider_for_readonly(state: &AppState, provider_id: &str) -> Result<Provider, String> {
+    let providers =
+        ProviderService::list(state, AppType::Codex).map_err(|error| error.to_string())?;
+    providers
+        .get(provider_id.trim())
+        .cloned()
+        .ok_or_else(|| format!("Codex Provider 不存在: {}", provider_id.trim()))
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn inspect_codex_reasoning_capability(
+    appState: State<'_, AppState>,
+    providerId: String,
+    model: String,
+) -> Result<CodexReasoningInspectResponse, String> {
+    let provider = codex_provider_for_readonly(appState.inner(), &providerId)?;
+    Ok(build_codex_reasoning_inspect(&provider, &model))
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn list_codex_reasoning_capabilities(
+    appState: State<'_, AppState>,
+    providerId: Option<String>,
+) -> Result<CodexReasoningListResponse, String> {
+    let providers = ProviderService::list(appState.inner(), AppType::Codex)
+        .map_err(|error| error.to_string())?;
+    let selected = providerId
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let mut provider_lists = Vec::new();
+    for provider in providers.values() {
+        if selected.is_some_and(|id| id != provider.id) {
+            continue;
+        }
+        provider_lists.push(build_codex_reasoning_provider_list(provider));
+    }
+    Ok(CodexReasoningListResponse {
+        schema_version: 1,
+        request_id: reasoning_request_id(),
+        providers: provider_lists,
+        diagnostics: Vec::new(),
+    })
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn validate_codex_reasoning_provider(
+    appState: State<'_, AppState>,
+    providerId: String,
+) -> Result<CodexReasoningValidationResponse, String> {
+    let provider = codex_provider_for_readonly(appState.inner(), &providerId)?;
+    Ok(build_codex_reasoning_validation(&provider))
+}
+
+/// Validate an unsaved Codex Provider candidate before the generic provider
+/// form submits it. This uses the same strict compiler/route/reasoning gate as
+/// `ProviderService::add` and `ProviderService::update`, but never writes.
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn validate_codex_subagent_v2_provider_candidate(
+    appState: State<'_, AppState>,
+    settingsConfig: Value,
+) -> Result<(), String> {
+    let provider_context = codex_provider_classification_context(appState.db.as_ref())
+        .map_err(|error| error.to_string())?;
+    validate_codex_subagent_v2_candidate(&settingsConfig, Some(&provider_context), true)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn export_codex_reasoning_provider(
+    appState: State<'_, AppState>,
+    providerId: String,
+    #[allow(dead_code)] _redacted: Option<bool>,
+) -> Result<CodexReasoningExportResponse, String> {
+    let provider = codex_provider_for_readonly(appState.inner(), &providerId)?;
+    // 即使调用方不传 --redacted，也只返回 allowlist 投影；绝不回读或输出凭据。
+    Ok(build_codex_reasoning_export(&provider))
+}
+
+fn cli_flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+}
+
+fn cli_required_flag(args: &[String], flag: &str) -> Result<String, String> {
+    cli_flag_value(args, flag)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing_required_argument: {flag}"))
+}
+
+/// P4：`ccsm reasoning` 的只读 JSON transport。
+///
+/// 该入口只使用 `Database::init_readonly`，因此不会触发应用启动迁移、live 投影、
+/// Provider 切换或任何配置写入。写入型 `detect/plan/apply/reset` 保留给 P5。
+pub fn run_reasoning_cli(args: &[String]) -> Result<Value, String> {
+    if args.first().map(String::as_str) != Some("reasoning") {
+        return Err("invalid_command: expected `reasoning`".into());
+    }
+    let command = args.get(1).map(String::as_str).ok_or_else(|| {
+        "missing_command: expected list, inspect, validate, or export".to_string()
+    })?;
+    if args.iter().any(|arg| arg == "--human") {
+        return Err("unsupported_output: only versioned JSON output is supported".into());
+    }
+    if let Some(output) = cli_flag_value(args, "--output") {
+        if output != "json" {
+            return Err("unsupported_output: --output must be json".into());
+        }
+    }
+    if matches!(command, "detect" | "plan" | "apply" | "reset") {
+        return Err("read_only_boundary: detect/plan/apply/reset are reserved for P5".into());
+    }
+
+    let db = std::sync::Arc::new(
+        crate::database::Database::init_readonly().map_err(|error| error.to_string())?,
+    );
+    let state = crate::store::AppState::new(db);
+    let providers =
+        ProviderService::list(&state, AppType::Codex).map_err(|error| error.to_string())?;
+
+    match command {
+        "list" => serde_json::to_value(CodexReasoningListResponse {
+            schema_version: 1,
+            request_id: reasoning_request_id(),
+            providers: providers
+                .values()
+                .filter(|provider| {
+                    cli_flag_value(args, "--provider").is_none_or(|id| id.trim() == provider.id)
+                })
+                .map(build_codex_reasoning_provider_list)
+                .collect(),
+            diagnostics: Vec::new(),
+        })
+        .map_err(|error| format!("serialize_error: {error}")),
+        "inspect" => {
+            let provider_id = cli_required_flag(args, "--provider")?;
+            let model = cli_required_flag(args, "--model")?;
+            let provider = providers
+                .get(&provider_id)
+                .ok_or_else(|| format!("provider_not_found: {provider_id}"))?;
+            serde_json::to_value(build_codex_reasoning_inspect(provider, &model))
+                .map_err(|error| format!("serialize_error: {error}"))
+        }
+        "validate" => {
+            let provider_id = cli_required_flag(args, "--provider")?;
+            let provider = providers
+                .get(&provider_id)
+                .ok_or_else(|| format!("provider_not_found: {provider_id}"))?;
+            serde_json::to_value(build_codex_reasoning_validation(provider))
+                .map_err(|error| format!("serialize_error: {error}"))
+        }
+        "export" => {
+            let provider_id = cli_required_flag(args, "--provider")?;
+            let provider = providers
+                .get(&provider_id)
+                .ok_or_else(|| format!("provider_not_found: {provider_id}"))?;
+            serde_json::to_value(build_codex_reasoning_export(provider))
+                .map_err(|error| format!("serialize_error: {error}"))
+        }
+        _ => Err(format!(
+            "unknown_command: unsupported reasoning command `{command}`"
+        )),
+    }
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn get_codex_subagent_profile_statuses(
+    appState: State<'_, crate::store::AppState>,
+    settingsConfig: Value,
+) -> Result<CodexSubagentProfileStatuses, String> {
+    get_codex_subagent_profile_statuses_from_db(appState.db.as_ref(), settingsConfig)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentProfilePreview {
+    provider_kind: SubagentProviderKind,
+    requested_role_name: String,
+    effective_role_name: String,
+    description: String,
+    developer_instructions: String,
+    nickname_candidates: Vec<String>,
+    model: String,
+    model_provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_reasoning_effort: Option<crate::codex_subagent_profiles::ModelReasoningEffort>,
+    reasoning_policy: SubagentReasoningRuntimePolicy,
+    reasoning_capability: ResolvedSubagentReasoningCapability,
+    model_context_window: u64,
+    toml_preview: String,
+    warnings: Vec<String>,
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn preview_codex_subagent_profile(
+    appState: State<'_, crate::store::AppState>,
+    settingsConfig: Value,
+    model: String,
+    profile: CodexSubagentProfileConfig,
+) -> Result<CodexSubagentProfilePreview, String> {
+    let provider_context = codex_provider_classification_context(appState.db.as_ref())
+        .map_err(|error| format!("Unable to load Codex provider records: {error}"))?;
+    preview_codex_subagent_profile_with_context(
+        settingsConfig,
+        model,
+        profile,
+        Some(&provider_context),
+    )
+}
+
+fn preview_codex_subagent_profile_with_context(
+    mut settings_config: Value,
+    model: String,
+    mut profile: CodexSubagentProfileConfig,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<CodexSubagentProfilePreview, String> {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("The requested model must be nonempty".to_string());
+    }
+    let profile_model = profile.model.trim();
+    if profile_model.is_empty() {
+        return Err("The profile model must be nonempty".to_string());
+    }
+    if profile_model != model {
+        return Err("Profile model does not match the requested model".to_string());
+    }
+    profile.model = model.clone();
+    let profile_key = normalize_profile_key(&model);
+    let mut warnings = Vec::new();
+    if !profile.enabled {
+        warnings.push("profile_disabled".to_string());
+        profile.enabled = true;
+    }
+    if profile.input_modalities.is_none() {
+        profile.input_modalities = codex_catalog_model_specs(&settings_config, "")
+            .iter()
+            .find(|spec| normalize_profile_key(&spec.model) == profile_key)
+            .and_then(codex_subagent_profile_input_modalities)
+            .map(|modalities| {
+                modalities
+                    .iter()
+                    .filter_map(|value| match value.as_str() {
+                        "text" => Some(SubagentInputModality::Text),
+                        "image" => Some(SubagentInputModality::Image),
+                        _ => None,
+                    })
+                    .collect()
+            });
+    }
+    let reasoning_policy = profile.reasoning.policy;
+    let profile = serde_json::to_value(profile)
+        .map_err(|error| format!("Invalid subagentV2 profile config: {error}"))?;
+    let routing = settings_config
+        .get_mut("codexRouting")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "settingsConfig.codexRouting must be an object".to_string())?;
+    let subagent_v2 = routing
+        .get_mut("subagentV2")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "settingsConfig.codexRouting.subagentV2 must be an object".to_string())?;
+    let profiles = subagent_v2
+        .get_mut("profiles")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            "settingsConfig.codexRouting.subagentV2.profiles must be an object".to_string()
+        })?;
+    profiles.insert(profile_key.clone(), profile);
+
+    let specs = codex_catalog_model_specs(&settings_config, "");
+    let spec = specs
+        .iter()
+        .find(|spec| normalize_profile_key(&spec.model) == profile_key)
+        .ok_or_else(|| format!("Profile model is not routable: {model}"))?;
+    let reasoning_capability =
+        crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
+            spec.reasoning.as_ref(),
+        );
+    let compilation = compile_configured_codex_subagent_roles(
+        &settings_config,
+        &specs,
+        CodexSubagentVersion::V2,
+        provider_context,
+    )
+    .map_err(|error| format!("Unable to compile profile preview: {error}"))?
+    .ok_or_else(|| "The selected profile is missing".to_string())?;
+    let classification = compilation
+        .route_classifications
+        .get(&spec.model.to_ascii_lowercase())
+        .cloned()
+        .ok_or_else(|| format!("Profile model is not routable: {model}"))?;
+    if let Some(warning) = classification.warning {
+        warnings.push(warning.to_string());
+    }
+    let provider_kind = classification.provider_kind;
+    let role = compilation
+        .output
+        .generated_roles
+        .into_iter()
+        .find(|role| normalize_profile_key(&role.model) == profile_key)
+        .ok_or_else(|| "Profile did not produce a preview role".to_string())?;
+    let toml_preview = render_generated_role_toml(&role, CC_SWITCH_MANAGED_AGENT_MARKER)
+        .map_err(|error| format!("Unable to render profile preview: {error:?}"))?;
+    for warning in &role.warnings {
+        push_unique_warning(&mut warnings, warning);
+    }
+    Ok(CodexSubagentProfilePreview {
+        provider_kind,
+        requested_role_name: role.requested_role_name,
+        effective_role_name: role.effective_role_name,
+        description: role.description,
+        developer_instructions: role.developer_instructions,
+        nickname_candidates: role.nickname_candidates,
+        model,
+        model_provider: role.model_provider,
+        model_reasoning_effort: role.effort,
+        reasoning_policy,
+        reasoning_capability,
+        model_context_window: role.context_window,
+        toml_preview,
+        warnings,
+    })
+}
+
+#[cfg(test)]
+fn sync_codex_managed_agent_files_with_settings(
+    specs: &[CodexCatalogModelSpec],
+    version: CodexSubagentVersion,
+    settings: &Value,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<(), AppError> {
+    let mut attempt = CodexProjectionSideEffectsAttempt::capture()?;
+    let result = sync_codex_managed_agent_files_with_settings_with_attempt(
+        specs,
+        version,
+        settings,
+        provider_context,
+        &mut attempt,
+    );
+    if result.is_err() {
+        let _ = attempt.restore_if_unchanged();
+    }
+    result
+}
+
+fn sync_codex_managed_agent_files_with_settings_with_attempt(
+    specs: &[CodexCatalogModelSpec],
+    version: CodexSubagentVersion,
+    settings: &Value,
+    provider_context: Option<&ProviderClassificationContext>,
+    attempt: &mut CodexProjectionSideEffectsAttempt,
+) -> Result<(), AppError> {
+    let Some(compilation) =
+        compile_configured_codex_subagent_roles(settings, specs, version, provider_context)?
+    else {
+        return sync_codex_managed_agent_files_with_attempt(specs, version, attempt);
+    };
+    let agents_dir = get_codex_agents_dir();
+    fs::create_dir_all(&agents_dir).map_err(|error| AppError::io(&agents_dir, error))?;
+    let mut desired_paths = HashSet::new();
+    for role in compilation.output.generated_roles {
+        let path = agents_dir.join(format!("{}.toml", role.effective_role_name));
+        if path.exists() && !codex_agent_file_is_cc_switch_managed(&path) {
+            continue;
+        }
+        desired_paths.insert(path.clone());
+        let rendered =
+            render_generated_role_toml(&role, CC_SWITCH_MANAGED_AGENT_MARKER).map_err(|error| {
+                AppError::Message(format!("Unable to render Codex subagent role: {error:?}"))
+            })?;
+        attempt.capture_path_for_managed_write(&path)?;
+        attempt.write_text_if_unchanged(&path, &rendered)?;
+    }
+    prune_stale_codex_managed_agent_files_with_attempt(&agents_dir, &desired_paths, attempt)
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentRoleFileVerification {
+    pub profile_key: String,
+    pub path: String,
+    pub exists: bool,
+    pub content_matches: bool,
+}
+
+/// Recompile the persisted V2 document and compare every expected managed role
+/// against the bytes that were atomically written to `~/.codex/agents`.
+pub(crate) fn verify_codex_subagent_role_files(
+    settings: &Value,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<Vec<CodexSubagentRoleFileVerification>, AppError> {
+    let specs = codex_catalog_model_specs(settings, "");
+    let Some(compilation) = compile_configured_codex_subagent_roles(
+        settings,
+        &specs,
+        codex_subagent_version(settings),
+        provider_context,
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    let agents_dir = get_codex_agents_dir();
+    let mut generated_roles = compilation.output.generated_roles.into_iter();
+    let mut verification = Vec::new();
+    for (entry, status) in compilation
+        .persisted
+        .profiles
+        .iter()
+        .zip(compilation.output.profile_statuses.iter())
+    {
+        if status.status != SubagentProfileStatusCode::Routable {
+            continue;
+        }
+        let ParsedProfileEntry::Valid(profile) = entry else {
+            return Err(AppError::Message(
+                "Routable Codex subagent status has no valid profile".to_string(),
+            ));
+        };
+        let role = generated_roles.next().ok_or_else(|| {
+            AppError::Message(
+                "Codex subagent compiler omitted a role during write verification".to_string(),
+            )
+        })?;
+        let path = agents_dir.join(format!("{}.toml", role.effective_role_name));
+        let expected =
+            render_generated_role_toml(&role, CC_SWITCH_MANAGED_AGENT_MARKER).map_err(|error| {
+                AppError::Message(format!(
+                    "Unable to render Codex subagent role during verification: {error:?}"
+                ))
+            })?;
+        let actual = fs::read_to_string(&path).ok();
+        verification.push(CodexSubagentRoleFileVerification {
+            profile_key: profile.key.clone(),
+            path: absolute_codex_role_path(&path)?,
+            exists: actual.is_some(),
+            content_matches: actual.as_deref() == Some(expected.as_str()),
+        });
+    }
+    if generated_roles.next().is_some() {
+        return Err(AppError::Message(
+            "Codex subagent compiler returned extra roles during write verification".to_string(),
+        ));
+    }
+    Ok(verification)
+}
+
+/// 删除已经不属于当前可路由模型目录的 CCSwitchMulti 托管 agent 文件。
 ///
 /// 只清理带托管标记的文件，用户手写 role、旧版未标记文件和其它扩展 agent 都保留。
+#[cfg(test)]
 fn prune_stale_codex_managed_agent_files(
     agents_dir: &Path,
     desired_paths: &HashSet<PathBuf>,
+) -> Result<(), AppError> {
+    let mut attempt = CodexProjectionSideEffectsAttempt::capture()?;
+    let result =
+        prune_stale_codex_managed_agent_files_with_attempt(agents_dir, desired_paths, &mut attempt);
+    if result.is_err() {
+        let _ = attempt.restore_if_unchanged();
+    }
+    result
+}
+
+fn prune_stale_codex_managed_agent_files_with_attempt(
+    agents_dir: &Path,
+    desired_paths: &HashSet<PathBuf>,
+    attempt: &mut CodexProjectionSideEffectsAttempt,
 ) -> Result<(), AppError> {
     if !agents_dir.exists() {
         return Ok(());
@@ -2468,7 +6209,7 @@ fn prune_stale_codex_managed_agent_files(
         if desired_paths.contains(&path) || !codex_agent_file_is_cc_switch_managed(&path) {
             continue;
         }
-        delete_file(&path)?;
+        attempt.delete_if_unchanged(&path)?;
     }
     Ok(())
 }
@@ -2566,6 +6307,7 @@ fn codex_official_picker_metadata_field(
         | "contextWindow"
         | "is_default"
         | "isDefault"
+        | "priority"
         | "visibility"
         | "show_in_picker"
         | "showInPicker"
@@ -2697,27 +6439,13 @@ fn enrich_codex_catalog_with_official_metadata(catalog: &Value) -> Result<Value,
     let Some(routed_models) = catalog.get("models").and_then(Value::as_array) else {
         return Ok(catalog.clone());
     };
-    let cache_path = get_codex_models_cache_path();
-    let backup_path = get_codex_models_cache_backup_path();
-    let existing_cache = read_json_file_if_exists(&cache_path)?;
-    let official_cache = match existing_cache.as_ref() {
-        Some(cache) if codex_models_cache_is_cc_switch_owned(cache) => {
-            read_json_file_if_exists(&backup_path)?.or_else(|| existing_cache.clone())
-        }
-        _ => existing_cache,
-    };
-    let official_models = official_cache
-        .as_ref()
-        .and_then(|cache| cache.get("models"))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+    let official_models = codex_official_models_cache().unwrap_or_default();
 
     let mut enriched = catalog.clone();
     if let Some(object) = enriched.as_object_mut() {
         object.insert(
             "models".to_string(),
-            Value::Array(merge_codex_models(official_models, routed_models)),
+            Value::Array(merge_codex_models(&official_models, routed_models)),
         );
     }
     Ok(enriched)
@@ -2727,7 +6455,20 @@ fn enrich_codex_catalog_with_official_metadata(catalog: &Value) -> Result<Value,
 ///
 /// 这个函数解决运行中的 Codex 热切到 custom MultiRouter 后候选模型不刷新的问题：
 /// custom provider 不会主动请求 `/models`，但会接受 fresh `models_cache.json`。
+#[cfg(test)]
 fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(), AppError> {
+    let mut attempt = CodexProjectionSideEffectsAttempt::capture()?;
+    let result = sync_codex_models_cache_with_cc_switch_catalog_with_attempt(catalog, &mut attempt);
+    if result.is_err() {
+        let _ = attempt.restore_if_unchanged();
+    }
+    result
+}
+
+fn sync_codex_models_cache_with_cc_switch_catalog_with_attempt(
+    catalog: &Value,
+    side_effects: &mut CodexProjectionSideEffectsAttempt,
+) -> Result<(), AppError> {
     let Some(models) = catalog.get("models").and_then(|models| models.as_array()) else {
         return Ok(());
     };
@@ -2737,26 +6478,29 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
 
     let cache_path = get_codex_models_cache_path();
     let backup_path = get_codex_models_cache_backup_path();
-    let existing_cache = read_json_file_if_exists(&cache_path)?;
-    // 当前缓存若已被 CCSM 接管，必须从接管前备份读取官方同 slug 元数据；
-    // official-only 模型仍不能越过 routed catalog 边界重新进入选择器。
-    let official_cache = match existing_cache.as_ref() {
-        Some(cache) if codex_models_cache_is_cc_switch_owned(cache) => {
-            read_json_file_if_exists(&backup_path)?.or_else(|| existing_cache.clone())
-        }
-        _ => existing_cache.clone(),
-    };
-    let client_version = existing_cache
-        .as_ref()
-        .or(official_cache.as_ref())
-        .and_then(|cache| cache.get("client_version"))
-        .and_then(|version| version.as_str())
-        .map(ToString::to_string);
-
+    let existing_cache = side_effects
+        .read_bytes_if_unchanged(&cache_path)?
+        .map(|bytes| {
+            serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+                AppError::Message(format!(
+                    "解析 Codex models_cache.json 失败 ({}): {error}",
+                    cache_path.display()
+                ))
+            })
+        })
+        .transpose()?;
+    // 官方同 slug 元数据优先来自接管前 backup；backup 为空时使用 Codex 自带
+    // bundled 官方目录，因此新模型不会被旧缓存/空 backup 卡住。
+    let official_models = codex_official_models_cache().unwrap_or_default();
     // Codex 0.140+ 的 custom provider 不会主动请求 /models，只会读取新鲜 cache。
     // 因此这里复用已有 client_version 写入同格式 cache，让模型菜单立刻看到
     // cc-switch 生成的完整 catalog，同时用 etag 标记所有权便于恢复 official。
-    let Some(client_version) = client_version else {
+    let has_client_version = existing_cache
+        .as_ref()
+        .and_then(|cache| cache.get("client_version"))
+        .and_then(Value::as_str)
+        .is_some_and(|version| !version.trim().is_empty());
+    if !has_client_version {
         log::warn!(
             "skip Codex models_cache sync: existing cache has no client_version, path={}",
             cache_path.display()
@@ -2765,72 +6509,190 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
     };
 
     if let Some(cache) = existing_cache.as_ref() {
-        if !codex_models_cache_is_cc_switch_owned(cache) && !backup_path.exists() {
+        if codex_models_cache_is_cc_switch_owned(cache) {
+            let backup_models_empty = side_effects
+                .read_bytes_if_unchanged(&backup_path)?
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|backup| backup.get("models").cloned())
+                .and_then(|models| models.as_array().cloned())
+                .is_none_or(|models| models.is_empty());
+            if backup_models_empty && !official_models.is_empty() {
+                let mut restored = cache.clone();
+                restored["models"] = Value::Array(official_models.clone());
+                side_effects.write_json_if_unchanged(&backup_path, &restored)?;
+            }
+        } else if !backup_path.exists() {
             if let Some(parent) = backup_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
             }
-            fs::copy(&cache_path, &backup_path).map_err(|e| AppError::io(&backup_path, e))?;
+            let cache_bytes = side_effects
+                .read_bytes_if_unchanged(&cache_path)?
+                .ok_or_else(|| {
+                    AppError::io(
+                        &cache_path,
+                        std::io::Error::from(std::io::ErrorKind::NotFound),
+                    )
+                })?;
+            side_effects.write_bytes_if_unchanged(&backup_path, &cache_bytes)?;
         }
     }
 
-    let official_models = official_cache
-        .as_ref()
-        .and_then(|cache| cache.get("models"))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let merged_models = merge_codex_models(official_models, models);
-
-    // 以官方缓存对象为底稿还能保留新版 App 可能新增的顶层元数据；这里只覆盖
-    // CCSM 必须维护的刷新时间、所有权标记、客户端版本和合并后的模型数组。
-    let mut cache = official_cache.unwrap_or_else(|| json!({}));
-    if !cache.is_object() {
-        cache = json!({});
+    let mut merged_models = merge_codex_models(&official_models, models);
+    let routed_models_by_id = models
+        .iter()
+        .filter_map(|model| codex_model_stable_id(model).map(|model_id| (model_id, model)))
+        .collect::<HashMap<_, _>>();
+    for merged_model in &mut merged_models {
+        let Some(model_id) = codex_model_stable_id(merged_model) else {
+            continue;
+        };
+        let Some(routed_model) = routed_models_by_id.get(&model_id) else {
+            continue;
+        };
+        let Some(merged_object) = merged_model.as_object_mut() else {
+            continue;
+        };
+        // 普通 catalog enrichment 仍以同 slug 官方 transport 元数据为权威；
+        // 只有最终写入 CCSM-owned cache 时，才让当前用户选择的 V1/V2 投影
+        // 覆盖接管前备份，避免第二次合并重新带回过期协议。
+        for field in ["multi_agent_version", "multiAgentVersion"] {
+            if let Some(value) = routed_model.get(field).cloned() {
+                merged_object.insert(field.to_string(), value);
+            }
+        }
     }
-    let cache_object = cache
-        .as_object_mut()
-        .expect("cache was normalized to a JSON object");
-    cache_object.insert(
-        "fetched_at".to_string(),
-        Value::String(current_utc_rfc3339_nanos()),
+
+    // Re-read the cache for every optimistic attempt.  Codex Desktop and
+    // another CCSwitchMulti process may update unknown top-level metadata at
+    // any time; rebuilding from the first snapshot would erase those fields.
+    // The compare immediately before replacement makes the write conditional
+    // on the exact bytes we transformed.
+    const MAX_RETRIES: usize = 2;
+    for _attempt in 0..=MAX_RETRIES {
+        let before = ExactCodexSnapshot::read(&cache_path)?;
+        let mut cache = match before.bytes.as_deref() {
+            Some(bytes) => serde_json::from_slice::<Value>(bytes).map_err(|error| {
+                AppError::Message(format!(
+                    "解析 Codex models_cache.json 失败 ({}): {error}",
+                    cache_path.display()
+                ))
+            })?,
+            None => json!({}),
+        };
+        if !cache.is_object() {
+            cache = json!({});
+        }
+        let Some(client_version) = cache
+            .get("client_version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+            .map(ToString::to_string)
+        else {
+            log::warn!(
+                "skip Codex models_cache sync: latest cache has no client_version, path={}",
+                cache_path.display()
+            );
+            return Ok(());
+        };
+
+        // 以当前缓存对象为底稿还能保留新版 App 可能新增的顶层元数据；这里只覆盖
+        // CCSM 必须维护的刷新时间、所有权标记、客户端版本和合并后的模型数组。
+        let cache_object = cache
+            .as_object_mut()
+            .expect("cache was normalized to a JSON object");
+        cache_object.insert(
+            "fetched_at".to_string(),
+            Value::String(current_utc_rfc3339_nanos()),
+        );
+        cache_object.insert(
+            "etag".to_string(),
+            Value::String(CC_SWITCH_CODEX_MODELS_CACHE_ETAG.to_string()),
+        );
+        cache_object.insert("client_version".to_string(), Value::String(client_version));
+        cache_object.insert("models".to_string(), Value::Array(merged_models.clone()));
+
+        #[cfg(test)]
+        maybe_mutate_companion_before_write_for_test(&cache_path);
+        let observed = ExactCodexSnapshot::read(&cache_path)?;
+        if observed.fingerprint() != before.fingerprint() {
+            continue;
+        }
+        side_effects.write_json_if_unchanged(&cache_path, &cache)?;
+        return Ok(());
+    }
+
+    let error = concurrent_modification_deferred_error();
+    let mut outcome = crate::services::recovery_outcome::RecoveryOutcome::for_app(
+        crate::services::recovery_outcome::RecoveryOutcomeKind::ConcurrentModificationDeferred,
+        "codex",
     );
-    cache_object.insert(
-        "etag".to_string(),
-        Value::String(CC_SWITCH_CODEX_MODELS_CACHE_ETAG.to_string()),
-    );
-    cache_object.insert("client_version".to_string(), Value::String(client_version));
-    cache_object.insert("models".to_string(), Value::Array(merged_models));
-    write_json_file(&cache_path, &cache)
+    outcome.next_step = Some("retryCodexModelsCacheSync".to_string());
+    outcome.details = Some(error.to_string());
+    if let Err(record_error) = crate::services::recovery_outcome::record_recovery_outcome(outcome) {
+        log::warn!("保存 Codex models cache 并发写入延迟结果失败: {record_error}");
+    }
+    Err(error)
 }
 
 /// 在退出 MultiRouter 或清空模型目录时恢复 Codex 原始模型缓存。
-fn restore_codex_models_cache_if_cc_switch_owned() -> Result<(), AppError> {
+fn restore_codex_models_cache_if_cc_switch_owned_with_attempt(
+    side_effects: &mut CodexProjectionSideEffectsAttempt,
+) -> Result<(), AppError> {
     let cache_path = get_codex_models_cache_path();
     let backup_path = get_codex_models_cache_backup_path();
-    let Some(cache) = read_json_file_if_exists(&cache_path)? else {
+    let Some(cache_bytes) = side_effects.read_bytes_if_unchanged(&cache_path)? else {
         return Ok(());
     };
+    let cache: Value =
+        serde_json::from_slice(&cache_bytes).map_err(|error| AppError::json(&cache_path, error))?;
     if !codex_models_cache_is_cc_switch_owned(&cache) {
         return Ok(());
     }
 
-    if backup_path.exists() {
-        let backup = fs::read(&backup_path).map_err(|e| AppError::io(&backup_path, e))?;
-        atomic_write(&cache_path, &backup)?;
-        delete_file(&backup_path).ok();
+    if let Some(backup) = side_effects.read_bytes_if_unchanged(&backup_path)? {
+        side_effects.write_bytes_if_unchanged(&cache_path, &backup)?;
+        side_effects.delete_if_unchanged(&backup_path)?;
     } else {
-        delete_file(&cache_path).ok();
+        side_effects.delete_if_unchanged(&cache_path)?;
     }
     Ok(())
 }
 
 /// Generate Codex `model_catalog_json` from provider settings and inject/remove
 /// the top-level TOML field that points Codex to the generated file.
-pub fn prepare_codex_config_text_with_model_catalog(
+pub(crate) fn prepare_codex_config_text_with_model_catalog_without_provider_context(
     settings: &Value,
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Result<String, AppError> {
+    prepare_codex_config_text_with_model_catalog_impl(settings, config_text, profile, None)
+}
+
+fn prepare_codex_config_text_with_model_catalog_impl(
+    settings: &Value,
+    config_text: &str,
+    profile: CodexCatalogToolProfile,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<String, AppError> {
+    let plan = build_codex_projection_plan(settings, config_text, profile, provider_context)?;
+    let mut side_effects = CodexProjectionSideEffectsAttempt::capture()?;
+    if let Err(error) = commit_codex_projection_plan(&plan, &mut side_effects) {
+        let _ = side_effects.restore_if_unchanged();
+        return Err(error);
+    }
+    Ok(plan.config_text)
+}
+
+/// Pure projection planning.  This function only reads the current inputs and
+/// returns target bytes; callers commit the companion files after the guarded
+/// `config.toml` write succeeds.
+pub(crate) fn build_codex_projection_plan(
+    settings: &Value,
+    config_text: &str,
+    profile: CodexCatalogToolProfile,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<CodexProjectionPlan, AppError> {
     let catalog_path = get_codex_model_catalog_path();
     let specs = codex_catalog_model_specs(settings, config_text);
 
@@ -2838,6 +6700,15 @@ pub fn prepare_codex_config_text_with_model_catalog(
         let generated_catalog = codex_model_catalog_from_settings(settings, config_text, profile)?
             .unwrap_or_else(|| json!({ "models": [] }));
         let mut catalog = enrich_codex_catalog_with_official_metadata(&generated_catalog)?;
+        if let Some(fingerprint) = settings
+            .pointer("/codexRoutingProjection/dependencyFingerprint")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|fingerprint| !fingerprint.is_empty())
+        {
+            catalog["ccSwitchRoutingDependencyFingerprint"] =
+                Value::String(fingerprint.to_string());
+        }
         apply_codex_multi_agent_transport_policy(&mut catalog, settings);
         let config_text = set_codex_model_catalog_projection_fields(
             config_text,
@@ -2848,6 +6719,11 @@ pub fn prepare_codex_config_text_with_model_catalog(
         let mut doc = config_text
             .parse::<DocumentMut>()
             .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+        ensure_codex_multi_agent_reserved_schema_compatible(
+            &mut doc,
+            codex_subagent_version(settings),
+            codex_multi_router_requires_non_reserved_agent_namespace(settings),
+        );
         let config_text =
             if codex_multi_router_is_enabled(settings) || codex_document_uses_multi_router(&doc) {
                 remove_multi_router_context_overrides(&mut doc);
@@ -2863,22 +6739,547 @@ pub fn prepare_codex_config_text_with_model_catalog(
             CodexCatalogToolProfile::ProxyChat => false,
         };
         let config_text = set_codex_native_web_search_field(&config_text, disable_web_search)?;
-        write_json_file(&catalog_path, &catalog)?;
-        sync_codex_models_cache_with_cc_switch_catalog(&catalog)?;
-        sync_codex_managed_agent_files(&specs)?;
-        Ok(config_text)
+        let config_text = project_codex_subagent_v2_parent_instructions(
+            settings,
+            &config_text,
+            &specs,
+            codex_subagent_version(settings),
+            provider_context,
+        )?;
+        Ok(CodexProjectionPlan {
+            config_text,
+            catalog: Some(catalog),
+            specs,
+            version: codex_subagent_version(settings),
+            settings: settings.clone(),
+            provider_context: provider_context.cloned(),
+        })
     } else {
-        restore_codex_models_cache_if_cc_switch_owned()?;
-        prune_stale_codex_managed_agent_files(&get_codex_agents_dir(), &HashSet::new())?;
         let config_text = set_codex_model_catalog_projection_fields(config_text, None, None, None)?;
-        set_codex_native_web_search_field(
+        let config_text = set_codex_native_web_search_field(
             &config_text,
             profile == CodexCatalogToolProfile::Anthropic,
-        )
+        )?;
+        let config_text = project_codex_subagent_v2_parent_instructions(
+            settings,
+            &config_text,
+            &[],
+            codex_subagent_version(settings),
+            provider_context,
+        )?;
+        Ok(CodexProjectionPlan {
+            config_text,
+            catalog: None,
+            specs,
+            version: codex_subagent_version(settings),
+            settings: settings.clone(),
+            provider_context: provider_context.cloned(),
+        })
     }
 }
 
-/// Reverse of `prepare_codex_config_text_with_model_catalog`: read the
+#[derive(Debug, Clone)]
+pub(crate) struct CodexProjectionPlan {
+    pub(crate) config_text: String,
+    catalog: Option<Value>,
+    specs: Vec<CodexCatalogModelSpec>,
+    version: CodexSubagentVersion,
+    settings: Value,
+    provider_context: Option<ProviderClassificationContext>,
+}
+
+fn commit_codex_projection_plan(
+    plan: &CodexProjectionPlan,
+    side_effects: &mut CodexProjectionSideEffectsAttempt,
+) -> Result<(), AppError> {
+    if let Some(catalog) = &plan.catalog {
+        side_effects.write_json_if_unchanged(&get_codex_model_catalog_path(), catalog)?;
+        sync_codex_models_cache_with_cc_switch_catalog_with_attempt(catalog, side_effects)?;
+        sync_codex_managed_agent_files_with_settings_with_attempt(
+            &plan.specs,
+            plan.version,
+            &plan.settings,
+            plan.provider_context.as_ref(),
+            side_effects,
+        )?;
+    } else {
+        restore_codex_models_cache_if_cc_switch_owned_with_attempt(side_effects)?;
+        prune_stale_codex_managed_agent_files_with_attempt(
+            &get_codex_agents_dir(),
+            &HashSet::new(),
+            side_effects,
+        )?;
+    }
+    Ok(())
+}
+
+/// Commit a projection plan only after the live config reconcile succeeds.
+///
+/// The builder is rerun for every current-live retry.  Companion files are
+/// therefore derived from the same winning attempt as `config.toml`, and a
+/// partial companion commit can be compensated only while each file still has
+/// this attempt's after-fingerprint.
+#[derive(Debug, Clone)]
+pub(crate) struct CodexProjectionCommitReceipt {
+    pub(crate) config_attempt: CommittedCodexAttempt,
+    pub(crate) companion_attempt: CodexProjectionSideEffectsAttempt,
+}
+
+pub(crate) fn write_codex_projection_plan_reconciled<F>(
+    config_path: &Path,
+    mut build: F,
+) -> Result<CodexProjectionCommitReceipt, AppError>
+where
+    F: FnMut(&str) -> Result<CodexProjectionPlan, AppError>,
+{
+    // Capture every companion before the guarded config write.  The config
+    // attempt may succeed while a later catalog/cache/agent write fails; in
+    // that case rollback is allowed to restore only bytes that this attempt
+    // still owns.  Capturing after the config write would lose the original
+    // snapshot and could restore a user's concurrent edit.
+    let mut side_effects = CodexProjectionSideEffectsAttempt::capture()?;
+    let latest_plan = std::cell::RefCell::new(None::<CodexProjectionPlan>);
+    let config_attempt = write_codex_live_config_reconcile_with_attempt(config_path, |live| {
+        let plan = build(live)?;
+        let config_text = plan.config_text.clone();
+        *latest_plan.borrow_mut() = Some(plan);
+        #[cfg(test)]
+        maybe_mutate_codex_config_after_transform_for_test(config_path);
+        Ok(config_text)
+    })?;
+
+    #[cfg(test)]
+    maybe_mutate_companion_after_config_commit_for_test();
+
+    let plan = latest_plan
+        .into_inner()
+        .ok_or_else(|| AppError::Message("Codex projection plan was not produced".to_string()))?;
+    if let Err(error) = commit_codex_projection_plan(&plan, &mut side_effects) {
+        let restore_error = side_effects.restore_if_unchanged().err();
+        let config_restored = config_attempt
+            .restore_if_unchanged(config_path)
+            .unwrap_or(false);
+        if let Some(restore_error) = restore_error {
+            log::warn!("回滚 Codex projection 副作用失败: {restore_error}");
+        }
+        if !config_restored {
+            log::warn!(
+                "Codex projection 副作用提交失败后 config.toml 已发生外部变化，延迟全文回滚"
+            );
+        }
+        return Err(error);
+    }
+    Ok(CodexProjectionCommitReceipt {
+        config_attempt,
+        companion_attempt: side_effects,
+    })
+}
+
+/// Side effects produced while preparing a MultiRouter projection.  The
+/// config writer may defer after a concurrent live-file change, in which case
+/// these generated files must not claim a projection that never reached
+/// `config.toml`.
+#[derive(Debug, Clone)]
+struct AttemptOwnedFile {
+    path: PathBuf,
+    before: ExactCodexSnapshot,
+    after_fingerprint: Option<CodexConfigFingerprint>,
+    committed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodexProjectionSideEffectsAttempt {
+    files: Vec<AttemptOwnedFile>,
+}
+
+/// Snapshot of every Codex projection companion that existed at one switch
+/// boundary.  Unlike a plain `CodexProjectionSideEffectsAttempt`, this type is
+/// intentionally a before/after boundary: a provider switch can touch a
+/// catalog, cache, backup, or managed agent through a proxy helper that does
+/// not expose its inner writer receipt.  Force-repair uses the pair to restore
+/// only bytes that still equal the switch attempt's final snapshot.
+#[derive(Debug, Clone)]
+pub(crate) struct CodexProjectionSnapshot {
+    files: Vec<(PathBuf, ExactCodexSnapshot)>,
+}
+
+impl CodexProjectionSnapshot {
+    pub(crate) fn capture() -> Result<Self, AppError> {
+        let attempt = CodexProjectionSideEffectsAttempt::capture()?;
+        Ok(Self {
+            files: attempt
+                .files
+                .into_iter()
+                .map(|file| (file.path, file.before))
+                .collect(),
+        })
+    }
+
+    pub(crate) fn restore_if_unchanged(&self, after: &Self) -> Result<bool, AppError> {
+        let mut restored_all = true;
+        let mut paths = self
+            .files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        paths.extend(after.files.iter().map(|(path, _)| path.clone()));
+
+        for path in paths {
+            let before = self
+                .files
+                .iter()
+                .find(|(candidate, _)| candidate == &path)
+                .map(|(_, snapshot)| snapshot);
+            let after = after
+                .files
+                .iter()
+                .find(|(candidate, _)| candidate == &path)
+                .map(|(_, snapshot)| snapshot);
+            let Some(after) = after else {
+                restored_all = false;
+                continue;
+            };
+            let current = ExactCodexSnapshot::read(&path)?;
+            if current.fingerprint() != after.fingerprint() {
+                restored_all = false;
+                log::warn!(
+                    "跳过恢复被外部修改的 Codex switch projection 文件: {}",
+                    path.display()
+                );
+                continue;
+            }
+            match before.and_then(|snapshot| snapshot.bytes.as_deref()) {
+                Some(bytes) => atomic_write(&path, bytes)?,
+                None => delete_file(&path)?,
+            }
+        }
+        Ok(restored_all)
+    }
+
+    pub(crate) fn overlay_attempt_after(
+        &self,
+        attempts: &[&CodexProjectionSideEffectsAttempt],
+    ) -> Self {
+        let mut files = self.files.clone();
+        for attempt in attempts {
+            for (path, snapshot) in attempt.after_snapshot().files {
+                if let Some((_, existing)) =
+                    files.iter_mut().find(|(candidate, _)| candidate == &path)
+                {
+                    *existing = snapshot;
+                } else {
+                    files.push((path, snapshot));
+                }
+            }
+        }
+        Self { files }
+    }
+}
+
+impl CodexProjectionSideEffectsAttempt {
+    pub(crate) fn capture() -> Result<Self, AppError> {
+        let paths = [
+            get_codex_model_catalog_path(),
+            get_codex_models_cache_path(),
+            get_codex_models_cache_backup_path(),
+        ];
+        let mut files = paths
+            .into_iter()
+            .map(|path| {
+                // A malformed path (for example a directory where Codex
+                // expects `cc-switch-model-catalog.json`) must reach the
+                // actual projection write so callers report that write
+                // failure.  Snapshot capture itself is best-effort for such
+                // non-regular entries; there is no byte ownership to restore.
+                let before = match ExactCodexSnapshot::read(&path) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        log::warn!(
+                            "无法读取 Codex projection companion，继续让提交阶段报告错误: {}: {error}",
+                            path.display()
+                        );
+                        ExactCodexSnapshot {
+                            bytes: None,
+                            fingerprint: None,
+                        }
+                    }
+                };
+                Ok(AttemptOwnedFile {
+                    path,
+                    before,
+                    after_fingerprint: None,
+                    committed: false,
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let agents_dir = get_codex_agents_dir();
+        if agents_dir.exists() {
+            fs::read_dir(&agents_dir)
+                .map_err(|error| AppError::io(&agents_dir, error))?
+                .map(|entry| {
+                    let entry = entry.map_err(|error| AppError::io(&agents_dir, error))?;
+                    let path = entry.path();
+                    // User-authored role files participate in name collision checks, but they
+                    // are never projection side effects.  Capturing them here would let a
+                    // failed reconcile write an old user snapshot over a concurrent edit.
+                    if !path.is_file() || !codex_agent_file_is_cc_switch_managed(&path) {
+                        return Ok(None);
+                    }
+                    let before = ExactCodexSnapshot::read(&path)?;
+                    Ok(Some(AttemptOwnedFile {
+                        path,
+                        before,
+                        after_fingerprint: None,
+                        committed: false,
+                    }))
+                })
+                .collect::<Result<Vec<_>, AppError>>()?
+                .into_iter()
+                .flatten()
+                .for_each(|file| files.push(file));
+        }
+        Ok(Self { files })
+    }
+
+    fn capture_path_for_managed_write(&mut self, path: &Path) -> Result<(), AppError> {
+        if self.files.iter().any(|file| file.path == path) {
+            return Ok(());
+        }
+        let before = ExactCodexSnapshot::read(path)?;
+        self.files.push(AttemptOwnedFile {
+            path: path.to_path_buf(),
+            before,
+            after_fingerprint: None,
+            committed: false,
+        });
+        Ok(())
+    }
+
+    fn expected_fingerprint(file: &AttemptOwnedFile) -> Option<CodexConfigFingerprint> {
+        file.after_fingerprint.or(file.before.fingerprint())
+    }
+
+    fn committed_after_fingerprint(file: &AttemptOwnedFile) -> Option<CodexConfigFingerprint> {
+        if file.committed {
+            file.after_fingerprint
+        } else {
+            file.before.fingerprint()
+        }
+    }
+
+    /// Mark captured files that this operation did not touch as its
+    /// after-state.  Config-only writers still need a complete typed receipt;
+    /// using the before fingerprint here records an intentional no-op instead
+    /// of leaving the after fingerprint as `None` (which would incorrectly
+    /// look like a deletion during rollback).
+    pub(crate) fn mark_unmodified_as_after(&mut self) {
+        for file in &mut self.files {
+            if file.after_fingerprint.is_none() {
+                file.after_fingerprint = file.before.fingerprint();
+            }
+        }
+    }
+
+    /// Build a lightweight after snapshot from the fingerprints recorded by
+    /// this attempt.  The bytes are deliberately omitted: rollback only needs
+    /// the candidate fingerprint to prove ownership, while the before bytes
+    /// remain in the outer switch snapshot.
+    pub(crate) fn after_snapshot(&self) -> CodexProjectionSnapshot {
+        CodexProjectionSnapshot {
+            files: self
+                .files
+                .iter()
+                .map(|file| {
+                    (
+                        file.path.clone(),
+                        ExactCodexSnapshot::from_fingerprint(Self::committed_after_fingerprint(
+                            file,
+                        )),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn read_bytes_if_unchanged(&self, path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+        let file = self
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                AppError::Message(format!(
+                    "Codex projection path was not captured before read: {}",
+                    path.display()
+                ))
+            })?;
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != Self::expected_fingerprint(file) {
+            return Err(concurrent_modification_deferred_error());
+        }
+        Ok(current.bytes)
+    }
+
+    fn write_bytes_if_unchanged(&mut self, path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+        let file = self
+            .files
+            .iter_mut()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                AppError::Message(format!(
+                    "Codex projection path was not captured before commit: {}",
+                    path.display()
+                ))
+            })?;
+        #[cfg(test)]
+        maybe_mutate_companion_before_write_for_test(path);
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != Self::expected_fingerprint(file) {
+            return Err(concurrent_modification_deferred_error());
+        }
+        atomic_write(path, bytes)?;
+        file.after_fingerprint = Some(codex_bytes_fingerprint(bytes));
+        file.committed = true;
+        Ok(())
+    }
+
+    fn write_text_if_unchanged(&mut self, path: &Path, text: &str) -> Result<(), AppError> {
+        self.write_bytes_if_unchanged(path, text.as_bytes())
+    }
+
+    fn write_json_if_unchanged<T: Serialize>(
+        &mut self,
+        path: &Path,
+        value: &T,
+    ) -> Result<(), AppError> {
+        let bytes = serialize_json_file_contents(value)?;
+        self.write_bytes_if_unchanged(path, &bytes)
+    }
+
+    fn delete_if_unchanged(&mut self, path: &Path) -> Result<(), AppError> {
+        let file = self
+            .files
+            .iter_mut()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                AppError::Message(format!(
+                    "Codex projection path was not captured before delete: {}",
+                    path.display()
+                ))
+            })?;
+        #[cfg(test)]
+        maybe_mutate_companion_before_write_for_test(path);
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != Self::expected_fingerprint(file) {
+            return Err(concurrent_modification_deferred_error());
+        }
+        delete_file(path)?;
+        file.after_fingerprint = None;
+        file.committed = true;
+        Ok(())
+    }
+
+    pub(crate) fn restore_if_unchanged(&self) -> Result<bool, AppError> {
+        let mut restored_all = true;
+        for file in &self.files {
+            let current = ExactCodexSnapshot::read(&file.path)?;
+            if current.fingerprint() != file.after_fingerprint {
+                restored_all = false;
+                log::warn!(
+                    "跳过恢复被外部修改的 Codex projection 文件: {}",
+                    file.path.display()
+                );
+                continue;
+            }
+            match &file.before.bytes {
+                Some(bytes) => atomic_write(&file.path, bytes)?,
+                None => delete_file(&file.path)?,
+            }
+        }
+        Ok(restored_all)
+    }
+}
+
+/// Publish a schema-v2 MultiRouter catalog/config/cache projection and prove the atomic files can
+/// be read back. The caller persists `projection_pending` when this function or its proof fails;
+/// Provider/route declarations remain the database truth throughout.
+pub(crate) fn publish_codex_multirouter_projection(
+    projection_settings: &Value,
+) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, AppError> {
+    let _expected_fingerprint = projection_settings
+        .pointer("/codexRoutingProjection/dependencyFingerprint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .ok_or_else(|| {
+            AppError::Message(
+                "Codex MultiRouter projection dependency fingerprint is missing".to_string(),
+            )
+        })?;
+    let config_path = get_codex_config_path();
+    write_codex_projection_plan_reconciled(&config_path, |live_config| {
+        build_codex_projection_plan(
+            projection_settings,
+            live_config,
+            CodexCatalogToolProfile::NativeResponses,
+            None,
+        )
+    })?;
+
+    read_back_codex_multirouter_projection(projection_settings)
+}
+
+pub(crate) fn read_back_codex_multirouter_projection(
+    projection_settings: &Value,
+) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, AppError> {
+    let expected_fingerprint = projection_settings
+        .pointer("/codexRoutingProjection/dependencyFingerprint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .ok_or_else(|| {
+            AppError::Message(
+                "Codex MultiRouter projection dependency fingerprint is missing".to_string(),
+            )
+        })?;
+
+    let catalog: Value = read_json_file(&get_codex_model_catalog_path())?;
+    let read_fingerprint = catalog
+        .get("ccSwitchRoutingDependencyFingerprint")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let catalog_verified = read_fingerprint == expected_fingerprint;
+    let live_after = read_codex_config_text()?;
+    let config_verified = live_after
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|document| {
+            document
+                .get("model_catalog_json")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .is_some_and(|path| {
+            Path::new(&path) == get_codex_model_catalog_path()
+                || codex_model_catalog_path_is_cc_switch_owned(&path)
+        });
+    let cache_verified = read_json_file_if_exists(&get_codex_models_cache_path())?
+        .as_ref()
+        .is_some_and(codex_models_cache_is_cc_switch_owned);
+    let agent_files_verified = verify_codex_subagent_role_files(projection_settings, None)?
+        .iter()
+        .all(|file| file.exists && file.content_matches);
+
+    Ok(crate::codex_multirouter::projection::ProjectionReadBack {
+        dependency_fingerprint: read_fingerprint,
+        catalog_verified,
+        config_verified,
+        cache_verified,
+        agent_files_verified,
+    })
+}
+
+/// Reverse of the model-catalog prepare pipeline: read the
 /// cc-switch–maintained catalog file referenced by `~/.codex/config.toml` and
 /// convert it back into the simplified shape the frontend table uses:
 /// `{ "models": [{ "model", "displayName"?, "contextWindow"?, hidden overrides... }, ...] }`.
@@ -2900,17 +7301,28 @@ pub fn prepare_codex_config_text_with_model_catalog(
 /// All failure modes (missing file, parse error, no `model_catalog_json`,
 /// entries without `slug`) collapse to `Ok(None)` so callers can treat this
 /// as best-effort enrichment without making `read_live_settings` brittle.
+/// 模型目录文件读取上限（32 MiB）。目录 JSON 正常只有几百 KiB；超过则视为异常，
+/// 避免指向外部大文件时耗尽内存。
+const MAX_CODEX_CATALOG_BYTES: u64 = 32 * 1024 * 1024;
+
 pub fn read_codex_model_catalog_simplified_from_live() -> Result<Option<Value>, AppError> {
     let config_text = read_codex_config_text()?;
-    let generated_path = get_codex_model_catalog_path();
-    let Some(catalog_path) = resolve_cc_switch_catalog_path(&config_text, &generated_path) else {
+    let config_dir = get_codex_config_dir();
+    let Some(catalog_path) = resolve_cc_switch_catalog_path(&config_text, &config_dir) else {
         return Ok(None);
     };
     if !catalog_path.exists() {
         return Ok(None);
     }
-    let Ok(catalog_text) = fs::read_to_string(&catalog_path) else {
-        return Ok(None);
+    let catalog_text = match read_limited_string(&catalog_path, MAX_CODEX_CATALOG_BYTES) {
+        Ok(text) => text,
+        Err(error) => {
+            log::warn!(
+                "拒绝读取越界或过大的 Codex 模型目录 {}: {error}",
+                catalog_path.display()
+            );
+            return Ok(None);
+        }
     };
     Ok(build_simplified_catalog_from_texts(
         &config_text,
@@ -2918,12 +7330,31 @@ pub fn read_codex_model_catalog_simplified_from_live() -> Result<Option<Value>, 
     ))
 }
 
+/// 安全地读取文件为字符串，并在超过字节上限时返回错误。
+pub(crate) fn read_limited_string(path: &Path, max_bytes: u64) -> Result<String, AppError> {
+    let metadata = fs::metadata(path).map_err(|error| AppError::io(path, error))?;
+    if metadata.len() > max_bytes {
+        return Err(AppError::Config(format!(
+            "文件 {} 超过大小上限 {} 字节",
+            path.display(),
+            max_bytes
+        )));
+    }
+    fs::read_to_string(path).map_err(|error| AppError::io(path, error))
+}
+
+/// Read the cc-switch Codex model catalog file with a size cap.
+pub(crate) fn read_codex_model_catalog_text(path: &Path) -> Result<String, AppError> {
+    read_limited_string(path, MAX_CODEX_CATALOG_BYTES)
+}
+
 /// Given `config.toml` text, resolve the on-disk path of the cc-switch–owned
 /// catalog file (returns `None` if `model_catalog_json` is absent or points at
-/// a file we don't own). Relative paths fall back to `generated_path`.
+/// a file we don't own). Relative paths are resolved under `base_dir`;
+/// absolute paths must still be inside `base_dir`.
 pub(crate) fn resolve_cc_switch_catalog_path(
     config_text: &str,
-    generated_path: &Path,
+    base_dir: &Path,
 ) -> Option<PathBuf> {
     if config_text.trim().is_empty() {
         return None;
@@ -2942,11 +7373,59 @@ pub(crate) fn resolve_cc_switch_catalog_path(
         return None;
     }
 
-    if referenced_path.is_absolute() {
-        Some(referenced_path.to_path_buf())
+    // 注意（有意的行为变更）：Windows 上 `/…` 形式的旧 WSL 风格 Linux 路径也会
+    // 被视为绝对路径，从而在下方的包含性校验中失败——此前这类路径会因无法匹配
+    // 生成文件名而回退为按文件名解析、碰巧能工作。可接受：下一次切换供应商时
+    // 写入侧会重新落一个裸文件名，配置自愈（见
+    // `set_catalog_json_none_removes_cc_switch_owned_by_filename` 的场景注释）。
+    let is_unix_absolute = catalog_path_str.starts_with('/');
+    let resolved = if referenced_path.is_absolute() || is_unix_absolute {
+        referenced_path.to_path_buf()
     } else {
-        Some(generated_path.to_path_buf())
+        base_dir.join(referenced_path)
+    };
+
+    if !path_is_within(base_dir, &resolved) {
+        log::warn!(
+            "Codex model_catalog_json 指向配置目录外: {}（允许目录: {}）",
+            resolved.display(),
+            base_dir.display()
+        );
+        return None;
     }
+
+    // 词法包含不等于运行时包含：配置目录内的符号链接（如 ~/.codex/link ->
+    // /etc）能让 `link/cc-switch-model-catalog.json` 通过上面的检查，读取却
+    // 落到目录外。文件存在时把真实路径 canonicalize 出来再校验一次，并把
+    // canonical 路径返回给调用方——后续读取不再经过 symlink 组件。
+    if resolved.exists() {
+        let canonical = match fs::canonicalize(&resolved) {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!(
+                    "Codex model_catalog_json canonicalize 失败: {}: {error}",
+                    resolved.display()
+                );
+                return None;
+            }
+        };
+        // base 同样 canonicalize，保证两侧前缀一致（Windows \\?\、
+        // macOS /tmp -> /private/tmp）；base 失败时退回词法 base——
+        // 词法 base 与 canonical 路径比较只会误拒（退化为不读），不会误放。
+        let canonical_base = fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
+        if !path_is_within(&canonical_base, &canonical) {
+            log::warn!(
+                "Codex model_catalog_json 经符号链接解析到配置目录外: {} -> {}（允许目录: {}）",
+                resolved.display(),
+                canonical.display(),
+                canonical_base.display()
+            );
+            return None;
+        }
+        return Some(canonical);
+    }
+
+    Some(resolved)
 }
 
 /// Pure reverse-parsing core: convert Codex catalog JSON text back into the
@@ -3036,20 +7515,22 @@ fn build_simplified_catalog_from_texts(config_text: &str, catalog_text: &str) ->
 ///   (inline DB SSOT) }`. Here the pointer/catalog file must be (re)generated
 ///   from the inline `modelCatalog`, or the mapping is lost on restore.
 ///
-/// Gating on the presence of the inline `modelCatalog` key routes each shape
-/// correctly; an empty inline catalog still projects (and so correctly drops a
-/// now-stale pointer), while an absent key leaves the text untouched. This is
-/// **orthogonal to auth** — a provider-rebuilt backup can pair an inline
-/// `modelCatalog` with empty `auth.json` (the API key living in the config's
-/// `experimental_bearer_token`), so the caller must decide config projection
-/// independently of whether it writes or deletes `auth.json`.
-pub fn prepare_codex_live_config_text_with_optional_catalog(
+/// Prepare a deleted-provider backup when its target Provider record can no longer be loaded.
+///
+/// This boundary is intentionally narrow: classification can only use the route's inline auth,
+/// and any target Provider id therefore emits the controlled inline-fallback warning. Ordinary
+/// activation/takeover paths use the context-aware projection writer directly.
+pub(crate) fn prepare_codex_live_config_text_for_verbatim_restore_without_provider_context(
     settings: &Value,
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Result<String, AppError> {
     if settings.get("modelCatalog").is_some() {
-        prepare_codex_config_text_with_model_catalog(settings, config_text, profile)
+        prepare_codex_config_text_with_model_catalog_without_provider_context(
+            settings,
+            config_text,
+            profile,
+        )
     } else {
         Ok(config_text.to_string())
     }
@@ -3356,9 +7837,13 @@ pub fn remove_codex_multirouter_proxy_route(config_text: &str) -> Result<String,
 
 /// 将当前 `config.toml` 原子切回 Codex 内建 `openai` provider。
 pub fn force_codex_builtin_openai_live_provider() -> Result<(), AppError> {
-    let live = read_codex_config_text()?;
-    let config = force_builtin_openai_provider_in_config_text(&live)?;
-    write_codex_live_config_atomic(Some(&config))
+    let config_path = get_codex_config_path();
+    write_codex_live_config_reconcile(&config_path, |live_config| {
+        let config = force_builtin_openai_provider_in_config_text(live_config)?;
+        #[cfg(test)]
+        maybe_mutate_codex_config_after_transform_for_test(&config_path);
+        Ok(config)
+    })
 }
 
 /// 将待切换 provider 的 Codex 配置叠加到当前 live `config.toml`。
@@ -3372,12 +7857,21 @@ pub(crate) fn merge_codex_provider_config_texts(
     live_config_text: &str,
     provider_config_text: &str,
 ) -> Result<String, AppError> {
+    let live_config_text = normalize_codex_config_text_for_live_read(live_config_text)?;
+    let provider_config_text = normalize_codex_config_text_for_live_read(provider_config_text)?;
+
     if provider_config_text.trim().is_empty() {
-        return strip_codex_provider_owned_fields_from_live(live_config_text);
+        let merged = strip_codex_provider_owned_fields_from_live(&live_config_text)?;
+        #[cfg(test)]
+        maybe_mutate_codex_config_after_provider_merge_for_test(&get_codex_config_path());
+        return Ok(merged);
     }
 
     if live_config_text.trim().is_empty() {
-        return Ok(provider_config_text.to_string());
+        let merged = provider_config_text.to_string();
+        #[cfg(test)]
+        maybe_mutate_codex_config_after_provider_merge_for_test(&get_codex_config_path());
+        return Ok(merged);
     }
 
     let mut live_doc = live_config_text
@@ -3440,26 +7934,168 @@ pub(crate) fn merge_codex_provider_config_texts(
         }
     }
 
-    Ok(live_doc.to_string())
+    let merged = live_doc.to_string();
+    #[cfg(test)]
+    maybe_mutate_codex_config_after_provider_merge_for_test(&get_codex_config_path());
+    Ok(merged)
 }
 
-/// 读取当前 live 配置，并把 provider 配置叠加进去。
-pub(crate) fn merge_codex_provider_config_with_live(config_text: &str) -> Result<String, AppError> {
-    let live_config = read_codex_config_text()?;
-    merge_codex_provider_config_texts(&live_config, config_text)
+pub(crate) fn strip_codex_provider_mcp_tables(config_text: &str) -> Result<String, AppError> {
+    if config_text.trim().is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut doc = config_text.parse::<DocumentMut>().map_err(|error| {
+        AppError::Message(format!("Invalid provider Codex config.toml: {error}"))
+    })?;
+    doc.as_table_mut().remove("mcp_servers");
+    if let Some(mcp) = doc.get_mut("mcp").and_then(Item::as_table_like_mut) {
+        mcp.remove("servers");
+        if mcp.is_empty() {
+            doc.as_table_mut().remove("mcp");
+        }
+    }
+    Ok(doc.to_string())
 }
 
-pub fn write_codex_provider_live_with_catalog(
+#[derive(Debug, Clone)]
+pub(crate) struct CodexProviderWriteReceipt {
+    pub(crate) projection: CodexProjectionCommitReceipt,
+    pub(crate) auth_attempt: Option<CodexAuthWriteAttempt>,
+}
+
+pub(crate) fn write_codex_provider_live_with_catalog_and_provider_context_with_receipt(
     settings: &Value,
     category: Option<&str>,
     auth: &Value,
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
+    provider_context: &ProviderClassificationContext,
+) -> Result<CodexProviderWriteReceipt, AppError> {
+    let config_text = config_text.ok_or_else(missing_codex_live_config_error)?;
+    let should_write_auth = category == Some("official")
+        && codex_auth_has_login_material(auth)
+        && !should_preserve_live_codex_oauth_for_official_switch(auth);
+    let auth_path = get_codex_auth_path();
+    let auth_attempt = if should_write_auth {
+        Some(CodexAuthWriteAttempt::capture_and_write(&auth_path, auth)?)
+    } else {
+        None
+    };
+
+    let result = write_codex_projection_plan_reconciled(&get_codex_config_path(), |live_config| {
+        // Start from the newest live bytes, then overlay only provider-owned
+        // fields.  This keeps user tables (including MCP) intact when Codex
+        // Desktop edits config.toml between the caller's read and commit.
+        // Merge first so a provider snapshot whose only content was a stale
+        // MCP table can still inherit the live document before its bearer
+        // token is applied.  The effective-settings builder has already
+        // stripped snapshot MCP tables; applying the token after the merge
+        // also handles an otherwise-empty provider config safely.
+        let merged =
+            merge_codex_provider_config_texts(live_config, config_text).map_err(|error| {
+                AppError::McpValidation(format!("解析当前 Codex config.toml 失败: {error}"))
+            })?;
+        let merged = prepare_codex_provider_live_config(auth, &merged)?;
+        let mut plan =
+            build_codex_projection_plan(settings, &merged, profile, Some(provider_context))?;
+        if category == Some("official") && crate::settings::unify_codex_session_history() {
+            plan.config_text = inject_codex_unified_session_bucket(&plan.config_text)?;
+        }
+        Ok(plan)
+    });
+
+    match result {
+        Ok(projection) => Ok(CodexProviderWriteReceipt {
+            projection,
+            auth_attempt,
+        }),
+        Err(error) => Err(restore_codex_auth_after_error(
+            error,
+            auth_attempt.as_ref(),
+            &auth_path,
+        )),
+    }
+}
+
+pub(crate) fn write_codex_provider_live_with_catalog_and_provider_context(
+    settings: &Value,
+    category: Option<&str>,
+    auth: &Value,
+    config_text: Option<&str>,
+    profile: CodexCatalogToolProfile,
+    provider_context: &ProviderClassificationContext,
 ) -> Result<(), AppError> {
-    let prepared_config = config_text
-        .map(|text| prepare_codex_config_text_with_model_catalog(settings, text, profile))
-        .transpose()?;
-    write_codex_live_for_provider(category, auth, prepared_config.as_deref())
+    write_codex_provider_live_with_catalog_and_provider_context_with_receipt(
+        settings,
+        category,
+        auth,
+        config_text,
+        profile,
+        provider_context,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn write_codex_provider_live_with_catalog_without_provider_context_with_receipt(
+    settings: &Value,
+    _category: Option<&str>,
+    auth: &Value,
+    config_text: Option<&str>,
+    profile: CodexCatalogToolProfile,
+) -> Result<CodexProviderWriteReceipt, AppError> {
+    let config_text = config_text.ok_or_else(missing_codex_live_config_error)?;
+    let projection =
+        write_codex_projection_plan_reconciled(&get_codex_config_path(), |live_config| {
+            let merged =
+                merge_codex_provider_config_texts(live_config, config_text).map_err(|error| {
+                    AppError::McpValidation(format!("解析当前 Codex config.toml 失败: {error}"))
+                })?;
+            let merged = prepare_codex_provider_live_config(auth, &merged)?;
+            build_codex_projection_plan(settings, &merged, profile, None)
+        })?;
+    Ok(CodexProviderWriteReceipt {
+        projection,
+        auth_attempt: None,
+    })
+}
+
+pub(crate) fn write_codex_snapshot_projection_without_provider_context_with_provider_receipt(
+    settings: &Value,
+    auth: Option<&Value>,
+    config_text: &str,
+    write_auth: bool,
+    profile: CodexCatalogToolProfile,
+) -> Result<CodexProviderWriteReceipt, AppError> {
+    let auth_path = get_codex_auth_path();
+    let auth_attempt = if write_auth {
+        auth.map(|value| CodexAuthWriteAttempt::capture_and_write(&auth_path, value))
+            .transpose()?
+    } else {
+        None
+    };
+    let result = write_codex_projection_plan_reconciled(&get_codex_config_path(), |live_config| {
+        let merged =
+            merge_codex_provider_config_texts(live_config, config_text).map_err(|error| {
+                AppError::McpValidation(format!("解析当前 Codex config.toml 失败: {error}"))
+            })?;
+        let merged = match auth {
+            Some(auth) => prepare_codex_provider_live_config(auth, &merged)?,
+            None => merged,
+        };
+        build_codex_projection_plan(settings, &merged, profile, None)
+    });
+    match result {
+        Ok(projection) => Ok(CodexProviderWriteReceipt {
+            projection,
+            auth_attempt,
+        }),
+        Err(error) => Err(restore_codex_auth_after_error(
+            error,
+            auth_attempt.as_ref(),
+            &auth_path,
+        )),
+    }
 }
 
 /// 只按 provider 配置刷新 Codex `config.toml`，显式保留当前 `auth.json`。
@@ -3468,30 +8104,39 @@ pub fn write_codex_provider_live_with_catalog(
 /// 才是当前用户真实登录态，而 DB 里的 official provider 可能只是早期导入的旧
 /// OAuth 快照。该函数仍会走 model catalog 投影、统一会话路由注入和 live 配置
 /// 合并，但最终只写 `config.toml`，避免把旧快照覆盖到 `auth.json`。
-pub fn write_codex_provider_config_only_with_catalog(
+pub(crate) fn write_codex_provider_config_only_with_catalog_and_provider_context_with_receipt(
     settings: &Value,
     category: Option<&str>,
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
-) -> Result<(), AppError> {
-    let prepared_config = config_text
-        .map(|text| prepare_codex_config_text_with_model_catalog(settings, text, profile))
-        .transpose()?;
-    let unified_official_config =
+    provider_context: &ProviderClassificationContext,
+) -> Result<CodexProjectionCommitReceipt, AppError> {
+    let Some(config_text) = config_text else {
+        // A config-only write is also used to leave local takeover.  This is
+        // an explicit cleanup operation: preserve the current live user tables
+        // while removing only provider-owned fields.  It is deliberately
+        // separate from `None` at the normal writer boundary, where `None`
+        // means the caller forgot the required provider payload.
+        let mut companions = CodexProjectionSideEffectsAttempt::capture()?;
+        let config_attempt = write_codex_live_config_reconcile_with_attempt(
+            &get_codex_config_path(),
+            |live_config| strip_codex_provider_owned_fields_from_live(live_config),
+        )?;
+        companions.mark_unmodified_as_after();
+        return Ok(CodexProjectionCommitReceipt {
+            config_attempt,
+            companion_attempt: companions,
+        });
+    };
+    write_codex_projection_plan_reconciled(&get_codex_config_path(), |live_config| {
+        let merged = merge_codex_provider_config_texts(live_config, config_text)?;
+        let mut plan =
+            build_codex_projection_plan(settings, &merged, profile, Some(provider_context))?;
         if category == Some("official") && crate::settings::unify_codex_session_history() {
-            Some(inject_codex_unified_session_bucket(
-                prepared_config.as_deref().unwrap_or(""),
-            )?)
-        } else {
-            None
-        };
-    let config_text = unified_official_config
-        .as_deref()
-        .or(prepared_config.as_deref())
-        .unwrap_or("");
-    let merged_config = merge_codex_provider_config_with_live(config_text)?;
-
-    write_codex_live_config_atomic(Some(&merged_config))
+            plan.config_text = inject_codex_unified_session_bucket(&plan.config_text)?;
+        }
+        Ok(plan)
+    })
 }
 
 /// Extract a provider-scoped `experimental_bearer_token` from Codex `config.toml`.
@@ -3703,6 +8348,14 @@ pub fn apply_codex_official_proxy_route(
     config_text: &str,
     proxy_base_url: &str,
 ) -> Result<String, AppError> {
+    apply_codex_official_proxy_route_with_system_proxy_policy(config_text, proxy_base_url, true)
+}
+
+pub fn apply_codex_official_proxy_route_with_system_proxy_policy(
+    config_text: &str,
+    proxy_base_url: &str,
+    respect_system_proxy: bool,
+) -> Result<String, AppError> {
     let mut doc = config_text
         .parse::<DocumentMut>()
         .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
@@ -3737,7 +8390,36 @@ pub fn apply_codex_official_proxy_route(
         toml_edit::Item::Table(table),
     );
     doc["model_providers"] = toml_edit::Item::Table(providers);
+    set_codex_respect_system_proxy(&mut doc, respect_system_proxy)?;
     Ok(doc.to_string())
+}
+
+/// During CCSM takeover Codex must resolve the host's proxy policy itself.
+/// This keeps requests to the local CCSM listener direct while allowing CCSM
+/// to use its configured upstream proxy for internet egress.
+pub fn ensure_codex_respect_system_proxy(doc: &mut DocumentMut) -> Result<(), AppError> {
+    set_codex_respect_system_proxy(doc, true)
+}
+
+pub fn set_codex_respect_system_proxy(
+    doc: &mut DocumentMut,
+    enabled: bool,
+) -> Result<(), AppError> {
+    if doc.get("features").is_none() {
+        doc["features"] = toml_edit::table();
+    }
+    let features = doc
+        .get_mut("features")
+        .and_then(|item| item.as_table_mut())
+        .ok_or_else(|| {
+            AppError::Message("Invalid Codex config.toml: features must be a table".to_string())
+        })?;
+    if enabled {
+        features["respect_system_proxy"] = toml_edit::value(true);
+    } else {
+        features.remove("respect_system_proxy");
+    }
+    Ok(())
 }
 
 /// Whether a live Codex config is the official route projected by CC Switch.
@@ -4014,29 +8696,22 @@ pub fn write_codex_live_for_provider(
     auth: &Value,
     config_text: Option<&str>,
 ) -> Result<(), AppError> {
+    let config_text = config_text.ok_or_else(missing_codex_live_config_error)?;
     let unified_official_config =
         if category == Some("official") && crate::settings::unify_codex_session_history() {
-            Some(inject_codex_unified_session_bucket(
-                config_text.unwrap_or(""),
-            )?)
+            Some(inject_codex_unified_session_bucket(config_text)?)
         } else {
             None
         };
-    let config_text = unified_official_config.as_deref().or(config_text);
+    let config_text = unified_official_config.as_deref().unwrap_or(config_text);
 
     let should_write_auth = category == Some("official")
         && codex_auth_has_login_material(auth)
         && !should_preserve_live_codex_oauth_for_official_switch(auth);
-    let merged_config = config_text
-        .map(merge_codex_provider_config_with_live)
-        .transpose()?;
-
     if should_write_auth {
-        write_codex_live_atomic(auth, merged_config.as_deref())
+        write_codex_provider_auth_and_config_reconciled(auth, config_text)
     } else {
-        let live_config =
-            prepare_codex_provider_live_config(auth, merged_config.as_deref().unwrap_or(""))?;
-        write_codex_live_config_atomic(Some(&live_config))
+        write_codex_provider_config_reconciled(auth, config_text)
     }
 }
 
@@ -4284,12 +8959,2944 @@ pub fn remove_codex_toml_base_url_if(toml_str: &str, predicate: impl Fn(&str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deepseek_vendor_catalog_keeps_mcp_tools_directly_visible() {
+        let models = load_codex_deepseek_official_catalog_models();
+        assert!(
+            !models.is_empty(),
+            "bundled DeepSeek catalog must have models"
+        );
+
+        for model in models {
+            assert_eq!(
+                model.get("supports_search_tool"),
+                Some(&json!(false)),
+                "DeepSeek cannot consume Codex tool_search; MCP tools must remain inline"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_vision_catalog_preserves_official_modalities_and_reasoning() {
+        let models = load_codex_deepseek_official_catalog_models();
+        let vision = models
+            .iter()
+            .find(|model| {
+                model.get("slug").and_then(Value::as_str) == Some("deepseek-v4-flash-vision-exp")
+            })
+            .expect("bundled DeepSeek catalog must include Flash Vision");
+
+        assert_eq!(
+            vision.get("input_modalities"),
+            Some(&json!(["text", "image"]))
+        );
+        assert_eq!(
+            vision.get("supports_image_detail_original"),
+            Some(&json!(true))
+        );
+        assert_eq!(vision.get("context_window"), Some(&json!(1_048_576)));
+        assert_eq!(vision.get("max_context_window"), Some(&json!(1_048_576)));
+        assert_eq!(vision.get("default_reasoning_level"), Some(&json!("high")));
+        assert_eq!(
+            vision.get("supported_reasoning_levels"),
+            Some(&json!([
+                {"effort": "low", "description": "Fast responses with lighter reasoning"},
+                {"effort": "high", "description": "Extra high reasoning depth for complex problems"},
+                {"effort": "max", "description": "Maximum reasoning depth for the hardest problems"}
+            ]))
+        );
+    }
+
+    #[test]
+    fn only_known_deepseek_v4_text_models_are_forced_to_text() {
+        assert!(codex_catalog_model_name_is_text_only("deepseek-v4-flash"));
+        assert!(codex_catalog_model_name_is_text_only("deepseek-v4-pro"));
+        assert!(!codex_catalog_model_name_is_text_only(
+            "deepseek-v4-flash-vision-exp"
+        ));
+    }
+
+    fn reasoning_inspect_provider() -> Provider {
+        Provider::with_id(
+            "provider-qwen".into(),
+            "Qwen vLLM".into(),
+            serde_json::json!({
+                "base_url": "https://vllm.example/v1",
+                "api_key": "sk-test-secret",
+                "modelCatalog": {
+                    "models": [{
+                        "model": "qwen3.8",
+                        "displayName": "Qwen 3.8",
+                        "reasoning": {
+                            "schemaVersion": 2,
+                            "supportStatus": "confirmed_supported",
+                            "controlKind": "graded",
+                            "supportedEfforts": ["low", "high"],
+                            "defaultEffort": "high",
+                            "disableAllowed": false,
+                            "upstream": {
+                                "format": "string",
+                                "parameter": "reasoning.effort",
+                                "effortMap": {}
+                            }
+                        }
+                    }]
+                }
+            }),
+            None,
+        )
+    }
+
+    #[test]
+    fn reasoning_inspect_response_is_versioned_and_redacted() {
+        let response = build_codex_reasoning_inspect(&reasoning_inspect_provider(), "qwen3.8");
+        let value = serde_json::to_value(response).expect("serialize inspect response");
+
+        assert_eq!(value["schemaVersion"], 1);
+        assert!(value["requestId"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(value["revision"]
+            .as_str()
+            .is_some_and(|revision| !revision.is_empty()));
+        assert_eq!(value["persisted"]["model"]["model"], "qwen3.8");
+        assert_eq!(value["resolved"]["source"], "user_config");
+        assert_eq!(
+            value["codexProjection"]["fingerprint"],
+            value["resolved"]["fingerprint"]
+        );
+        assert_eq!(value["providerProjection"]["platform"], "vllm");
+        assert!(!value.to_string().contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn reasoning_inspect_reports_model_missing_from_catalog() {
+        let response =
+            build_codex_reasoning_inspect(&reasoning_inspect_provider(), "missing-model");
+        let value = serde_json::to_value(response).expect("serialize inspect response");
+        assert_eq!(value["resolved"]["source"], "unknown");
+        assert!(value["diagnostics"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["code"] == "model_not_in_catalog")
+        }));
+    }
+
+    #[test]
+    fn reasoning_cli_rejects_mutation_commands_before_opening_database() {
+        let args = vec!["reasoning".into(), "detect".into()];
+        assert_eq!(
+            run_reasoning_cli(&args).expect_err("P4 must not execute detect"),
+            "read_only_boundary: detect/plan/apply/reset are reserved for P5"
+        );
+    }
+
+    #[test]
+    fn official_reasoning_capability_reads_snake_case_levels() {
+        let official = serde_json::json!([{
+            "slug": "gpt-5.6-luna",
+            "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max"],
+            "default_reasoning_level": "medium"
+        }]);
+        let models = official.as_array().unwrap().clone();
+        let capability =
+            crate::proxy::providers::codex_reasoning::official_reasoning_capability_for_model(
+                "gpt-5.6-luna",
+                &models,
+            )
+            .expect("luna official capability");
+        assert_eq!(
+            capability.supported_efforts,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(capability.default_effort.as_deref(), Some("medium"));
+        assert_eq!(capability.source.as_deref(), Some("official"));
+        // 官方档位含 ultra 的模型（sol/terra）将它保存为 Codex 编排能力，
+        // 不再伪装为 Provider 原生 effort。
+        let sol = serde_json::json!([{
+            "slug": "gpt-5.6-sol",
+            "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "default_reasoning_level": "low"
+        }]);
+        let sol_models = sol.as_array().unwrap().clone();
+        let sol_capability =
+            crate::proxy::providers::codex_reasoning::official_reasoning_capability_for_model(
+                "gpt-5.6-sol",
+                &sol_models,
+            )
+            .expect("sol official capability");
+        assert!(!sol_capability
+            .supported_efforts
+            .contains(&"ultra".to_string()));
+        assert!(sol_capability
+            .codex_ultra_orchestration
+            .as_ref()
+            .is_some_and(|ultra| ultra.enabled));
+        // 不匹配的 slug 返回 None
+        assert!(
+            crate::proxy::providers::codex_reasoning::official_reasoning_capability_for_model(
+                "gpt-5.6-sol",
+                &models
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ultra_orchestration_projects_ultra_into_codex_catalog_levels() {
+        let mut entry = serde_json::Map::new();
+        let capability = serde_json::from_value(json!({
+            "schemaVersion": 2,
+            "supportStatus": "confirmed_supported",
+            "controlKind": "graded",
+            "supportedEfforts": ["low", "high"],
+            "defaultEffort": "high",
+            "disableAllowed": false,
+            "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {"low": "low", "high": "high", "max": "high"}
+            },
+            "codexUltraOrchestration": {"enabled": true},
+            "source": "user"
+        }))
+        .expect("valid third-party Ultra capability");
+
+        apply_codex_model_reasoning_capability(&mut entry, Some(&capability));
+
+        let efforts = entry["supported_reasoning_levels"]
+            .as_array()
+            .expect("projected levels")
+            .iter()
+            .filter_map(|level| level["effort"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(efforts, vec!["low", "high", "ultra"]);
+    }
+
+    #[test]
+    fn subagent_v1_hides_ultra_because_it_cannot_enable_proactive_delegation() {
+        let mut catalog = json!({
+            "models": [{
+                "default_reasoning_level": "ultra",
+                "default_reasoning_effort": "ultra",
+                "defaultReasoningEffort": "ultra",
+                "supported_reasoning_levels": [{"effort": "max"}, {"effort": "ultra"}],
+                "supported_reasoning_efforts": [{"reasoning_effort": "max"}, {"reasoning_effort": "ultra"}],
+                "supportedReasoningEfforts": [{"reasoningEffort": "max"}, {"reasoningEffort": "ultra"}]
+            }]
+        });
+        let settings = json!({
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v1",
+                "routes": [{
+                    "match": {"models": ["third-party-model"]},
+                    "upstream": {"auth": {"source": "provider_config"}}
+                }]
+            }
+        });
+
+        apply_codex_multi_agent_transport_policy(&mut catalog, &settings);
+
+        for field in [
+            "supported_reasoning_levels",
+            "supported_reasoning_efforts",
+            "supportedReasoningEfforts",
+        ] {
+            let values = catalog["models"][0][field]
+                .as_array()
+                .expect("levels")
+                .iter()
+                .filter_map(|value| {
+                    value
+                        .get("effort")
+                        .or_else(|| value.get("reasoning_effort"))
+                        .or_else(|| value.get("reasoningEffort"))
+                        .and_then(Value::as_str)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(values, vec!["max"], "field {field}");
+        }
+        for field in [
+            "default_reasoning_level",
+            "default_reasoning_effort",
+            "defaultReasoningEffort",
+        ] {
+            assert_eq!(
+                catalog["models"][0][field].as_str(),
+                Some("max"),
+                "V1 default must remain selectable after hiding Ultra: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn official_reasoning_capability_accepts_object_levels_from_backup() {
+        // 官方 backup 文件（models_cache.cc-switch-backup.json）里
+        // supported_reasoning_levels 是对象数组 {effort, description}，必须兼容。
+        let official = serde_json::json!([{
+            "slug": "gpt-5.6-luna",
+            "supported_reasoning_levels": [
+                {"effort": "low", "description": "Fast"},
+                {"effort": "medium", "description": "Balanced"},
+                {"effort": "high", "description": "Deep"},
+                {"effort": "xhigh", "description": "Extra deep"},
+                {"effort": "max", "description": "Maximum"}
+            ],
+            "default_reasoning_level": "medium"
+        }]);
+        let models = official.as_array().unwrap().clone();
+        let capability =
+            crate::proxy::providers::codex_reasoning::official_reasoning_capability_for_model(
+                "gpt-5.6-luna",
+                &models,
+            )
+            .expect("object levels must resolve");
+        assert_eq!(
+            capability.supported_efforts,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(capability.default_effort.as_deref(), Some("medium"));
+    }
+
+    fn codex_subagent_profile_status_json(
+        settings: &Value,
+        provider_context: Option<&ProviderClassificationContext>,
+    ) -> Result<Value, AppError> {
+        let statuses =
+            get_codex_subagent_profile_statuses_with_context(settings.clone(), provider_context)?;
+        serde_json::to_value(statuses).map_err(|error| AppError::Config(error.to_string()))
+    }
+
+    fn codex_subagent_profile_status_settings(
+        version: &str,
+        profiles: Value,
+        models: Value,
+        routes: Value,
+    ) -> Value {
+        json!({
+            "modelCatalog": { "models": models },
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": version,
+                "subagentV2": {
+                    "schemaVersion": 2,
+                    "selectionPolicy": "balanced",
+                    "profiles": profiles
+                },
+                "routes": routes
+            }
+        })
+    }
+
+    fn codex_subagent_profile_status_profile(model: &str, enabled: bool) -> Value {
+        json!({
+            "model": model,
+            "enabled": enabled,
+            "questionnaire": {
+                "taskStrengths": ["repository_exploration"],
+                "optimization": "speed",
+                "writeScope": "read_only",
+                "preference": "eligible"
+            },
+            "reasoning": { "policy": "delegated" }
+        })
+    }
+
+    #[test]
+    fn codex_subagent_v2_save_rejects_unknown_reasoning_for_enabled_routable_profile() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({ "private-model": codex_subagent_profile_status_profile("private-model", true) }),
+            json!([{ "model": "private-model", "contextWindow": 128000 }]),
+            json!([{
+                "id": "private-route",
+                "match": { "models": ["private-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+
+        let error = validate_codex_subagent_v2_candidate(&settings, None, true)
+            .expect_err("unknown reasoning capability must block provider save");
+        assert!(error
+            .to_string()
+            .contains("unknown_reasoning_capability_requires_declaration"));
+    }
+
+    #[test]
+    fn codex_subagent_v2_save_does_not_block_unknown_reasoning_for_disabled_or_unroutable_profile()
+    {
+        let disabled = codex_subagent_profile_status_settings(
+            "v2",
+            json!({ "private-model": codex_subagent_profile_status_profile("private-model", false) }),
+            json!([{ "model": "private-model", "contextWindow": 128000 }]),
+            json!([{
+                "id": "private-route",
+                "match": { "models": ["private-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        validate_codex_subagent_v2_candidate(&disabled, None, true)
+            .expect("disabled profiles do not generate roles");
+
+        let unroutable = codex_subagent_profile_status_settings(
+            "v2",
+            json!({ "private-model": codex_subagent_profile_status_profile("private-model", true) }),
+            json!([{ "model": "private-model", "contextWindow": 128000 }]),
+            json!([{
+                "id": "private-route",
+                "enabled": false,
+                "match": { "models": ["private-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        validate_codex_subagent_v2_candidate(&unroutable, None, true)
+            .expect("unroutable profiles do not generate roles");
+    }
+
+    fn review_codex_catalog_spec(model: &str) -> CodexCatalogModelSpec {
+        CodexCatalogModelSpec {
+            model: model.to_string(),
+            upstream_model: None,
+            display_name: model.to_string(),
+            context_window: 128_000,
+            text_only: true,
+            is_default: false,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
+        }
+    }
+
+    fn deepseek_reasoning_capability(
+    ) -> crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability {
+        crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability {
+            schema_version: None,
+            support_status: None,
+            control_kind: None,
+            supported: Some(true),
+            supported_efforts: vec!["low".into(), "high".into(), "max".into()],
+            default_effort: Some("high".into()),
+            disable_allowed: true,
+            upstream: crate::proxy::providers::codex_reasoning::CodexModelReasoningUpstream {
+                format: "string".into(),
+                parameter: "reasoning_effort".into(),
+                effort_map: [
+                    ("low".into(), "low".into()),
+                    ("medium".into(), "high".into()),
+                    ("high".into(), "high".into()),
+                    ("xhigh".into(), "high".into()),
+                    ("max".into(), "max".into()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            output_format: Some("reasoning_content".into()),
+            source: Some("builtin".into()),
+            confidence: None,
+            fetched_at: None,
+            provider_key: None,
+            model_revision: None,
+            codex_ultra_orchestration: None,
+        }
+    }
+
+    #[test]
+    fn codex_subagent_reasoning_capabilities_are_exact_and_credential_free() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "deepseek-v4-pro",
+                    "reasoning": serde_json::to_value(deepseek_reasoning_capability())
+                        .expect("serialize maintained capability")
+                }]
+            },
+            "apiKey": "MUST_NOT_LEAK",
+            "codexRouting": {
+                "routes": [{
+                    "match": { "models": ["deepseek-v4-pro"] },
+                    "upstream": {
+                        "auth": {
+                            "source": "provider_config",
+                            "apiKey": "ROUTE_SECRET_MUST_NOT_LEAK"
+                        }
+                    }
+                }]
+            }
+        });
+
+        let value = serde_json::to_value(get_codex_subagent_reasoning_capabilities_from_settings(
+            &settings,
+        ))
+        .expect("serialize capability response");
+        assert_eq!(
+            value,
+            json!({
+                "deepseek-v4-pro": {
+                    "supportKind": "effort_levels",
+                    "source": "builtin",
+                    "confidence": "confirmed",
+                    "codexSelectableEfforts": ["low", "high", "max"],
+                    "providerAcceptedEfforts": ["low", "high", "max"],
+                    "providerDefaultEffort": "high",
+                    "disableAllowed": true,
+                    "effortMap": {
+                        "low": "low",
+                        "medium": "high",
+                        "high": "high",
+                        "xhigh": "high",
+                        "max": "max"
+                    },
+                    "fingerprint": "8d5aeff0f2c9743effd90da1cc89b10ec0335e2e2766e8161a9bf0325360abf9"
+                }
+            })
+        );
+        let serialized = value.to_string();
+        assert!(!serialized.contains("MUST_NOT_LEAK"));
+        assert!(!serialized.contains("apiKey"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_v2_preview_command_uses_exact_safe_camel_case_contract() {
+        let _guard = TestHomeGuard::new();
+        let preview = preview_codex_subagent_profile_with_context(
+            json!({
+                "modelCatalog": { "models": [{ "model": "DeepSeek-V4-Flash", "contextWindow": 1000000 }] },
+                "codexRouting": {
+                    "subagentV2": {
+                        "schemaVersion": 2,
+                        "selectionPolicy": "balanced",
+                        "profiles": {}
+                    },
+                    "routes": [{
+                        "match": { "models": ["DeepSeek-V4-Flash"] },
+                        "upstream": { "auth": { "source": "provider_config", "apiKey": "MUST_NOT_LEAK" } }
+                    }]
+                }
+            }),
+            "DeepSeek-V4-Flash".to_string(),
+            serde_json::from_value(json!({
+                "model": "DeepSeek-V4-Flash",
+                "enabled": true,
+                "questionnaire": {
+                    "taskStrengths": ["repository_exploration"],
+                    "optimization": "speed",
+                    "writeScope": "read_only",
+                    "preference": "eligible"
+                },
+                "reasoning": { "policy": "delegated" }
+            }))
+            .expect("typed preview profile"),
+            None,
+        )
+        .expect("preview configured profile");
+        let value = serde_json::to_value(preview).expect("serialize preview");
+        let object = value.as_object().expect("preview object");
+        assert_eq!(
+            object
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "providerKind",
+                "requestedRoleName",
+                "effectiveRoleName",
+                "description",
+                "developerInstructions",
+                "nicknameCandidates",
+                "model",
+                "modelProvider",
+                "reasoningPolicy",
+                "reasoningCapability",
+                "modelContextWindow",
+                "tomlPreview",
+                "warnings"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(value["providerKind"], "third_party");
+        assert_eq!(
+            value["modelProvider"],
+            CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID
+        );
+        assert_eq!(value["modelContextWindow"], 1_000_000);
+        assert_eq!(value["reasoningPolicy"], "delegated");
+        assert!(
+            !object.contains_key("modelReasoningEffort"),
+            "delegated preview must not expose a null or invented fixed effort"
+        );
+        assert_eq!(
+            value["reasoningCapability"],
+            json!({
+                "supportKind": "effort_levels",
+                "source": "builtin",
+                "confidence": "confirmed",
+                "codexSelectableEfforts": ["low", "high", "max"],
+                "providerAcceptedEfforts": ["low", "high", "max"],
+                "providerDefaultEffort": "high",
+                "disableAllowed": true,
+                "effortMap": {
+                    "low": "low",
+                    "medium": "high",
+                    "high": "high",
+                    "xhigh": "high",
+                    "max": "max"
+                },
+                "fingerprint": "8d5aeff0f2c9743effd90da1cc89b10ec0335e2e2766e8161a9bf0325360abf9"
+            })
+        );
+        let serialized = serde_json::to_string(&value).expect("serialize safe preview");
+        assert!(!serialized.contains("MUST_NOT_LEAK"));
+        assert!(!serialized.contains("apiKey"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_v2_preview_compiles_the_full_draft_for_duplicate_requested_roles() {
+        let _guard = TestHomeGuard::new();
+        let shared_questionnaire = json!({
+            "taskStrengths": ["repository_exploration"],
+            "optimization": "speed",
+            "writeScope": "read_only",
+            "preference": "eligible"
+        });
+        let first = json!({
+            "model": "model-a",
+            "enabled": true,
+            "questionnaire": shared_questionnaire.clone(),
+            "reasoning": { "policy": "delegated" },
+            "overrides": { "roleName": "shared-review" }
+        });
+        let second = json!({
+            "model": "model-b",
+            "enabled": true,
+            "questionnaire": shared_questionnaire,
+            "reasoning": { "policy": "delegated" },
+            "overrides": { "roleName": "shared-review" }
+        });
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({ "model-a": first, "model-b": second.clone() }),
+            json!([
+                { "model": "model-a", "contextWindow": 128000 },
+                { "model": "model-b", "contextWindow": 256000 }
+            ]),
+            json!([{
+                "id": "shared-route",
+                "match": { "models": ["model-a", "model-b"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let specs = vec![
+            CodexCatalogModelSpec {
+                model: "model-a".to_string(),
+                upstream_model: None,
+                display_name: "Model A".to_string(),
+                context_window: 128_000,
+                text_only: true,
+                is_default: false,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+                reasoning: None,
+                reasoning_fingerprint: String::new(),
+                reasoning_source: "unknown".to_string(),
+                sort_index: None,
+            },
+            CodexCatalogModelSpec {
+                model: "model-b".to_string(),
+                upstream_model: None,
+                display_name: "Model B".to_string(),
+                context_window: 256_000,
+                text_only: true,
+                is_default: false,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+                reasoning: None,
+                reasoning_fingerprint: String::new(),
+                reasoning_source: "unknown".to_string(),
+                sort_index: None,
+            },
+        ];
+        sync_codex_managed_agent_files_with_settings(
+            &specs,
+            CodexSubagentVersion::V2,
+            &settings,
+            None,
+        )
+        .expect("materialize the full settings draft to real managed files");
+        let materialized_for_model_b = std::fs::read_dir(get_codex_agents_dir())
+            .expect("enumerate generated managed role files")
+            .filter_map(|entry| {
+                let path = entry.expect("read generated role directory entry").path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+                    return None;
+                }
+                let rendered =
+                    std::fs::read_to_string(&path).expect("read a generated managed role file");
+                let parsed: toml::Value =
+                    toml::from_str(&rendered).expect("parse a generated role TOML");
+                (parsed["model"].as_str() == Some("model-b")).then_some((path, parsed))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            materialized_for_model_b.len(),
+            1,
+            "real sync must materialize exactly one managed TOML for model-b"
+        );
+        let (materialized_path, materialized) = &materialized_for_model_b[0];
+        let materialized_name = materialized["name"].as_str().expect("generated role name");
+        assert_eq!(
+            materialized_path.file_stem().and_then(|stem| stem.to_str()),
+            Some(materialized_name),
+            "the generated filename and TOML name must identify the same effective role"
+        );
+
+        let preview = preview_codex_subagent_profile_with_context(
+            settings,
+            "model-b".to_string(),
+            serde_json::from_value(second).expect("typed second profile"),
+            None,
+        )
+        .expect("preview the second model from the full draft");
+        let preview = serde_json::to_value(preview).expect("serialize preview");
+
+        assert_eq!(
+            preview["requestedRoleName"], "shared-review",
+            "preview must retain the requested role from the materialized profile"
+        );
+        assert_eq!(
+            preview["effectiveRoleName"], materialized_name,
+            "preview must match the effective role in the actual generated TOML"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_v2_preview_preserves_selected_non_last_profile_allocation_order() {
+        let _guard = TestHomeGuard::new();
+        let shared_questionnaire = json!({
+            "taskStrengths": ["repository_exploration"],
+            "optimization": "speed",
+            "writeScope": "read_only",
+            "preference": "eligible"
+        });
+        let selected_first = json!({
+            "model": "model-a",
+            "enabled": true,
+            "questionnaire": shared_questionnaire.clone(),
+            "reasoning": { "policy": "delegated" },
+            "overrides": { "roleName": "shared-review" }
+        });
+        let later_peer = json!({
+            "model": "model-b",
+            "enabled": true,
+            "questionnaire": shared_questionnaire,
+            "reasoning": { "policy": "delegated" },
+            "overrides": { "roleName": "shared-review" }
+        });
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({ "model-a": selected_first.clone(), "model-b": later_peer }),
+            json!([
+                { "model": "model-a", "contextWindow": 128000 },
+                { "model": "model-b", "contextWindow": 256000 }
+            ]),
+            json!([{
+                "id": "shared-route",
+                "match": { "models": ["model-a", "model-b"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let specs = vec![
+            review_codex_catalog_spec("model-a"),
+            review_codex_catalog_spec("model-b"),
+        ];
+        sync_codex_managed_agent_files_with_settings(
+            &specs,
+            CodexSubagentVersion::V2,
+            &settings,
+            None,
+        )
+        .expect("materialize original profile order");
+        let materialized_name = std::fs::read_dir(get_codex_agents_dir())
+            .expect("enumerate materialized roles")
+            .filter_map(|entry| {
+                let path = entry.expect("role entry").path();
+                let rendered = std::fs::read_to_string(path).ok()?;
+                let parsed: toml::Value = toml::from_str(&rendered).ok()?;
+                (parsed["model"].as_str() == Some("model-a"))
+                    .then(|| parsed["name"].as_str().map(ToString::to_string))
+                    .flatten()
+            })
+            .next()
+            .expect("materialized selected model-a role");
+        assert_eq!(materialized_name, "shared-review");
+
+        let preview = preview_codex_subagent_profile_with_context(
+            settings,
+            "model-a".to_string(),
+            serde_json::from_value(selected_first).expect("typed selected profile"),
+            None,
+        )
+        .expect("preview selected non-last profile");
+
+        assert_eq!(
+            preview.effective_role_name, materialized_name,
+            "replacing a selected non-last profile must not move it behind a later collision peer"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_v2_preview_keeps_canonical_alias_collision_fail_closed_and_redacted() {
+        let _guard = TestHomeGuard::new();
+        let raw_alias_sentinel = "RAW_CANONICAL_ALIAS_SECRET_SENTINEL";
+        let canonical_model = "collision-model";
+        let selected = codex_subagent_profile_status_profile(canonical_model, true);
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                (canonical_model): selected.clone(),
+                (raw_alias_sentinel): codex_subagent_profile_status_profile(canonical_model, true)
+            }),
+            json!([{ "model": canonical_model, "contextWindow": 128000 }]),
+            json!([{
+                "id": "collision-route",
+                "enabled": true,
+                "match": { "models": [canonical_model] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+
+        let statuses = codex_subagent_profile_status_json(&settings, None)
+            .expect("status must safely preserve the complete malformed draft");
+        assert_eq!(
+            statuses["profiles"]
+                .as_array()
+                .expect("status profiles")
+                .iter()
+                .filter(|status| status["status"] == "collision")
+                .count(),
+            2,
+            "status must keep both canonical identities fail closed"
+        );
+        assert!(!statuses.to_string().contains(raw_alias_sentinel));
+
+        sync_codex_managed_agent_files_with_settings(
+            &[review_codex_catalog_spec(canonical_model)],
+            CodexSubagentVersion::V2,
+            &settings,
+            None,
+        )
+        .expect("materialization must handle the collision as controlled non-generation");
+        assert_eq!(
+            std::fs::read_dir(get_codex_agents_dir())
+                .expect("enumerate managed role directory")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry.path().extension().and_then(|value| value.to_str()) == Some("toml")
+                })
+                .count(),
+            0,
+            "materialization must not generate either colliding role"
+        );
+
+        let error = preview_codex_subagent_profile_with_context(
+            settings,
+            canonical_model.to_string(),
+            serde_json::from_value(selected).expect("typed selected canonical profile"),
+            None,
+        )
+        .expect_err("preview must not erase the alias sibling and return TOML");
+        assert!(
+            error.contains("did not produce a preview role"),
+            "preview must report controlled collision non-generation"
+        );
+        assert!(
+            !error.contains(raw_alias_sentinel),
+            "preview errors must not expose the raw alias"
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_backend_initialization_and_catalog_sync_own_canonical_drafts() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([
+                { "model": "deepseek-v4-flash", "contextWindow": 1000000 },
+                { "model": "deepseek-v4-pro", "contextWindow": 1000000 },
+                { "model": "qwen3.6", "contextWindow": 262144 }
+            ]),
+            json!([{
+                "id": "all-models",
+                "match": { "models": ["deepseek-v4-flash", "deepseek-v4-pro", "qwen3.6"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+
+        let initialized = initialize_codex_subagent_v2_for_candidate(&settings, None)
+            .expect("initialize backend-owned catalog drafts");
+        assert_eq!(
+            initialized["profiles"]["deepseek-v4-flash"]["enabled"],
+            true
+        );
+        assert_eq!(
+            initialized["profiles"]["deepseek-v4-flash"]["questionnaire"]["preference"],
+            "preferred"
+        );
+        assert_eq!(initialized["profiles"]["deepseek-v4-pro"]["enabled"], true);
+        assert_eq!(initialized["profiles"]["qwen3.6"]["enabled"], false);
+        assert_eq!(
+            initialized["profiles"]["qwen3.6"]["questionnaire"],
+            json!({
+                "taskStrengths": ["repository_exploration"],
+                "optimization": "balanced",
+                "writeScope": "read_only",
+                "preference": "eligible"
+            })
+        );
+        assert_eq!(
+            initialized["profiles"]["qwen3.6"]["reasoning"],
+            json!({ "policy": "delegated" })
+        );
+        parse_persisted_subagent_v2(&initialized)
+            .expect("initialized backend result must be strict-storage valid");
+
+        let mut unsaved = initialized.clone();
+        unsaved["profiles"]["deepseek-v4-flash"]["overrides"] =
+            json!({ "description": "Unsaved draft survives backend catalog sync." });
+        unsaved
+            .get_mut("profiles")
+            .and_then(Value::as_object_mut)
+            .expect("profiles object")
+            .remove("qwen3.6");
+        let synced = reconcile_codex_subagent_v2_for_candidate(
+            &settings,
+            CodexSubagentV2ReconcileAction::SyncCatalog,
+            Some(&unsaved),
+            None,
+        )
+        .expect("sync current unsaved draft against backend catalog");
+        assert_eq!(
+            synced["profiles"]["deepseek-v4-flash"]["overrides"]["description"],
+            "Unsaved draft survives backend catalog sync."
+        );
+        assert_eq!(synced["profiles"]["qwen3.6"]["enabled"], false);
+        parse_persisted_subagent_v2(&synced)
+            .expect("synced backend result must be strict-storage valid");
+    }
+
+    #[test]
+    fn codex_subagent_v2_initialization_only_includes_routable_catalog_models() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([
+                { "model": "deepseek-v4-flash", "contextWindow": 1000000 },
+                { "model": "deepseek-v4-pro", "contextWindow": 1000000 },
+                { "model": "qwen3.6", "contextWindow": 262144 }
+            ]),
+            json!([
+                {
+                    "id": "qwen-only",
+                    "match": { "models": ["qwen3.6"] },
+                    "upstream": { "auth": { "source": "provider_config" } }
+                },
+                {
+                    "id": "disabled-deepseek",
+                    "enabled": false,
+                    "match": { "models": ["deepseek-v4-flash", "deepseek-v4-pro"] },
+                    "upstream": { "auth": { "source": "provider_config" } }
+                }
+            ]),
+        );
+
+        let initialized = initialize_codex_subagent_v2_for_candidate(&settings, None)
+            .expect("initialize from the actually routable catalog only");
+        let keys = initialized["profiles"]
+            .as_object()
+            .expect("initialized profiles object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys, vec!["qwen3.6"]);
+        assert_eq!(initialized["profiles"]["qwen3.6"]["enabled"], false);
+        assert_eq!(
+            initialized["profiles"]["qwen3.6"]["questionnaire"]["preference"],
+            "eligible"
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_catalog_sync_adds_third_party_without_silently_adding_official_models() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([
+                { "model": "gpt-5.6-sol", "contextWindow": 262144 },
+                { "model": "deepseek-v4-flash", "contextWindow": 1000000 }
+            ]),
+            json!([
+                {
+                    "id": "official-route",
+                    "match": { "models": ["gpt-5.6-sol"] },
+                    "upstream": { "auth": { "source": "managed_codex_oauth" } }
+                },
+                {
+                    "id": "third-party-route",
+                    "match": { "models": ["deepseek-v4-flash"] },
+                    "upstream": { "targetProviderId": "deepseek", "auth": { "source": "provider_config" } }
+                }
+            ]),
+        );
+        let third_party = Provider::with_id(
+            "deepseek".to_string(),
+            "DeepSeek".to_string(),
+            json!({}),
+            None,
+        );
+        let context = ProviderClassificationContext::from_providers([&third_party]);
+        let draft = json!({
+            "schemaVersion": 2,
+            "selectionPolicy": "balanced",
+            "profiles": {}
+        });
+
+        let synced = reconcile_codex_subagent_v2_for_candidate(
+            &settings,
+            CodexSubagentV2ReconcileAction::SyncCatalog,
+            Some(&draft),
+            Some(&context),
+        )
+        .expect("sync third-party candidates");
+
+        assert!(synced["profiles"].get("deepseek-v4-flash").is_some());
+        assert!(
+            synced["profiles"].get("gpt-5.6-sol").is_none(),
+            "the normal candidate import must not silently add official models"
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_initialization_excludes_unmatched_model_without_route_fallback() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([{ "model": "unmatched-model", "contextWindow": 128000 }]),
+            json!([{
+                "id": "first-enabled",
+                "enabled": true,
+                "match": { "models": ["qwen3.6"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+
+        assert!(
+            resolve_codex_primary_route_from_settings(&settings, "unmatched-model").is_none(),
+            "an unmatched model must fail closed instead of using the first enabled route"
+        );
+        let initialized = initialize_codex_subagent_v2_for_candidate(&settings, None)
+            .expect("initialize from runtime-routable catalog models");
+
+        assert!(
+            initialized["profiles"].get("unmatched-model").is_none(),
+            "an unroutable catalog model must not produce a Sub-Agent draft"
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_initialization_excludes_disabled_declared_model_before_enabled_default() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([{ "model": "disabled-model", "contextWindow": 128000 }]),
+            json!([
+                {
+                    "id": "official-default",
+                    "enabled": true,
+                    "match": { "models": ["gpt-5.5"] },
+                    "upstream": { "auth": { "source": "managed_codex_oauth" } }
+                },
+                {
+                    "id": "disabled-model-route",
+                    "enabled": false,
+                    "match": { "models": ["disabled-model"] },
+                    "upstream": { "auth": { "source": "provider_config" } }
+                }
+            ]),
+        );
+        let mut settings = settings;
+        settings["codexRouting"]["defaultRouteId"] = Value::String("official-default".to_string());
+
+        assert!(
+            resolve_codex_primary_route_from_settings(&settings, "disabled-model").is_none(),
+            "the runtime must fail closed before considering the enabled default"
+        );
+        let initialized = initialize_codex_subagent_v2_for_candidate(&settings, None)
+            .expect("initialize without disabled-only catalog models");
+
+        assert!(
+            initialized["profiles"].get("disabled-model").is_none(),
+            "a model declared only by a disabled route must not receive a draft"
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_strict_candidate_error_redacts_raw_profile_identity() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                "RAW_PROFILE_KEY_SENTINEL": {
+                    "model": "PRIVATE_MODEL_SENTINEL",
+                    "enabled": true,
+                    "questionnaire": {
+                        "taskStrengths": ["repository_exploration"],
+                        "optimization": "speed",
+                        "writeScope": "read_only",
+                        "preference": "eligible"
+                    },
+                    "reasoning": { "policy": "delegated" }
+                }
+            }),
+            json!([{ "model": "PRIVATE_MODEL_SENTINEL", "contextWindow": 128000 }]),
+            json!([{
+                "id": "private-route",
+                "match": { "models": ["PRIVATE_MODEL_SENTINEL"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+
+        let error = validate_codex_subagent_v2_candidate(&settings, None, true)
+            .expect_err("strict key/model mismatch must reject the candidate");
+        let public_error = error.to_string();
+
+        assert_eq!(
+            public_error,
+            "无效输入: Codex subagent V2 configuration is invalid (profile_key_model_mismatch)"
+        );
+        assert!(!public_error.contains("RAW_PROFILE_KEY_SENTINEL"));
+        assert!(!public_error.contains("PRIVATE_MODEL_SENTINEL"));
+    }
+
+    #[test]
+    fn codex_subagent_v2_backend_invalid_batch_actions_preserve_valid_and_redact_raw_keys() {
+        let valid = codex_subagent_profile_status_profile("repository-scout", true);
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                "repository-scout": valid.clone(),
+                "RAW_SECRET_PRO": {
+                    "model": "deepseek-v4-pro",
+                    "enabled": "broken"
+                },
+                "RAW_SECRET_QWEN": {
+                    "model": "qwen3.6",
+                    "enabled": true
+                }
+            }),
+            json!([
+                { "model": "repository-scout", "contextWindow": 128000 },
+                { "model": "deepseek-v4-pro", "contextWindow": 1000000 },
+                { "model": "qwen3.6", "contextWindow": 262144 }
+            ]),
+            json!([{
+                "id": "all-models",
+                "match": { "models": ["repository-scout", "deepseek-v4-pro", "qwen3.6"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let draft = settings["codexRouting"]["subagentV2"].clone();
+
+        let removed = reconcile_codex_subagent_v2_for_candidate(
+            &settings,
+            CodexSubagentV2ReconcileAction::RemoveAllInvalid,
+            Some(&draft),
+            None,
+        )
+        .expect("remove all invalid profiles in backend");
+        assert_eq!(removed["profiles"], json!({ "repository-scout": valid }));
+        parse_persisted_subagent_v2(&removed)
+            .expect("invalid removal must produce strict-storage valid output");
+
+        let recovered = reconcile_codex_subagent_v2_for_candidate(
+            &settings,
+            CodexSubagentV2ReconcileAction::RecoverAllInvalidFromCatalog,
+            Some(&draft),
+            None,
+        )
+        .expect("recover catalog-identifiable invalid profiles in backend");
+        assert_eq!(
+            recovered["profiles"]["repository-scout"],
+            codex_subagent_profile_status_profile("repository-scout", true)
+        );
+        assert_eq!(recovered["profiles"]["deepseek-v4-pro"]["enabled"], false);
+        assert_eq!(
+            recovered["profiles"]["deepseek-v4-pro"]["questionnaire"]["taskStrengths"],
+            json!([
+                "complex_debugging",
+                "architecture_design",
+                "complex_implementation",
+                "high_risk_review",
+                "testing"
+            ])
+        );
+        assert_eq!(recovered["profiles"]["qwen3.6"]["enabled"], false);
+        let public_recovered = recovered.to_string();
+        assert!(!public_recovered.contains("RAW_SECRET_PRO"));
+        assert!(!public_recovered.contains("RAW_SECRET_QWEN"));
+        parse_persisted_subagent_v2(&recovered)
+            .expect("catalog recovery must produce strict-storage valid output");
+    }
+
+    #[test]
+    fn codex_subagent_v2_backend_rekeys_a_structurally_valid_alias_without_losing_fields() {
+        let aliased_profile = json!({
+            "model": "deepseek-v4-flash",
+            "enabled": true,
+            "questionnaire": {
+                "taskStrengths": ["repository_exploration", "testing"],
+                "optimization": "quality",
+                "writeScope": "bounded_changes",
+                "preference": "fallback"
+            },
+            "reasoning": { "policy": "fixed", "effort": "xhigh" },
+            "overrides": {
+                "roleName": "keep-valid-role",
+                "description": "KEEP_VALID_DESCRIPTION",
+                "developerInstructions": "KEEP_VALID_INSTRUCTIONS",
+                "nicknameCandidates": ["KeepValid", "Stable"]
+            }
+        });
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({ "LEGACY_ALIAS_SENTINEL": aliased_profile.clone() }),
+            json!([{ "model": "deepseek-v4-flash", "contextWindow": 1000000 }]),
+            json!([{
+                "id": "flash-route",
+                "match": { "models": ["deepseek-v4-flash"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let draft = settings["codexRouting"]["subagentV2"].clone();
+
+        let recovered = reconcile_codex_subagent_v2_for_candidate(
+            &settings,
+            CodexSubagentV2ReconcileAction::RecoverAllInvalidFromCatalog,
+            Some(&draft),
+            None,
+        )
+        .expect("backend recovery should re-key a structurally valid alias");
+
+        let expected_profile = aliased_profile;
+        assert_eq!(recovered["profiles"]["deepseek-v4-flash"], expected_profile);
+        assert!(recovered["profiles"].get("LEGACY_ALIAS_SENTINEL").is_none());
+        parse_persisted_subagent_v2(&recovered)
+            .expect("re-keyed alias recovery must be strict-storage valid");
+    }
+
+    #[test]
+    fn codex_subagent_v2_prune_unroutable_removes_stale_and_keeps_routable() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                "repository-scout": codex_subagent_profile_status_profile("repository-scout", true),
+                "deepseek-v4-pro": codex_subagent_profile_status_profile("deepseek-v4-pro", false),
+                "qwen3.6": codex_subagent_profile_status_profile("qwen3.6", false),
+                "stale-disabled": codex_subagent_profile_status_profile("stale-disabled", false),
+                "stale-enabled": codex_subagent_profile_status_profile("stale-enabled", true)
+            }),
+            json!([
+                { "model": "repository-scout", "contextWindow": 128000 },
+                { "model": "deepseek-v4-pro", "contextWindow": 1000000 },
+                { "model": "qwen3.6", "contextWindow": 262144 }
+            ]),
+            json!([{
+                "id": "all-models",
+                "match": { "models": ["repository-scout", "deepseek-v4-pro", "qwen3.6"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let draft = settings["codexRouting"]["subagentV2"].clone();
+
+        let pruned = reconcile_codex_subagent_v2_for_candidate(
+            &settings,
+            CodexSubagentV2ReconcileAction::PruneUnroutable,
+            Some(&draft),
+            None,
+        )
+        .expect("prune unroutable profiles in backend");
+
+        // Routable profiles (in catalog + routed) are kept, regardless of enabled state.
+        assert!(pruned["profiles"].get("repository-scout").is_some());
+        assert!(pruned["profiles"].get("deepseek-v4-pro").is_some());
+        assert!(pruned["profiles"].get("qwen3.6").is_some());
+        // Unroutable profiles (not in catalog) are removed, regardless of enabled state.
+        assert!(pruned["profiles"].get("stale-disabled").is_none());
+        assert!(pruned["profiles"].get("stale-enabled").is_none());
+        parse_persisted_subagent_v2(&pruned)
+            .expect("prune must produce strict-storage valid output");
+    }
+
+    fn parse_test_profile(
+        model: &str,
+        input_modalities: Option<Value>,
+    ) -> crate::codex_subagent_profiles::ParsedCodexSubagentProfile {
+        let mut profile_json = json!({
+            "model": model,
+            "enabled": true,
+            "questionnaire": {
+                "taskStrengths": ["repository_exploration"],
+                "optimization": "speed",
+                "writeScope": "read_only",
+                "preference": "eligible"
+            },
+            "reasoning": { "policy": "delegated" }
+        });
+        if let Some(modalities) = input_modalities {
+            profile_json["inputModalities"] = modalities;
+        }
+        let v2 = json!({
+            "schemaVersion": 2,
+            "selectionPolicy": "balanced",
+            "profiles": { model: profile_json }
+        });
+        let parsed = parse_persisted_subagent_v2(&v2).expect("parse test profile");
+        parsed
+            .profiles
+            .iter()
+            .find_map(|entry| match entry {
+                ParsedProfileEntry::Valid(profile) => Some(profile),
+                _ => None,
+            })
+            .cloned()
+            .expect("valid profile")
+    }
+
+    #[test]
+    fn input_modality_provenance_catalog_declares_multimodal() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([{
+                "model": "vision-model",
+                "contextWindow": 128000,
+                "inputModalities": ["text", "image"]
+            }]),
+            json!([{
+                "id": "r",
+                "match": { "models": ["vision-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let profile = parse_test_profile("vision-model", None);
+        let info = resolve_input_modality_provenance(&settings, &profile);
+        assert_eq!(info.modalities, Some(vec!["text".into(), "image".into()]));
+        assert_eq!(info.source, CodexSubagentInputModalitySource::Catalog);
+        assert!(info.conflict.is_none());
+    }
+
+    #[test]
+    fn input_modality_provenance_detects_route_catalog_conflict() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([{
+                "model": "conflict-model",
+                "contextWindow": 128000,
+                "inputModalities": ["text", "image"]
+            }]),
+            json!([{
+                "id": "r",
+                "match": { "models": ["conflict-model"] },
+                "capabilities": { "textOnly": true },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let profile = parse_test_profile("conflict-model", None);
+        let info = resolve_input_modality_provenance(&settings, &profile);
+        // route 声明 textOnly=true 优先 → 最终纯文本；route 与 catalog 声明冲突
+        assert_eq!(info.modalities, Some(vec!["text".into()]));
+        assert_eq!(info.source, CodexSubagentInputModalitySource::Route);
+        let conflict = info.conflict.expect("route/catalog 声明不一致必须报告冲突");
+        assert!(conflict.contains("冲突"), "conflict: {conflict}");
+    }
+
+    #[test]
+    fn input_modality_provenance_name_registry_text_only() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([{ "model": "deepseek-v4-flash", "contextWindow": 128000 }]),
+            json!([{
+                "id": "r",
+                "match": { "models": ["deepseek-v4-flash"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let profile = parse_test_profile("deepseek-v4-flash", None);
+        let info = resolve_input_modality_provenance(&settings, &profile);
+        // deepseek-v4-flash 在内置"已确认纯文本"注册表
+        assert_eq!(info.modalities, Some(vec!["text".into()]));
+        assert_eq!(info.source, CodexSubagentInputModalitySource::NameRegistry);
+        assert!(info.conflict.is_none());
+    }
+
+    #[test]
+    fn input_modality_provenance_unknown_when_no_declaration() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([{ "model": "mystery-model", "contextWindow": 128000 }]),
+            json!([{
+                "id": "r",
+                "match": { "models": ["mystery-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let profile = parse_test_profile("mystery-model", None);
+        let info = resolve_input_modality_provenance(&settings, &profile);
+        assert_eq!(info.modalities, None);
+        assert_eq!(info.source, CodexSubagentInputModalitySource::Unknown);
+        assert!(info.conflict.is_none());
+    }
+
+    #[test]
+    fn input_modality_provenance_profile_explicit_override() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([{
+                "model": "override-model",
+                "contextWindow": 128000,
+                "inputModalities": ["text", "image"]
+            }]),
+            json!([{
+                "id": "r",
+                "match": { "models": ["override-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        // profile 显式声明纯文本，与 catalog 的 text+image 不同 → 用户覆盖
+        let profile = parse_test_profile("override-model", Some(json!(["text"])));
+        let info = resolve_input_modality_provenance(&settings, &profile);
+        assert_eq!(info.modalities, Some(vec!["text".into()]));
+        assert_eq!(
+            info.source,
+            CodexSubagentInputModalitySource::ProfileExplicit
+        );
+    }
+
+    #[test]
+    fn input_modality_provenance_profile_wins_and_reports_profile_route_catalog_conflict() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([{
+                "model": "explicit-text-model",
+                "contextWindow": 128000,
+                "inputModalities": ["text"]
+            }]),
+            json!([{
+                "id": "r",
+                "match": { "models": ["explicit-text-model"] },
+                "capabilities": { "supportsImage": true },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        // 即使 profile 与 catalog 恰好一致，profile 仍是用户明确选择，
+        // 应压过冲突的 route，并在诊断中列出全部声明来源。
+        let profile = parse_test_profile("explicit-text-model", Some(json!(["text"])));
+        let info = resolve_input_modality_provenance(&settings, &profile);
+        assert_eq!(info.modalities, Some(vec!["text".into()]));
+        assert_eq!(
+            info.source,
+            CodexSubagentInputModalitySource::ProfileExplicit
+        );
+        let conflict = info.conflict.expect("profile/route/catalog 冲突必须可见");
+        assert!(conflict.contains("profile"), "conflict: {conflict}");
+        assert!(conflict.contains("route"), "conflict: {conflict}");
+        assert!(conflict.contains("模型目录"), "conflict: {conflict}");
+        assert!(info.declarations[0].adopted);
+        assert!(!info.declarations[1].adopted);
+        assert!(!info.declarations[2].adopted);
+    }
+
+    #[test]
+    fn catalog_refresh_replaces_automatic_profile_modality_without_persisting_it() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({}),
+            json!([{
+                "model": "refresh-model",
+                "contextWindow": 128000,
+                "inputModalities": ["text", "image"]
+            }]),
+            json!([{
+                "id": "r",
+                "match": { "models": ["refresh-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let raw = json!({
+            "schemaVersion": 2,
+            "selectionPolicy": "balanced",
+            "profiles": {
+                "refresh-model": {
+                    "model": "refresh-model",
+                    "enabled": true,
+                    "questionnaire": {
+                        "taskStrengths": ["repository_exploration"],
+                        "optimization": "speed",
+                        "writeScope": "read_only",
+                        "preference": "eligible"
+                    },
+                    "reasoning": { "policy": "delegated" }
+                }
+            }
+        });
+        let hydrated = hydrate_codex_subagent_v2_input_modalities(&settings, &raw);
+        assert!(hydrated["profiles"]["refresh-model"]
+            .get("inputModalities")
+            .is_none());
+        let profile = parse_persisted_subagent_v2(&hydrated)
+            .expect("catalog-derived modality must not be required in persisted profile")
+            .profiles
+            .into_iter()
+            .find_map(|entry| match entry {
+                ParsedProfileEntry::Valid(profile) => Some(profile),
+                _ => None,
+            })
+            .expect("valid profile");
+        let info = resolve_input_modality_provenance(&settings, &profile);
+        assert_eq!(info.modalities, Some(vec!["text".into(), "image".into()]));
+        assert_eq!(info.source, CodexSubagentInputModalitySource::Catalog);
+    }
+
+    #[test]
+    fn codex_subagent_profile_status_command_is_registered_without_changing_preview_ipc() {
+        let lib_source = include_str!("lib.rs");
+        assert!(lib_source.contains("codex_config::get_codex_subagent_reasoning_capabilities,"));
+        assert!(
+            lib_source.contains("codex_config::get_codex_subagent_profile_statuses,"),
+            "the read-only status command must be registered independently from preview"
+        );
+        assert!(lib_source.contains("codex_config::preview_codex_subagent_profile,"));
+        for command in [
+            "codex_config::inspect_codex_reasoning_capability,",
+            "codex_config::list_codex_reasoning_capabilities,",
+            "codex_config::validate_codex_reasoning_provider,",
+            "codex_config::export_codex_reasoning_provider,",
+        ] {
+            assert!(
+                lib_source.contains(command),
+                "missing P4 command registration: {command}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_profile_status_configured_generated_is_exact_and_dry_run() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create isolated agents dir");
+        let first_user_role = agents_dir.join("analysis-role.toml");
+        let second_user_role = agents_dir.join("ccswitch-analysis-role.toml");
+        std::fs::write(
+            &first_user_role,
+            "name = \"analysis-role\"\nuser = \"FIRST\"\n",
+        )
+        .expect("seed first user role");
+        std::fs::write(
+            &second_user_role,
+            "name = \"ccswitch-analysis-role\"\nuser = \"SECOND\"\n",
+        )
+        .expect("seed second user role");
+
+        let mut profile = codex_subagent_profile_status_profile("neutral-model", true);
+        profile["reasoning"] = json!({ "policy": "fixed", "effort": "high" });
+        profile["overrides"] = json!({
+            "roleName": "Analysis Role",
+            "nicknameCandidates": ["Neutral Scout"]
+        });
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({ "neutral-model": profile }),
+            json!([{
+                "model": "neutral-model",
+                "contextWindow": 262144,
+                "reasoning": serde_json::to_value(deepseek_reasoning_capability())
+                    .expect("serialize reasoning capability")
+            }]),
+            json!([{
+                "id": "neutral-route",
+                "match": { "models": ["neutral-model"] },
+                "upstream": {
+                    "targetProviderId": "official-target",
+                    "auth": { "source": "provider_config", "apiKey": "ROUTE_SECRET_SENTINEL" }
+                }
+            }]),
+        );
+        let mut official = Provider::with_id(
+            "official-target".to_string(),
+            "Official target".to_string(),
+            json!({}),
+            None,
+        );
+        official.category = Some("official".to_string());
+        let context = ProviderClassificationContext::from_providers([&official]);
+
+        let value = codex_subagent_profile_status_json(&settings, Some(&context))
+            .expect("inspect configured status");
+        let expected_path = agents_dir.join("ccswitch-analysis-role-2.toml");
+        assert_eq!(
+            value,
+            json!({
+                "mode": "v2",
+                "generationSource": "configured_profiles",
+                "profiles": [{
+                    "profileKey": "neutral-model",
+                    "model": "neutral-model",
+                    "providerKind": "official",
+                    "enabled": true,
+                    "routable": true,
+                    "fieldSources": {
+                        "roleName": "override",
+                        "description": "automatic",
+                        "developerInstructions": "automatic",
+                        "nicknameCandidates": "override",
+                        "modelReasoningEffort": "override"
+                    },
+                    "inputModality": {
+                        "source": "unknown",
+                        "declarations": [
+                            { "source": "profile_explicit", "adopted": false },
+                            { "source": "route", "adopted": false },
+                            { "source": "catalog", "adopted": false },
+                            { "source": "name_registry", "adopted": false }
+                        ]
+                    },
+                    "requestedRoleName": "Analysis Role",
+                    "effectiveRoleName": "ccswitch-analysis-role-2",
+                    "roleFilePath": expected_path.to_string_lossy(),
+                    "modelProvider": "codex_model_router_v2",
+                    "modelReasoningEffort": "high",
+                    "reasoningPolicy": "fixed",
+                    "reasoningCapability": {
+                        "supportKind": "effort_levels",
+                        "source": "builtin",
+                        "confidence": "confirmed",
+                        "codexSelectableEfforts": ["low", "high", "max"],
+                        "providerAcceptedEfforts": ["low", "high", "max"],
+                        "providerDefaultEffort": "high",
+                        "disableAllowed": true,
+                        "effortMap": {
+                            "low": "low",
+                            "medium": "high",
+                            "high": "high",
+                            "xhigh": "high",
+                        "max": "max"
+                        },
+                        "fingerprint": "8d5aeff0f2c9743effd90da1cc89b10ec0335e2e2766e8161a9bf0325360abf9"
+                    },
+                    "status": "generated",
+                    "warnings": []
+                }],
+                "warnings": []
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first_user_role).expect("read first user role"),
+            "name = \"analysis-role\"\nuser = \"FIRST\"\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second_user_role).expect("read second user role"),
+            "name = \"ccswitch-analysis-role\"\nuser = \"SECOND\"\n"
+        );
+        assert!(
+            !expected_path.exists(),
+            "status inspection must not write roles"
+        );
+        let serialized = value.to_string();
+        assert!(!serialized.contains("ROUTE_SECRET_SENTINEL"));
+        assert!(!serialized.contains("apiKey"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_profile_status_reports_non_generation_reasons_and_redacts_invalid_raw() {
+        let _guard = TestHomeGuard::new();
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                "disabled-model": codex_subagent_profile_status_profile("disabled-model", false),
+                "unroutable-model": codex_subagent_profile_status_profile("unroutable-model", true),
+                "first-alias": codex_subagent_profile_status_profile("collision-model", true),
+                "second-alias": codex_subagent_profile_status_profile("collision-model", true),
+                "PROFILE_KEY_SECRET_SENTINEL": {
+                    "model": "MODEL_SECRET_SENTINEL",
+                    "enabled": "CREDENTIAL_SECRET_SENTINEL",
+                    "apiKey": "API_KEY_SECRET_SENTINEL",
+                    "taskBody": "TASK_SECRET_SENTINEL",
+                    "encryptedContent": "ENCRYPTED_SECRET_SENTINEL"
+                }
+            }),
+            json!([
+                { "model": "disabled-model", "contextWindow": 1000 },
+                { "model": "unroutable-model", "contextWindow": 1000 },
+                { "model": "collision-model", "contextWindow": 1000 }
+            ]),
+            json!([{
+                "enabled": false,
+                "match": { "models": ["disabled-model", "collision-model"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let value = codex_subagent_profile_status_json(&settings, None)
+            .expect("inspect non-generation statuses");
+        assert_eq!(value["mode"], "v2");
+        assert_eq!(value["generationSource"], "configured_profiles");
+        let profiles = value["profiles"].as_array().expect("status profiles");
+        assert_eq!(profiles.len(), 5, "every stored entry must be preserved");
+        assert!(profiles.iter().any(|status| {
+            status["profileKey"] == "disabled-model"
+                && status["status"] == "disabled"
+                && status["nonGenerationReason"] == "disabled"
+                && status["routable"] == false
+                && status.get("roleFilePath").is_none()
+        }));
+        assert!(profiles.iter().any(|status| {
+            status["profileKey"] == "unroutable-model"
+                && status["status"] == "unroutable"
+                && status["nonGenerationReason"] == "unroutable"
+                && status["routable"] == false
+        }));
+        assert_eq!(
+            profiles
+                .iter()
+                .filter(|status| status["status"] == "collision")
+                .count(),
+            2
+        );
+        let invalid = profiles
+            .iter()
+            .find(|status| status["status"] == "invalid")
+            .expect("invalid status");
+        assert_eq!(
+            invalid,
+            &json!({
+                "routable": false,
+                "status": "invalid",
+                "nonGenerationReason": "invalid",
+                "warnings": []
+            })
+        );
+        let serialized = value.to_string();
+        for sentinel in [
+            "PROFILE_KEY_SECRET_SENTINEL",
+            "MODEL_SECRET_SENTINEL",
+            "CREDENTIAL_SECRET_SENTINEL",
+            "API_KEY_SECRET_SENTINEL",
+            "TASK_SECRET_SENTINEL",
+            "ENCRYPTED_SECRET_SENTINEL",
+        ] {
+            assert!(!serialized.contains(sentinel), "leaked sentinel {sentinel}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_profile_status_v1_marks_each_explicit_profile_inactive() {
+        let _guard = TestHomeGuard::new();
+        let settings = codex_subagent_profile_status_settings(
+            "v1",
+            json!({
+                "deepseek-v4-flash": codex_subagent_profile_status_profile("deepseek-v4-flash", true)
+            }),
+            json!([{ "model": "deepseek-v4-flash", "contextWindow": 1000000 }]),
+            json!([{
+                "match": { "models": ["deepseek-v4-flash"] },
+                "upstream": { "auth": { "source": "provider_config" } }
+            }]),
+        );
+        let value = codex_subagent_profile_status_json(&settings, None)
+            .expect("inspect inactive V1 profile");
+        assert_eq!(value["mode"], "v1");
+        assert_eq!(value["generationSource"], "inactive_v1");
+        assert_eq!(value["profiles"][0]["status"], "inactive_v1");
+        assert_eq!(value["profiles"][0]["nonGenerationReason"], "inactive_v1");
+        assert_eq!(value["profiles"][0]["routable"], false);
+        assert!(value["profiles"][0].get("roleFilePath").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_profile_status_legacy_inspects_actual_roles_without_writes() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create isolated agents dir");
+        let user_role = agents_dir.join("qwen-local.toml");
+        std::fs::write(&user_role, "name = \"qwen-local\"\nuser = \"KEEP\"\n")
+            .expect("seed user role");
+        let settings = json!({
+            "modelCatalog": { "models": [
+                { "model": "qwen3.6", "contextWindow": 262144 },
+                { "model": "deepseek-v4-flash", "contextWindow": 1000000 }
+            ] },
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v2",
+                "routes": [{
+                    "match": { "models": ["qwen3.6", "deepseek-v4-flash"] },
+                    "upstream": { "auth": { "source": "provider_config" } }
+                }]
+            }
+        });
+        let value = codex_subagent_profile_status_json(&settings, None)
+            .expect("inspect legacy managed roles");
+        assert_eq!(value["mode"], "v2");
+        assert_eq!(value["generationSource"], "legacy_managed_roles");
+        assert_eq!(value["profiles"].as_array().map(Vec::len), Some(2));
+        let qwen = value["profiles"]
+            .as_array()
+            .and_then(|profiles| profiles.iter().find(|status| status["model"] == "qwen3.6"))
+            .expect("qwen legacy status");
+        assert_eq!(qwen["requestedRoleName"], "qwen-local");
+        assert_eq!(qwen["effectiveRoleName"], "ccswitch-qwen-local");
+        assert_eq!(
+            qwen["roleFilePath"],
+            agents_dir
+                .join("ccswitch-qwen-local.toml")
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(qwen["status"], "generated");
+        assert_eq!(qwen["routable"], true);
+        assert_eq!(
+            std::fs::read_to_string(&user_role).expect("read preserved user role"),
+            "name = \"qwen-local\"\nuser = \"KEEP\"\n"
+        );
+        assert!(!agents_dir.join("ccswitch-qwen-local.toml").exists());
+        assert!(!agents_dir.join("deepseek-flash.toml").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_profile_status_propagates_db_errors_and_never_infers_provider_from_model() {
+        let _guard = TestHomeGuard::new();
+        let broken_db = crate::database::Database {
+            conn: std::sync::Mutex::new(
+                rusqlite::Connection::open_in_memory().expect("open schema-less database"),
+            ),
+        };
+        let error = get_codex_subagent_profile_statuses_from_db(&broken_db, json!({}))
+            .expect_err("provider query errors must propagate through the status command");
+        assert!(error.contains("no such table: providers"));
+
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                "gpt-official-looking": codex_subagent_profile_status_profile("gpt-official-looking", true)
+            }),
+            json!([{ "model": "gpt-official-looking", "contextWindow": 128000 }]),
+            json!([{
+                "match": { "models": ["gpt-official-looking"] },
+                "upstream": {
+                    "targetProviderId": "third-party-target",
+                    "auth": { "source": "managed_codex_oauth" }
+                }
+            }]),
+        );
+        let third_party = Provider::with_id(
+            "third-party-target".to_string(),
+            "Third party target".to_string(),
+            json!({}),
+            None,
+        );
+        let context = ProviderClassificationContext::from_providers([&third_party]);
+        let value = codex_subagent_profile_status_json(&settings, Some(&context))
+            .expect("inspect authoritative provider record");
+        assert_eq!(value["profiles"][0]["providerKind"], "third_party");
+        assert_eq!(value["profiles"][0]["status"], "generated");
+    }
+
+    #[test]
+    fn codex_subagent_v2_route_classifier_uses_runtime_exact_prefix_and_fail_closed_order() {
+        let classify = |settings: &Value, model: &str| {
+            codex_subagent_route_classification_with_context(settings, model, None)
+                .map(|classification| classification.provider_kind)
+        };
+        let settings = json!({
+            "codexRouting": {
+                "enabled": true,
+                "defaultRouteId": "official-default",
+                "routes": [
+                    {
+                        "id": "official-prefix",
+                        "match": { "prefixes": ["gpt-"] },
+                        "upstream": { "auth": { "source": "managed_codex_oauth" } }
+                    },
+                    {
+                        "id": "relay-exact",
+                        "match": { "models": ["gpt-5.5-relay"] },
+                        "upstream": {
+                            "targetProviderId": "relay-provider",
+                            "modelMap": { "gpt-5.5-relay": "gpt-5.5" },
+                            "auth": { "source": "provider_config" }
+                        }
+                    },
+                    {
+                        "id": "official-default",
+                        "match": { "models": ["gpt-default"] },
+                        "upstream": { "auth": { "source": "account_pool" } }
+                    }
+                ]
+            }
+        });
+        assert_eq!(
+            classify(&settings, "gpt-5.5-relay"),
+            Some(SubagentProviderKind::ThirdParty),
+            "an exact relay route must beat an earlier official prefix"
+        );
+        assert_eq!(
+            classify(&settings, "unknown-model"),
+            None,
+            "an unmatched request must not use defaultRouteId"
+        );
+        let fallback_settings = json!({
+            "codexRouting": {
+                "enabled": true,
+                "routes": [{
+                    "id": "first-enabled-relay",
+                    "match": { "models": ["relay-only"] },
+                    "upstream": { "targetProviderId": "relay-provider", "auth": { "source": "provider_config" } }
+                }]
+            }
+        });
+        assert_eq!(
+            classify(&fallback_settings, "unmatched-model"),
+            None,
+            "an unmatched request must not use the first enabled route"
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_route_classifier_matches_mode_all_target_catalog() {
+        let settings = json!({
+            "codexRouting": {
+                "enabled": true,
+                "routes": [
+                    {
+                        "id": "official",
+                        "enabled": true,
+                        "targetProviderId": "codex-official",
+                        "modelSelection": { "mode": "include", "models": ["gpt-5.6-sol"] },
+                        "matchPrefixes": ["gpt"]
+                    },
+                    {
+                        "id": "kimi",
+                        "enabled": true,
+                        "targetProviderId": "kimi-target",
+                        "modelSelection": { "mode": "all" },
+                        "matchPrefixes": []
+                    }
+                ]
+            }
+        });
+        let kimi = Provider::with_id(
+            "kimi-target".to_string(),
+            "Kimi".to_string(),
+            json!({ "modelCatalog": { "models": [{ "model": "k3" }] } }),
+            None,
+        );
+        let official = Provider::with_id(
+            "codex-official".to_string(),
+            "OpenAI Official".to_string(),
+            json!({
+                "modelCatalog": { "models": [{ "model": "gpt-5.6-sol" }] },
+                "auth": { "auth_mode": "chatgpt" }
+            }),
+            None,
+        );
+        let context = ProviderClassificationContext::from_providers([&kimi, &official]);
+
+        assert_eq!(
+            codex_subagent_route_classification_with_context(&settings, "k3", Some(&context))
+                .map(|classification| classification.provider_kind),
+            Some(SubagentProviderKind::ThirdParty),
+            "mode=all must classify models from its target Provider catalog"
+        );
+        assert_eq!(
+            codex_subagent_route_classification_with_context(
+                &settings,
+                "unselected-model",
+                Some(&context),
+            )
+            .map(|classification| classification.provider_kind),
+            None,
+            "a model outside every selected target catalog must remain unroutable"
+        );
+    }
+
+    fn classify_subagent_route_with_provider_records(
+        settings: &Value,
+        model: &str,
+        provider_records: &[(&str, SubagentProviderKind)],
+    ) -> Option<SubagentProviderKind> {
+        let providers = provider_records
+            .iter()
+            .map(|(id, kind)| {
+                let mut provider =
+                    Provider::with_id((*id).to_string(), (*id).to_string(), json!({}), None);
+                if *kind == SubagentProviderKind::Official {
+                    provider.meta = Some(crate::provider::ProviderMeta {
+                        provider_type: Some("codex_oauth".to_string()),
+                        ..Default::default()
+                    });
+                }
+                provider
+            })
+            .collect::<Vec<_>>();
+        let context = ProviderClassificationContext::from_providers(providers.iter());
+        codex_subagent_route_classification_with_context(settings, model, Some(&context))
+            .map(|classification| classification.provider_kind)
+    }
+
+    #[test]
+    fn codex_subagent_v2_target_provider_record_is_authoritative_with_safe_inline_fallback() {
+        let generic_target = json!({
+            "codexRouting": { "enabled": true, "routes": [{
+                "match": { "models": ["neutral-model"] },
+                "upstream": {
+                    "targetProviderId": "target-provider",
+                    "auth": { "source": "provider_config" }
+                }
+            }] }
+        });
+        assert_eq!(
+            classify_subagent_route_with_provider_records(
+                &generic_target,
+                "neutral-model",
+                &[("target-provider", SubagentProviderKind::Official)],
+            ),
+            Some(SubagentProviderKind::Official),
+            "an official ChatGPT/Codex OAuth target record must override generic inline auth"
+        );
+        let chatgpt_provider = Provider::with_id(
+            "target-provider".to_string(),
+            "ChatGPT".to_string(),
+            json!({"auth": {"auth_mode": "chatgpt"}}),
+            None,
+        );
+        let chatgpt_context = ProviderClassificationContext::from_providers([&chatgpt_provider]);
+        assert_eq!(
+            codex_subagent_route_classification_with_context(
+                &generic_target,
+                "neutral-model",
+                Some(&chatgpt_context),
+            )
+            .map(|classification| classification.provider_kind),
+            Some(SubagentProviderKind::Official),
+            "a ChatGPT auth_mode Provider record is official even when inline route auth is generic"
+        );
+        assert_eq!(
+            classify_subagent_route_with_provider_records(
+                &generic_target,
+                "neutral-model",
+                &[("target-provider", SubagentProviderKind::ThirdParty)],
+            ),
+            Some(SubagentProviderKind::ThirdParty),
+            "a third-party target record must remain third-party"
+        );
+
+        let misleading_inline = json!({
+            "codexRouting": { "enabled": true, "routes": [{
+                "match": { "models": ["gpt-looking-name"] },
+                "upstream": {
+                    "targetProviderId": "target-provider",
+                    "auth": { "source": "managed_codex_oauth" }
+                }
+            }] }
+        });
+        assert_eq!(
+            classify_subagent_route_with_provider_records(
+                &misleading_inline,
+                "gpt-looking-name",
+                &[("target-provider", SubagentProviderKind::ThirdParty)],
+            ),
+            Some(SubagentProviderKind::ThirdParty),
+            "the target record must win over inline auth and model names must not influence classification"
+        );
+        assert_eq!(
+            classify_subagent_route_with_provider_records(
+                &misleading_inline,
+                "gpt-looking-name",
+                &[],
+            ),
+            Some(SubagentProviderKind::Official),
+            "a missing target record must safely fall back to inline auth"
+        );
+        assert_eq!(
+            classify_subagent_route_with_provider_records(&generic_target, "gpt-5.6-sol", &[],),
+            None,
+            "an unmatched official-looking model must fail closed instead of inheriting a route"
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_target_provider_aliases_share_runtime_extractor_and_warning() {
+        let aliases = [
+            "targetProviderId",
+            "target_provider_id",
+            "providerId",
+            "provider_id",
+            "upstreamProviderId",
+            "upstream_provider_id",
+            "provider",
+        ];
+        let official = Provider::with_id(
+            "official-target".to_string(),
+            "Official target".to_string(),
+            json!({}),
+            None,
+        );
+        let mut official = official;
+        official.category = Some("official".to_string());
+        let context = ProviderClassificationContext::from_providers([&official]);
+
+        for scope in ["upstream", "top-level"] {
+            for alias in aliases {
+                let mut route = json!({
+                    "match": { "models": ["neutral-model"] },
+                    "upstream": { "auth": { "source": "provider_config" } }
+                });
+                if scope == "upstream" {
+                    route["upstream"][alias] = json!("official-target");
+                } else {
+                    route[alias] = json!("official-target");
+                }
+                let settings = json!({
+                    "codexRouting": { "enabled": true, "routes": [route] }
+                });
+                let classified = codex_subagent_route_classification_with_context(
+                    &settings,
+                    "neutral-model",
+                    Some(&context),
+                )
+                .expect("alias route classification");
+                assert_eq!(
+                    classified.provider_kind,
+                    SubagentProviderKind::Official,
+                    "{scope} alias {alias} must resolve the real target record before inline auth"
+                );
+                assert_eq!(classified.warning, None, "known record must not warn");
+
+                let missing = codex_subagent_route_classification_with_context(
+                    &settings,
+                    "neutral-model",
+                    Some(&ProviderClassificationContext::default()),
+                )
+                .expect("missing-record classification");
+                assert_eq!(
+                    missing.warning,
+                    Some("target_provider_record_unavailable_inline_auth_fallback"),
+                    "{scope} alias {alias} must preserve the controlled missing-record warning"
+                );
+            }
+        }
+
+        let precedence = json!({
+            "codexRouting": { "enabled": true, "routes": [{
+                "match": { "models": ["neutral-model"] },
+                "providerId": "third-party-target",
+                "upstream": {
+                    "provider_id": "official-target",
+                    "auth": { "source": "provider_config" }
+                }
+            }] }
+        });
+        let third_party = Provider::with_id(
+            "third-party-target".to_string(),
+            "Third party".to_string(),
+            json!({}),
+            None,
+        );
+        let context = ProviderClassificationContext::from_providers([&official, &third_party]);
+        assert_eq!(
+            codex_subagent_route_classification_with_context(
+                &precedence,
+                "neutral-model",
+                Some(&context),
+            )
+            .expect("precedence classification")
+            .provider_kind,
+            SubagentProviderKind::Official,
+            "upstream target aliases must precede top-level aliases exactly like runtime routing"
+        );
+    }
+
+    #[test]
+    fn codex_verbatim_restore_has_an_explicit_no_provider_context_prepare_boundary() {
+        let config_source = include_str!("codex_config.rs");
+        let proxy_source = include_str!("services/proxy.rs");
+        let boundary = concat!(
+            "prepare_codex_live_config_text_for_verbatim_restore_",
+            "without_provider_context"
+        );
+        assert!(
+            config_source.contains(boundary),
+            "deleted-provider restore must have a named no-context boundary"
+        );
+        assert!(
+            proxy_source.contains(boundary),
+            "verbatim restore must call only the named no-context boundary"
+        );
+        assert!(
+            !config_source.contains(concat!(
+                "pub fn prepare_codex_config_text_with_model_",
+                "catalog("
+            )),
+            "ordinary public prepare must not hide an implicit None provider context"
+        );
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PreviewIpcArgsForContract {
+        settings_config: Value,
+        model: String,
+        profile: CodexSubagentProfileConfig,
+    }
+
+    #[test]
+    fn codex_subagent_preview_ipc_uses_camel_case_three_argument_contract_and_rejects_mismatch() {
+        let args: PreviewIpcArgsForContract = serde_json::from_value(json!({
+            "settingsConfig": {
+                "modelCatalog": { "models": [{ "model": "DeepSeek-V4-Flash", "contextWindow": 1000000 }] },
+                "codexRouting": {
+                    "subagentV2": { "selectionPolicy": "balanced" },
+                    "routes": [{
+                        "match": { "models": ["DeepSeek-V4-Flash"] },
+                        "upstream": { "auth": { "source": "provider_config" } }
+                    }]
+                }
+            },
+            "model": "  deepseek-v4-pro  ",
+            "profile": {
+                "model": "DeepSeek-V4-Flash",
+                "enabled": true,
+                "questionnaire": {
+                    "taskStrengths": ["repository_exploration"],
+                    "optimization": "speed",
+                    "writeScope": "read_only",
+                    "preference": "eligible"
+                },
+                "reasoning": { "policy": "delegated" }
+            }
+        }))
+        .expect("camelCase preview IPC request");
+        let error = preview_codex_subagent_profile_with_context(
+            args.settings_config,
+            args.model,
+            args.profile,
+            None,
+        )
+        .expect_err("independent model/profile.model mismatch must be rejected");
+        assert_eq!(error, "Profile model does not match the requested model");
+    }
+
+    #[test]
+    fn codex_live_read_normalizes_only_invalid_unescaped_windows_notify_paths() {
+        let invalid = concat!(
+            "developer_instructions = \"\"\"\n",
+            "notify = [\"C:\\\\Users\\\\inside\\\\instructions.exe\", \"turn-ended\"]\n",
+            "\"\"\"\n",
+            "notify = [\"C:\\Users\\sunda\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\bin\\codex-computer-use.exe\", \"turn-ended\"]\n",
+            "model = \"gpt-5.5\"\n",
+        );
+        assert!(validate_config_toml(invalid).is_err());
+
+        let normalized = normalize_codex_config_text_for_live_read(invalid)
+            .expect("the generated Windows notify path should be recoverable");
+        validate_config_toml(&normalized).expect("normalized live config must be valid TOML");
+        assert!(normalized.contains(concat!(
+            "notify = [\"C:\\\\Users\\\\sunda\\\\AppData\\\\Local\\\\OpenAI\\\\Codex",
+            "\\\\runtimes\\\\cua_node\\\\bin\\\\codex-computer-use.exe\", \"turn-ended\"]"
+        )));
+        assert!(normalized
+            .contains("notify = [\"C:\\\\Users\\\\inside\\\\instructions.exe\", \"turn-ended\"]"));
+
+        let already_valid =
+            "notify = [\"C:\\\\Users\\\\sunda\\\\codex-computer-use.exe\", \"turn-ended\"]\n";
+        assert_eq!(
+            normalize_codex_config_text_for_live_read(already_valid)
+                .expect("valid config should pass through"),
+            already_valid
+        );
+    }
+
+    #[test]
+    fn codex_live_read_recovers_desktop_rewritten_notify_inside_developer_instructions() {
+        let invalid = concat!(
+            "developer_instructions = \"\"\"\n",
+            "notify = ['C:\\Users\\sunda\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\bin\\codex-computer-use.exe', \"turn-ended\"]\n",
+            "Keep this user instruction.\n",
+            "\"\"\"\n",
+            "notify = [\"C:\\\\Users\\\\sunda\\\\codex-computer-use.exe\", \"turn-ended\"]\n",
+        );
+        assert!(validate_config_toml(invalid).is_err());
+
+        let normalized = normalize_codex_config_text_for_live_read(invalid)
+            .expect("Desktop-rewritten notify text inside instructions should be recoverable");
+        let doc = normalized
+            .parse::<DocumentMut>()
+            .expect("recovered config should parse");
+        assert_eq!(
+            doc["developer_instructions"].as_str(),
+            Some(concat!(
+                "notify = ['C:\\Users\\sunda\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\bin\\codex-computer-use.exe', \"turn-ended\"]\n",
+                "Keep this user instruction.\n",
+            ))
+        );
+    }
+
+    #[test]
+    fn codex_live_read_repairs_unescaped_windows_project_basic_key() {
+        let invalid = concat!(
+            "model = \"gpt-5.6-sol\"\n",
+            "[projects.\"C:\\Users\\sunda\\Documents\\LLMservice\"]\n",
+            "trust_level = \"trusted\"\n",
+        );
+        assert!(validate_config_toml(invalid).is_err());
+
+        let normalized = normalize_codex_config_text_for_live_read(invalid)
+            .expect("the generated Windows project key should be recoverable");
+        validate_config_toml(&normalized).expect("normalized live config must be valid TOML");
+        let parsed: toml::Value = toml::from_str(&normalized).expect("parse normalized project");
+        assert_eq!(
+            parsed["projects"][r"C:\Users\sunda\Documents\LLMservice"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert!(normalized.contains(concat!(
+            "[projects.\"C:\\\\Users\\\\sunda\\\\Documents\\\\LLMservice\"]"
+        )));
+    }
+
+    #[test]
+    #[serial]
+    fn codex_atomic_write_repairs_unescaped_windows_project_basic_key() {
+        let _home = TestHomeGuard::new();
+        let invalid = concat!(
+            "model = \"gpt-5.6-sol\"\n",
+            "[projects.\"C:\\Users\\sunda\\Documents\\LLMservice\"]\n",
+            "trust_level = \"trusted\"\n",
+        );
+
+        write_codex_live_config_atomic(Some(invalid))
+            .expect("config-only restore should repair the project key before writing");
+        let config_only = read_codex_config_text().expect("read config-only output");
+        validate_config_toml(&config_only).expect("config-only output must stay valid");
+
+        write_codex_live_atomic(&json!({"auth_mode": "chatgpt"}), Some(invalid))
+            .expect("auth plus config restore should repair the project key before writing");
+        let auth_and_config = read_codex_config_text().expect("read atomic output");
+        let parsed: toml::Value =
+            toml::from_str(&auth_and_config).expect("parse atomic write output");
+        assert_eq!(
+            parsed["projects"][r"C:\Users\sunda\Documents\LLMservice"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_missing_fixed_reasoning_field_reports_specific_code() {
+        let error = parse_persisted_subagent_v2(&json!({
+            "schemaVersion": 2,
+            "selectionPolicy": "balanced",
+            "profiles": {
+                "deepseek-v4-pro": {
+                    "model": "deepseek-v4-pro",
+                    "enabled": true,
+                    "questionnaire": {
+                        "taskStrengths": ["complex_debugging"],
+                        "optimization": "quality",
+                        "writeScope": "complex_changes",
+                        "preference": "preferred"
+                    }
+                }
+            }
+        }))
+        .expect_err("schema v2 profile without reasoning must be rejected");
+
+        assert_eq!(
+            public_codex_subagent_validation_code(&error),
+            "missing_reasoning_policy"
+        );
+    }
+
+    #[test]
+    fn codex_subagent_v2_compile_marks_unmatched_and_disabled_declared_models_unroutable() {
+        let settings = json!({
+            "modelCatalog": { "models": [
+                { "model": "unknown", "contextWindow": 1000 },
+                { "model": "disabled-model", "contextWindow": 1000 }
+            ] },
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v2",
+                "subagentV2": {
+                    "schemaVersion": 1,
+                    "selectionPolicy": "balanced",
+                    "profiles": {
+                        "unknown": { "model": "unknown", "enabled": true, "questionnaire": { "taskStrengths": ["testing"], "optimization": "speed", "writeScope": "read_only", "preference": "eligible", "reasoningEffort": "auto" } },
+                        "disabled": { "model": "disabled-model", "enabled": true, "questionnaire": { "taskStrengths": ["testing"], "optimization": "speed", "writeScope": "read_only", "preference": "eligible", "reasoningEffort": "auto" } }
+                    }
+                },
+                "routes": [{
+                    "id": "disabled",
+                    "enabled": false,
+                    "match": { "models": ["disabled-model"] },
+                    "upstream": { "auth": { "source": "provider_config" } }
+                }]
+            }
+        });
+        let specs = codex_catalog_model_specs(&settings, "");
+        let compilation = compile_configured_codex_subagent_roles(
+            &settings,
+            &specs,
+            CodexSubagentVersion::V2,
+            None,
+        )
+        .expect("compile controlled unroutable profiles")
+        .expect("configured compiler selected");
+        assert!(
+            compilation.output.generated_roles.is_empty(),
+            "catalog presence alone must not make a model routable"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_v2_real_sync_honors_overrides_and_declared_user_name() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        let user_path = agents_dir.join("reviewer-file.toml");
+        let user_content = "name = \"flash-role\"\nmodel = \"user-model\"\n";
+        std::fs::write(&user_path, user_content).expect("seed differently named user role");
+        let stale = agents_dir.join("stale.toml");
+        std::fs::write(
+            &stale,
+            format!(
+                "{CC_SWITCH_MANAGED_AGENT_MARKER}\n\
+                 name = \"stale\"\n\
+                 model = \"old\"\n\
+                 model_provider = \"codex_model_router_v2\"\n"
+            ),
+        )
+        .expect("seed stale managed role");
+        let settings = json!({
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v2",
+                "subagentV2": {
+                    "schemaVersion": 1,
+                    "selectionPolicy": "balanced",
+                    "profiles": {
+                        "deepseek-v4-flash": {
+                            "model": "DeepSeek-V4-Flash",
+                            "enabled": true,
+                            "questionnaire": { "taskStrengths": ["repository_exploration"], "optimization": "quality", "writeScope": "bounded_changes", "preference": "preferred", "reasoningEffort": "auto" },
+                            "overrides": { "roleName": "flash-role", "description": "Filesystem description.", "modelReasoningEffort": "xhigh" }
+                        }
+                    }
+                },
+                "routes": [{ "id": "flash", "match": { "models": ["DeepSeek-V4-Flash"] }, "upstream": { "auth": { "source": "provider_config" } } }]
+            }
+        });
+        let specs = vec![CodexCatalogModelSpec {
+            model: "DeepSeek-V4-Flash".to_string(),
+            upstream_model: None,
+            display_name: "Flash".to_string(),
+            context_window: 1_000_000,
+            text_only: true,
+            is_default: false,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+            reasoning: Some(deepseek_reasoning_capability()),
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
+        }];
+
+        sync_codex_managed_agent_files_with_settings(
+            &specs,
+            CodexSubagentVersion::V2,
+            &settings,
+            None,
+        )
+        .expect("real configured filesystem sync");
+
+        assert_eq!(
+            std::fs::read_to_string(&user_path).expect("read user file"),
+            user_content
+        );
+        let managed = std::fs::read_to_string(agents_dir.join("ccswitch-flash-role.toml"))
+            .expect("declared user name must force managed fallback");
+        assert!(managed.contains("Filesystem description."));
+        assert!(managed.contains("model_reasoning_effort = \"xhigh\""));
+        assert!(
+            !stale.exists(),
+            "stale managed roles are pruned by the real sync path"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_sync_never_overwrites_user_toml_with_marker_only_in_its_body() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create isolated agents dir");
+        let path = agents_dir.join("deepseek-flash.toml");
+        let user_content = format!(
+            "name = \"deepseek-flash\"\n\
+             description = \"User authored role\"\n\
+             developer_instructions = \"\"\"\n\
+             This prose mentions {CC_SWITCH_MANAGED_AGENT_MARKER}\n\
+             but the file is not owned by CCSwitchMulti.\n\
+             \"\"\"\n\
+             model = \"deepseek-v4-flash\"\n\
+             model_provider = \"user-provider\"\n"
+        );
+        std::fs::write(&path, &user_content).expect("seed user-authored same-name role");
+
+        sync_codex_managed_agent_files(
+            &[review_codex_catalog_spec("deepseek-v4-flash")],
+            CodexSubagentVersion::V2,
+        )
+        .expect("sync without taking ownership of user content");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read preserved user role"),
+            user_content,
+            "a marker substring in the TOML body is not a provenance header"
+        );
+        assert!(
+            agents_dir.join("ccswitch-deepseek-flash.toml").exists(),
+            "managed output must use a fallback path when the requested path is user-owned"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_prune_never_deletes_user_toml_with_marker_only_in_its_body() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create isolated agents dir");
+        let path = agents_dir.join("user-not-managed.toml");
+        let user_content = format!(
+            "name = \"user-not-managed\"\n\
+             description = \"A user note containing {CC_SWITCH_MANAGED_AGENT_MARKER}\"\n\
+             model = \"user-model\"\n"
+        );
+        std::fs::write(&path, &user_content).expect("seed user role with marker substring");
+
+        prune_stale_codex_managed_agent_files(&agents_dir, &HashSet::new())
+            .expect("prune only genuinely managed roles");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("user file must survive prune"),
+            user_content
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_sync_does_not_infer_legacy_ownership_from_provider_and_model_match() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create isolated agents dir");
+        let path = agents_dir.join("deepseek-flash.toml");
+        let user_content = "name = \"deepseek-flash\"\n\
+                            description = \"User authored matching model\"\n\
+                            model = \"deepseek-v4-flash\"\n\
+                            model_provider = \"codex_model_router\"\n";
+        std::fs::write(&path, user_content).expect("seed legacy-looking user role");
+
+        sync_codex_managed_agent_files(
+            &[review_codex_catalog_spec("deepseek-v4-flash")],
+            CodexSubagentVersion::V2,
+        )
+        .expect("sync must preserve an unmarked user file");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read preserved matching user role"),
+            user_content,
+            "provider/model equality alone is not proof of legacy CCSwitchMulti ownership"
+        );
+        let fallback = agents_dir.join("ccswitch-deepseek-flash.toml");
+        assert!(
+            fallback.exists(),
+            "managed role must move to a fallback path"
+        );
+        assert!(std::fs::read_to_string(fallback)
+            .expect("read fallback managed role")
+            .starts_with(CC_SWITCH_MANAGED_AGENT_MARKER));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_v2_real_sync_rewrites_managed_output_for_changed_settings() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        let user_path = agents_dir.join("user.toml");
+        let user_content = "name = \"user\"\nmodel = \"custom\"\n";
+        std::fs::write(&user_path, user_content).expect("seed user role");
+        let specs = vec![CodexCatalogModelSpec {
+            model: "DeepSeek-V4-Flash".to_string(),
+            upstream_model: None,
+            display_name: "Flash".to_string(),
+            context_window: 1000,
+            text_only: true,
+            is_default: false,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+            reasoning:
+                crate::proxy::providers::codex_reasoning::builtin_reasoning_capability_for_model(
+                    "deepseek-v4-flash",
+                ),
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
+        }];
+        let make_settings = |description: &str| {
+            json!({
+                "codexRouting": {
+                    "enabled": true,
+                    "subagentV2": { "schemaVersion": 1, "profiles": { "deepseek-v4-flash": {
+                        "model": "DeepSeek-V4-Flash", "enabled": true,
+                        "questionnaire": { "taskStrengths": ["testing"], "optimization": "speed", "writeScope": "read_only", "preference": "eligible", "reasoningEffort": "auto" },
+                        "overrides": { "description": description }
+                    }}},
+                    "routes": [{ "match": { "models": ["DeepSeek-V4-Flash"] }, "upstream": { "auth": { "source": "provider_config" } } }]
+                }
+            })
+        };
+        let first_settings = make_settings("First filesystem config.");
+        sync_codex_managed_agent_files_with_settings(
+            &specs,
+            CodexSubagentVersion::V2,
+            &first_settings,
+            None,
+        )
+        .expect("first sync");
+        let path = agents_dir.join("deepseek-v4-flash.toml");
+        let first = std::fs::read_to_string(&path).expect("first managed role");
+        let second_settings = make_settings("Second filesystem config.");
+
+        sync_codex_managed_agent_files_with_settings(
+            &specs,
+            CodexSubagentVersion::V2,
+            &second_settings,
+            None,
+        )
+        .expect("second sync with changed settings");
+        let second = std::fs::read_to_string(&path).expect("rewritten managed role");
+        assert_ne!(first, second);
+        assert!(second.contains("Second filesystem config."));
+        assert_eq!(
+            std::fs::read_to_string(&user_path).expect("read user role after changed V2 sync"),
+            user_content
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_v2_same_retained_settings_survive_v1_cleanup_and_v2_restore() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        let user_path = agents_dir.join("user.toml");
+        let user_content = "name = \"user\"\nmodel = \"custom\"\n";
+        std::fs::write(&user_path, user_content).expect("seed user role");
+        let specs = vec![CodexCatalogModelSpec {
+            model: "DeepSeek-V4-Flash".to_string(),
+            upstream_model: None,
+            display_name: "Flash".to_string(),
+            context_window: 1000,
+            text_only: true,
+            is_default: false,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+            reasoning:
+                crate::proxy::providers::codex_reasoning::builtin_reasoning_capability_for_model(
+                    "deepseek-v4-flash",
+                ),
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
+        }];
+        let persisted_settings = json!({
+            "codexRouting": {
+                "enabled": true,
+                "subagentV2": { "schemaVersion": 1, "profiles": { "deepseek-v4-flash": {
+                    "model": "DeepSeek-V4-Flash", "enabled": true,
+                    "questionnaire": { "taskStrengths": ["testing"], "optimization": "speed", "writeScope": "read_only", "preference": "eligible", "reasoningEffort": "auto" },
+                    "overrides": { "description": "Preserved config." }
+                }}},
+                "routes": [{ "match": { "models": ["DeepSeek-V4-Flash"] }, "upstream": { "auth": { "source": "provider_config" } } }]
+            }
+        });
+        sync_codex_managed_agent_files_with_settings(
+            &specs,
+            CodexSubagentVersion::V2,
+            &persisted_settings,
+            None,
+        )
+        .expect("initial V2 sync from retained settings");
+        let path = agents_dir.join("deepseek-v4-flash.toml");
+        let first = std::fs::read_to_string(&path).expect("initial managed role");
+        assert!(first.contains("Preserved config."));
+        assert!(!first.contains("model_reasoning_effort"));
+
+        sync_codex_managed_agent_files_with_settings(
+            &specs,
+            CodexSubagentVersion::V1,
+            &persisted_settings,
+            None,
+        )
+        .expect("V1 cleanup using retained settings");
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&user_path).expect("read user role after V1 cleanup"),
+            user_content
+        );
+
+        sync_codex_managed_agent_files_with_settings(
+            &specs,
+            CodexSubagentVersion::V2,
+            &persisted_settings,
+            None,
+        )
+        .expect("V2 restore after V1");
+        let restored = std::fs::read_to_string(&path).expect("restored managed role");
+        assert!(restored.contains("Preserved config."));
+        assert!(!restored.contains("model_reasoning_effort"));
+        assert_eq!(
+            std::fs::read_to_string(&user_path).expect("read user role after V2 restore"),
+            user_content
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_v2_catalog_disappearance_and_alias_change_preserve_canonical_profile() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        let canonical_model = "vendor/canonical-model";
+        let settings = json!({
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v2",
+                "subagentV2": { "schemaVersion": 1, "profiles": { (canonical_model): {
+                    "model": canonical_model,
+                    "enabled": true,
+                    "questionnaire": { "taskStrengths": ["testing"], "optimization": "quality", "writeScope": "bounded_changes", "preference": "preferred", "reasoningEffort": "auto" },
+                    "overrides": { "roleName": "stable-role", "description": "Persisted questionnaire override." }
+                }}},
+                "routes": [{ "match": { "models": [canonical_model] }, "upstream": { "auth": { "source": "provider_config" } } }]
+            }
+        });
+        let spec = |display_name: &str| CodexCatalogModelSpec {
+            model: canonical_model.to_string(),
+            upstream_model: None,
+            display_name: display_name.to_string(),
+            context_window: 262_144,
+            text_only: true,
+            is_default: false,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
+        };
+        let path = agents_dir.join("stable-role.toml");
+
+        sync_codex_managed_agent_files_with_settings(
+            &[spec("Old visible alias")],
+            CodexSubagentVersion::V2,
+            &settings,
+            None,
+        )
+        .expect("initial catalog sync");
+        assert!(path.exists());
+
+        sync_codex_managed_agent_files_with_settings(
+            &[],
+            CodexSubagentVersion::V2,
+            &settings,
+            None,
+        )
+        .expect("catalog model temporarily absent");
+        assert!(!path.exists());
+        // This renderer does not own persistence. Reusing the same retained settings
+        // proves filesystem/compiler restoration; DAO interleaving tests cover storage survival.
+        sync_codex_managed_agent_files_with_settings(
+            &[spec("Renamed visible alias")],
+            CodexSubagentVersion::V2,
+            &settings,
+            None,
+        )
+        .expect("catalog model restored under a new visible alias");
+        let restored = std::fs::read_to_string(&path).expect("restored canonical role");
+        assert!(restored.contains(&format!("model = \"{canonical_model}\"")));
+        assert!(restored.contains("Persisted questionnaire override."));
+        assert!(!restored.contains("model_reasoning_effort"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_v2_invalid_user_toml_still_reserves_its_filename_stem() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        std::fs::write(agents_dir.join("Invalid-Role.toml"), "name = [")
+            .expect("seed invalid user TOML");
+        let occupied = occupied_user_codex_agent_names(&agents_dir).expect("scan user agents");
+        assert!(occupied
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("invalid-role")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_subagent_v2_missing_config_uses_real_legacy_filesystem_sync() {
+        let _guard = TestHomeGuard::new();
+        let specs = vec![CodexCatalogModelSpec {
+            model: "qwen3.6".to_string(),
+            upstream_model: None,
+            display_name: "Qwen 3.6".to_string(),
+            context_window: 262_144,
+            text_only: true,
+            is_default: false,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
+        }];
+        sync_codex_managed_agent_files_with_settings(
+            &specs,
+            CodexSubagentVersion::V2,
+            &json!({"codexRouting": {"enabled": true}}),
+            None,
+        )
+        .expect("legacy filesystem sync");
+        let role = std::fs::read_to_string(get_codex_agents_dir().join("qwen-local.toml"))
+            .expect("legacy managed role");
+        assert!(role.contains(CC_SWITCH_MANAGED_AGENT_MARKER));
+        assert!(role.contains(
+            "Low-cost Qwen worker for read-heavy exploration, summaries, and bounded helper tasks."
+        ));
+    }
+
     use serial_test::serial;
 
     #[test]
-    fn managed_codex_retry_budget_allows_pre_stream_but_not_in_flight_stream_retry() {
-        assert!(CODEX_MANAGED_REQUEST_MAX_RETRIES > 0);
-        assert_eq!(CODEX_MANAGED_STREAM_MAX_RETRIES, 0);
+    fn managed_codex_retry_budget_preserves_codex_stream_recovery() {
+        assert_eq!(CODEX_MANAGED_REQUEST_MAX_RETRIES, 2);
+        assert_eq!(CODEX_MANAGED_STREAM_MAX_RETRIES, 5);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_projection_cache_does_not_overwrite_external_update_before_companion_write() {
+        let _guard = TestHomeGuard::new();
+        seed_codex_models_cache(json!([{"slug": "gpt-5.4"}]));
+        let config_path = get_codex_config_path();
+        let original_config = "model = \"private-model\"\n";
+        std::fs::write(&config_path, original_config).expect("seed config");
+        let settings = json!({
+            "modelCatalog": { "models": [{
+                "model": "private-model",
+                "displayName": "Private model",
+                "contextWindow": 128000
+            }]}
+        });
+        let cache_path = get_codex_models_cache_path();
+        set_test_companion_prewrite_mutation_for_test(
+            &cache_path,
+            "{\"external_metadata\":\"keep\",\"client_version\":\"0.140.0\"}",
+        );
+        let error = prepare_codex_config_text_with_model_catalog_without_provider_context(
+            &settings,
+            original_config,
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect_err("external cache change must defer projection");
+        assert!(
+            error.to_string().contains("concurrent") || error.to_string().contains("并发"),
+            "unexpected error: {error:?}"
+        );
+        let cache: Value = read_json_file(&cache_path).expect("read cache after projection");
+        assert_eq!(
+            cache.get("external_metadata").and_then(Value::as_str),
+            Some("keep"),
+            "projection cache commit must not overwrite a newer external cache update"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config after deferred projection"),
+            original_config,
+            "config commit must roll back while the attempt still owns the live bytes"
+        );
+    }
+
+    #[test]
+    fn raw_codex_fulltext_writer_is_not_reexported_to_application_callers() {
+        let lib_source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
+        )
+        .expect("read crate lib source");
+        assert!(
+            !lib_source.contains("write_codex_live_atomic"),
+            "raw Codex fulltext writer must not remain in the public application re-export"
+        );
+    }
+
+    #[test]
+    fn raw_codex_fulltext_writers_are_not_public_module_api() {
+        let codex_source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codex_config.rs"),
+        )
+        .expect("read Codex config source");
+        let raw_auth_signature = ["pub", " fn write_codex_live_atomic"].concat();
+        let raw_config_signature = ["pub", " fn write_codex_live_config_atomic"].concat();
+        assert!(
+            !codex_source.contains(&raw_auth_signature),
+            "raw Codex auth+config writer must stay crate-private"
+        );
+        assert!(
+            !codex_source.contains(&raw_config_signature),
+            "raw Codex config writer must stay crate-private"
+        );
     }
 
     #[test]
@@ -4378,6 +11985,110 @@ trust_level = "trusted"
                 None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
             }
         }
+    }
+
+    #[cfg(test)]
+    fn set_test_concurrency_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_CONCURRENCY_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue.lock().expect("lock test mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+    }
+
+    #[cfg(test)]
+    fn set_test_config_after_write_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_CONFIG_AFTER_WRITE_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock config after-write mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+    }
+
+    #[cfg(test)]
+    fn set_test_auth_after_capture_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_AUTH_AFTER_CAPTURE_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock auth after-capture mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+    }
+
+    #[cfg(test)]
+    fn set_test_auth_after_commit_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_AUTH_AFTER_COMMIT_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue.lock().expect("lock auth after-commit mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+    }
+
+    #[cfg(test)]
+    fn set_test_companion_after_config_mutation_for_test(path: &Path, contents: &str) {
+        let queue = super::TEST_COMPANION_AFTER_CONFIG_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock companion after-config mutation queue");
+        queue.clear();
+        queue.push_back((path.to_path_buf(), contents.to_string()));
+    }
+
+    #[cfg(test)]
+    fn set_test_companion_prewrite_mutations_for_test<const N: usize>(entries: [(&Path, &str); N]) {
+        let queue = super::TEST_COMPANION_PREWRITE_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock companion pre-write mutation queue");
+        queue.clear();
+        queue.extend(
+            entries
+                .into_iter()
+                .map(|(path, contents)| (path.to_path_buf(), contents.to_string())),
+        );
+    }
+
+    #[cfg(test)]
+    fn set_test_provider_merge_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_PROVIDER_MERGE_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock provider merge test mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+    }
+
+    #[cfg(test)]
+    fn set_test_config_transform_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_CONFIG_TRANSFORM_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock config transform test mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+        super::TEST_CONFIG_TRANSFORM_AGENT_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()))
+            .lock()
+            .expect("lock config transform agent mutation queue")
+            .clear();
+    }
+
+    #[cfg(test)]
+    fn set_test_config_transform_agent_mutation(path: &Path, contents: &str) {
+        let queue = super::TEST_CONFIG_TRANSFORM_AGENT_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock config transform agent mutation queue");
+        queue.clear();
+        queue.push_back((path.to_path_buf(), contents.to_string()));
     }
 
     /// 写入一份带官方 client_version 的模型缓存，模拟 Codex 已经启动过的环境。
@@ -4533,7 +12244,24 @@ command = "example"
                 .and_then(toml::Value::as_integer),
             Some(CODEX_MANAGED_STREAM_MAX_RETRIES as i64)
         );
+        assert_eq!(
+            doc["features"]["respect_system_proxy"].as_bool(),
+            Some(true)
+        );
         assert!(codex_config_has_official_proxy_route(&output));
+    }
+
+    #[test]
+    fn official_proxy_route_can_leave_system_proxy_policy_disabled() {
+        let output = apply_codex_official_proxy_route_with_system_proxy_policy(
+            "[features]\nmulti_agent_v2 = true\n",
+            "http://127.0.0.1:15721/v1",
+            false,
+        )
+        .expect("apply official proxy route");
+        let doc: toml::Value = toml::from_str(&output).expect("parse output");
+        assert_eq!(doc["features"]["multi_agent_v2"].as_bool(), Some(true));
+        assert!(doc["features"].get("respect_system_proxy").is_none());
     }
 
     #[test]
@@ -5008,6 +12736,35 @@ experimental_bearer_token = "stale-table-key"
     }
 
     #[test]
+    #[serial_test::serial]
+    fn clear_stale_auth_defers_when_external_update_occurs_after_capture() {
+        let _guard = TestHomeGuard::new();
+        let auth_path = get_codex_auth_path();
+        std::fs::create_dir_all(auth_path.parent().expect("auth parent"))
+            .expect("create Codex directory");
+        write_json_file(&auth_path, &json!({ "OPENAI_API_KEY": "stale-key" }))
+            .expect("seed stale auth");
+        let external_oauth =
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"external-access"}}"#;
+        set_test_auth_after_capture_mutations([external_oauth]);
+
+        let error = clear_stale_codex_live_auth_after_official_switch(&json!({}))
+            .expect_err("auth cleanup must defer after an external update");
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("并发")
+                || error_text.contains("concurrent")
+                || error_text.contains("deferred"),
+            "auth cleanup race must report deferred ownership: {error_text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&auth_path).expect("read external auth"),
+            external_oauth,
+            "auth cleanup must preserve the external OAuth update"
+        );
+    }
+
+    #[test]
     fn prepare_provider_live_config_does_not_create_incomplete_provider_table() {
         let input = r#"model_provider = "vendor_x"
 model = "gpt-5"
@@ -5045,6 +12802,15 @@ memories = true
 
 [desktop]
 show-context-window-usage = true
+
+[plugins."sdd@personal"]
+enabled = true
+
+[marketplaces.personal]
+source = "local"
+
+[custom_user_table]
+value = "live-user-value"
 
 [memories]
 generate_memories = true
@@ -5129,6 +12895,32 @@ experimental_bearer_token = "provider-token"
         );
         assert_eq!(
             parsed
+                .get("plugins")
+                .and_then(|value| value.get("sdd@personal"))
+                .and_then(|value| value.get("enabled"))
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "live plugin enablement must survive provider merge"
+        );
+        assert_eq!(
+            parsed
+                .get("marketplaces")
+                .and_then(|value| value.get("personal"))
+                .and_then(|value| value.get("source"))
+                .and_then(|value| value.as_str()),
+            Some("local"),
+            "marketplace registration must survive provider merge"
+        );
+        assert_eq!(
+            parsed
+                .get("custom_user_table")
+                .and_then(|value| value.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("live-user-value"),
+            "unknown user tables must survive provider merge"
+        );
+        assert_eq!(
+            parsed
                 .get("memories")
                 .and_then(|value| value.get("use_memories"))
                 .and_then(|value| value.as_bool()),
@@ -5208,6 +13000,448 @@ wire_api = "responses"
                 .and_then(|value| value.as_integer()),
             Some(240_000),
             "single-model providers must keep an explicit user compaction override"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_atomic_rejects_missing_config_without_touching_files() {
+        let _guard = TestHomeGuard::new();
+        let auth_path = get_codex_auth_path();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let old_auth = br#"{"OPENAI_API_KEY":"sk-old"}"#;
+        let old_config = b"[desktop]\nenabled-reasoning-efforts = [\"max\"]\n";
+        std::fs::write(&auth_path, old_auth).expect("seed auth");
+        std::fs::write(&config_path, old_config).expect("seed config");
+
+        let error = write_codex_live_atomic(&json!({"OPENAI_API_KEY": "sk-new"}), None)
+            .expect_err("missing config must fail closed");
+        assert!(error.to_string().contains("config"));
+        assert_eq!(std::fs::read(&auth_path).expect("read auth"), old_auth);
+        assert_eq!(
+            std::fs::read(&config_path).expect("read config"),
+            old_config
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_atomic_persists_auth_and_config() {
+        let _guard = TestHomeGuard::new();
+        let auth = json!({"OPENAI_API_KEY": "dev-key"});
+        let config_text = "[mcp_servers.echo]\ncommand = \"echo\"\n";
+
+        write_codex_live_atomic(&auth, Some(config_text)).expect("atomic write should succeed");
+
+        let stored_auth: Value = read_json_file(&get_codex_auth_path()).expect("read auth");
+        assert_eq!(stored_auth, auth);
+        assert!(read_codex_config_text()
+            .expect("read config")
+            .contains("mcp_servers.echo"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_atomic_rolls_back_auth_when_config_write_fails() {
+        let _guard = TestHomeGuard::new();
+        let auth_path = get_codex_auth_path();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&auth_path, br#"{"OPENAI_API_KEY":"legacy"}"#).expect("seed auth");
+        std::fs::create_dir_all(&config_path).expect("create blocking config directory");
+
+        let error = write_codex_live_atomic(
+            &json!({"OPENAI_API_KEY": "new-key"}),
+            Some("[mcp_servers.sample]\ncommand = \"noop\"\n"),
+        )
+        .expect_err("config write should fail when target is directory");
+        assert!(error.to_string().contains("config") || error.to_string().contains("配置"));
+        assert!(std::fs::read_to_string(&auth_path)
+            .expect("read existing auth")
+            .contains("legacy"));
+        assert!(std::fs::metadata(&config_path)
+            .expect("config path metadata")
+            .is_dir());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_config_atomic_rejects_missing_config_without_touching_file() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let old_config = b"[desktop]\nenabled-reasoning-efforts = [\"max\"]\n";
+        std::fs::write(&config_path, old_config).expect("seed config");
+
+        let error =
+            write_codex_live_config_atomic(None).expect_err("missing config must fail closed");
+        assert!(error.to_string().contains("config"));
+        assert_eq!(
+            std::fs::read(&config_path).expect("read config"),
+            old_config
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_for_provider_rejects_missing_config_without_touching_live() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let old_config = r#"model = "gpt-5"
+model_provider = "custom"
+base_url = "https://example.invalid/v1"
+
+[desktop]
+enabled-reasoning-efforts = ["low", "medium", "high", "xhigh", "ultra", "max"]
+
+[plugins."sdd@personal"]
+enabled = true
+
+[projects."C:\\repo"]
+trust_level = "trusted"
+
+[marketplaces.personal]
+source = "local"
+
+[custom_user_table]
+value = "keep"
+"#;
+        std::fs::write(&config_path, old_config).expect("seed config");
+
+        let error = write_codex_live_for_provider(Some("third_party"), &json!({}), None)
+            .expect_err("missing config must fail closed");
+        assert!(error.to_string().contains("config"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config"),
+            old_config
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_config_atomic_rechecks_fingerprint_before_replace() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&config_path, "[desktop]\nold = true\n").expect("seed config");
+        set_test_concurrency_mutations(["[desktop]\nexternal = true\n"]);
+
+        write_codex_live_config_atomic(Some("model = \"gpt-5.6\"\n[desktop]\nprovider = true\n"))
+            .expect("writer should retry against the externally changed file");
+
+        let restored = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(restored.contains("external = true"));
+        assert!(restored.contains("model = \"gpt-5.6\""));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_for_provider_preserves_change_after_provider_merge_before_writer_entry() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(
+            &config_path,
+            "[desktop]\nold = true\n\n[custom_user_table]\nvalue = \"old\"\n",
+        )
+        .expect("seed config");
+        set_test_provider_merge_mutations([
+            "[desktop]\nexternal = true\n\n[plugins.\"sdd@personal\"]\nenabled = true\n\n[custom_user_table]\nvalue = \"external\"\n",
+        ]);
+
+        write_codex_live_for_provider(
+            Some("third_party"),
+            &json!({}),
+            Some("model = \"gpt-5.6\"\n"),
+        )
+        .expect("provider write should preserve the external change");
+
+        let restored = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(restored.contains("external = true"));
+        assert!(restored.contains("[plugins.\"sdd@personal\"]"));
+        assert!(restored.contains("model = \"gpt-5.6\""));
+        assert!(restored.contains("value = \"external\""));
+        assert!(!restored.contains("old = true"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_config_atomic_defers_after_bounded_retries() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&config_path, "[desktop]\nold = true\n").expect("seed config");
+        let external_versions = [
+            "[desktop]\none = true\n",
+            "[desktop]\ntwo = true\n",
+            "[desktop]\nthree = true\n",
+        ];
+        set_test_concurrency_mutations(external_versions);
+
+        let error = write_codex_live_config_atomic(Some("model = \"gpt-5.6\"\n"))
+            .expect_err("writer must stop after bounded concurrent modifications");
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("concurrent")
+                || error.to_string().contains("并发")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read final external config"),
+            external_versions[2]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_config_reconcile_retries_against_external_mcp_change() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&config_path, "[desktop]\nold = true\n").expect("seed config");
+        set_test_concurrency_mutations(["[desktop]\nexternal = true\n"]);
+
+        write_codex_live_config_reconcile(&config_path, |base| {
+            let mut doc = if base.trim().is_empty() {
+                DocumentMut::new()
+            } else {
+                base.parse::<DocumentMut>().expect("parse live config")
+            };
+            doc["mcp_servers"]["managed"]["command"] = toml_edit::value("from-db");
+            Ok(doc.to_string())
+        })
+        .expect("reconcile should retry");
+
+        let restored = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(restored.contains("external = true"));
+        let parsed: toml::Value = restored.parse().expect("parse reconciled config");
+        assert_eq!(
+            parsed
+                .get("mcp_servers")
+                .and_then(|value| value.get("managed"))
+                .and_then(|value| value.get("command"))
+                .and_then(|value| value.as_str()),
+            Some("from-db")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn committed_attempt_does_not_claim_external_write_after_replace_before_receipt() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let before = "[desktop]\nbefore = true\n";
+        let external_after_replace = "[desktop]\nexternal = \"third\"\n";
+        std::fs::write(&config_path, before).expect("seed config");
+        set_test_config_after_write_mutations([external_after_replace]);
+
+        let attempt = write_codex_live_config_reconcile_with_attempt(&config_path, |_| {
+            Ok("[desktop]\ncandidate = true\n".to_string())
+        })
+        .expect("candidate write should succeed");
+
+        let restored = attempt
+            .restore_if_unchanged(&config_path)
+            .expect("conditional restore should complete");
+        assert!(
+            !restored,
+            "an external write after replacement must invalidate this attempt receipt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config"),
+            external_after_replace,
+            "rollback must preserve the external third version"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_config_reconcile_defers_after_bounded_retries() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&config_path, "[desktop]\nold = true\n").expect("seed config");
+        let external_versions = [
+            "[desktop]\none = true\n",
+            "[desktop]\ntwo = true\n",
+            "[desktop]\nthree = true\n",
+        ];
+        set_test_concurrency_mutations(external_versions);
+
+        let error = write_codex_live_config_reconcile(&config_path, |base| {
+            let mut doc = if base.trim().is_empty() {
+                DocumentMut::new()
+            } else {
+                base.parse::<DocumentMut>().expect("parse live config")
+            };
+            doc["mcp_servers"]["managed"]["command"] = toml_edit::value("from-db");
+            Ok(doc.to_string())
+        })
+        .expect_err("reconcile must defer after bounded conflicts");
+        assert!(error.to_string().contains("concurrent") || error.to_string().contains("并发"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read final external config"),
+            external_versions[2]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_write_defers_after_bounded_merge_conflicts_and_rolls_back_auth() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        let auth_path = get_codex_auth_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&config_path, "[desktop]\nold = true\n").expect("seed config");
+        let old_auth = json!({"OPENAI_API_KEY": "old-key"});
+        write_json_file(&auth_path, &old_auth).expect("seed auth");
+        let old_auth_bytes = std::fs::read(&auth_path).expect("read old auth");
+        let external_versions = [
+            "[desktop]\none = true\n",
+            "[desktop]\ntwo = true\n",
+            "[desktop]\nthree = true\n",
+        ];
+        set_test_provider_merge_mutations(external_versions);
+
+        let error = write_codex_live_for_provider(
+            Some("official"),
+            &json!({"OPENAI_API_KEY": "new-key"}),
+            Some("model = \"gpt-5.6\"\n"),
+        )
+        .expect_err("provider write must defer after bounded merge conflicts");
+        assert!(error.to_string().contains("concurrent") || error.to_string().contains("并发"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read final external config"),
+            external_versions[2]
+        );
+        assert_eq!(
+            std::fs::read(&auth_path).expect("read rolled-back auth"),
+            old_auth_bytes,
+            "auth.json must roll back when the reconciled config write is deferred"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_auth_commit_defers_when_external_update_occurs_after_capture() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        let auth_path = get_codex_auth_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let old_config = "model_provider = \"custom\"\nmodel = \"gpt-5.6\"\n";
+        std::fs::write(&config_path, old_config).expect("seed config");
+        write_json_file(&auth_path, &json!({"OPENAI_API_KEY": "old-key"})).expect("seed auth");
+        set_test_auth_after_capture_mutations([r#"{"OPENAI_API_KEY":"external-after-capture"}"#]);
+
+        let error = write_codex_live_for_provider(
+            Some("official"),
+            &json!({"OPENAI_API_KEY": "new-key"}),
+            Some("model_provider = \"custom\"\nmodel = \"gpt-5.6\"\n"),
+        )
+        .expect_err("auth commit must defer after an external update between capture and commit");
+
+        assert!(
+            error.to_string().contains("concurrent")
+                || error.to_string().contains("并发")
+                || error.to_string().contains("deferred")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&auth_path).expect("read external auth"),
+            r#"{"OPENAI_API_KEY":"external-after-capture"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read unchanged config"),
+            old_config,
+            "deferred auth commit must not alter the live config"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_auth_rollback_preserves_external_update_after_commit() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        let auth_path = get_codex_auth_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let invalid_live = "[desktop\ninvalid = true\n";
+        std::fs::write(&config_path, invalid_live).expect("seed invalid config");
+        write_json_file(&auth_path, &json!({"OPENAI_API_KEY": "old-key"})).expect("seed auth");
+        set_test_auth_after_commit_mutations([r#"{"OPENAI_API_KEY":"external-after-commit"}"#]);
+
+        let error = write_codex_live_for_provider(
+            Some("official"),
+            &json!({"OPENAI_API_KEY": "new-key"}),
+            Some("model_provider = \"custom\"\nmodel = \"gpt-5.6\"\n"),
+        )
+        .expect_err("invalid live TOML must trigger auth rollback");
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("deferred")
+                || error_text.contains("并发")
+                || error_text.contains("恢复未完成"),
+            "rollback error must report a deferred/partial restore: {error_text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&auth_path).expect("read external auth"),
+            r#"{"OPENAI_API_KEY":"external-after-commit"}"#,
+            "rollback must preserve the external auth update"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read unchanged invalid config"),
+            invalid_live
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_write_rejects_invalid_live_toml_without_touching_config_or_auth() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        let auth_path = get_codex_auth_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let invalid_live = "[desktop\ninvalid = true\n";
+        std::fs::write(&config_path, invalid_live).expect("seed invalid config");
+        let old_auth = json!({"OPENAI_API_KEY": "old-key"});
+        write_json_file(&auth_path, &old_auth).expect("seed auth");
+        let old_auth_bytes = std::fs::read(&auth_path).expect("read old auth");
+
+        let error = write_codex_live_for_provider(
+            Some("official"),
+            &json!({"OPENAI_API_KEY": "new-key"}),
+            Some("model = \"gpt-5.6\"\n"),
+        )
+        .expect_err("invalid live config must fail closed");
+        assert!(
+            error.to_string().contains("TOML")
+                || error.to_string().contains("toml")
+                || error.to_string().contains("配置")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read unchanged invalid config"),
+            invalid_live
+        );
+        assert_eq!(
+            std::fs::read(&auth_path).expect("read rolled-back auth"),
+            old_auth_bytes,
+            "auth.json must roll back when provider reconciliation rejects live TOML"
         );
     }
 
@@ -5975,6 +14209,10 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         }];
         let catalog = codex_model_catalog_from_specs(
             &specs,
@@ -6096,6 +14334,13 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             Some(&json!(["text", "image"])),
             "models without a text-only override should keep the template modalities"
         );
+        assert_eq!(
+            models[1]
+                .get("supports_image_detail_original")
+                .and_then(Value::as_bool),
+            Some(true),
+            "image-capable Chat routes should expose original detail through the adapter's high-detail translation"
+        );
         assert!(
             models[0].get("model_messages").is_some(),
             "Codex requires model_messages in custom catalogs"
@@ -6122,6 +14367,36 @@ openai_base_url = "http://127.0.0.1:15721/v1"
                 .is_some_and(|value| value.is_null()),
             "generated third-party entries should not inherit GPT-5.5 launch messaging"
         );
+    }
+
+    #[test]
+    fn codex_catalog_reasoning_resolves_provider_inline_model_alias() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "router-alias",
+                    "upstreamModel": "vendor-reasoning-model"
+                }]
+            }
+        });
+        let config = r#"
+            [[model_providers.vendor.models]]
+            id = "vendor-reasoning-model"
+            supported_reasoning_levels = [{ effort = "low" }, { effort = "high" }]
+            default_reasoning_level = "high"
+        "#;
+
+        let specs = codex_catalog_model_specs(&settings, config);
+        let reasoning = specs
+            .first()
+            .and_then(|spec| spec.reasoning.as_ref())
+            .expect("inline provider model reasoning must reach the catalog resolver");
+        assert_eq!(
+            reasoning.supported_efforts,
+            vec!["low".to_string(), "high".to_string()]
+        );
+        assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+        assert_eq!(specs[0].reasoning_source, "provider_config");
     }
 
     #[test]
@@ -6362,6 +14637,10 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         };
         let entry = codex_catalog_model_entry(
             &template,
@@ -6412,6 +14691,10 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             supports_parallel_tool_calls: Some(false),
             input_modalities: Some(vec!["text".to_string(), "image".to_string()]),
             base_instructions: Some("base".to_string()),
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         };
 
         let entry = codex_catalog_model_entry(
@@ -6569,7 +14852,39 @@ openai_base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
-    /// 生成 catalog 时同时满足新版 Codex `ModelInfo` 和旧 renderer 的字段形态。
+    /// 全量模型菜单的用户排序优先于子 Agent 候选和历史默认排序。
+    fn codex_model_catalog_uses_user_model_sort_index_for_picker_order() {
+        let settings = json!({
+            "modelCatalog": {
+                "spawnAgentModels": [
+                    "deepseek-v4-pro",
+                    "qwen3.6"
+                ],
+                "models": [
+                    { "model": "gpt-5.5", "sortIndex": 2 },
+                    { "model": "qwen3.6", "sortIndex": 1 },
+                    { "model": "deepseek-v4-pro", "sort_index": 0 },
+                    { "model": "gpt-5.4" }
+                ]
+            }
+        });
+
+        let ordered = codex_catalog_model_specs(&settings, r#"model = "gpt-5.5""#)
+            .into_iter()
+            .map(|spec| spec.model)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered,
+            vec!["deepseek-v4-pro", "qwen3.6", "gpt-5.5", "gpt-5.4"],
+            "sortIndex must control the complete picker order and leave unranked models available"
+        );
+    }
+
+    #[test]
+    /// 未声明 reasoning 的第三方模型不能继承 GPT 档位，但仍必须保留
+    /// Codex `ModelInfo` 反序列化所需的空 reasoning 数组。缺失该字段会让
+    /// `windowsSandbox/setupStart` 在启动 UAC helper 前因 invalid_config 失败。
     fn codex_model_catalog_projects_spawn_agent_model_info_fields() {
         let template = json!({
             "slug": "gpt-5.5",
@@ -6594,6 +14909,10 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         };
         let entry = codex_catalog_model_entry(
             &template,
@@ -6619,25 +14938,502 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             Some(true),
             "non-ChatGPT auth filters must not remove MultiRouter models"
         );
-        assert_eq!(
-            entry
-                .get("default_reasoning_level")
-                .and_then(|v| v.as_str()),
-            Some("medium")
+        assert!(entry.get("default_reasoning_level").is_none());
+        assert_eq!(entry.get("supported_reasoning_levels"), Some(&json!([])));
+    }
+
+    #[test]
+    /// DeepSeek V4 保留原生 effort 集合，并只投影已经确认的 Codex 映射键。
+    fn codex_model_catalog_uses_deepseek_v4_reasoning_capabilities() {
+        let template = json!({
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "supported_reasoning_levels": [
+                { "effort": "low", "description": "Low" },
+                { "effort": "medium", "description": "Medium" },
+                { "effort": "high", "description": "High" },
+                { "effort": "xhigh", "description": "Extra high" }
+            ],
+            "default_reasoning_level": "medium"
+        });
+        let spec = CodexCatalogModelSpec {
+            model: "deepseek-v4-flash".to_string(),
+            upstream_model: None,
+            display_name: "DeepSeek V4 Flash".to_string(),
+            context_window: 1_048_576,
+            text_only: true,
+            is_default: true,
+            supports_parallel_tool_calls: Some(true),
+            input_modalities: Some(vec!["text".to_string()]),
+            base_instructions: None,
+            reasoning: Some(
+                crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability {
+                    schema_version: None,
+                    support_status: None,
+                    control_kind: None,
+                    supported: Some(true),
+                    supported_efforts: vec!["low".into(), "high".into(), "max".into()],
+                    default_effort: Some("high".into()),
+                    disable_allowed: true,
+                    upstream:
+                        crate::proxy::providers::codex_reasoning::CodexModelReasoningUpstream {
+                            format: "string".into(),
+                            parameter: "reasoning_effort".into(),
+                            effort_map: [
+                                ("low".into(), "low".into()),
+                                ("medium".into(), "high".into()),
+                                ("high".into(), "high".into()),
+                                ("xhigh".into(), "high".into()),
+                                ("max".into(), "max".into()),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        },
+                    output_format: None,
+                    source: Some("builtin".into()),
+                    confidence: None,
+                    fetched_at: None,
+                    provider_key: None,
+                    model_revision: None,
+                    codex_ultra_orchestration: None,
+                },
+            ),
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
+        };
+
+        let entry = codex_catalog_model_entry(
+            &template,
+            &spec,
+            0,
+            CodexCatalogToolProfile::ProxyChat,
+            128_000,
         );
+        let levels = entry["supported_reasoning_levels"]
+            .as_array()
+            .expect("reasoning levels")
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let desktop_levels = entry["supportedReasoningEfforts"]
+            .as_array()
+            .expect("desktop reasoning levels")
+            .iter()
+            .filter_map(|level| level.get("reasoningEffort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(entry["default_reasoning_level"], "high");
+        assert_eq!(entry["defaultReasoningEffort"], "high");
+        assert_eq!(levels, vec!["low", "high", "max"]);
+        assert_eq!(desktop_levels, vec!["low", "high", "max"]);
+        assert!(!levels.contains(&"ultra"));
+    }
+
+    #[test]
+    fn codex_catalog_restores_builtin_deepseek_reasoning_for_legacy_rows() {
+        let settings = json!({
+            "modelCatalog": { "models": [{
+                "model": "deepseek-v4-flash",
+                "displayName": "DeepSeek V4 Flash"
+            }]}
+        });
+
+        let specs = codex_catalog_model_specs(&settings, "");
+        let capability = specs[0]
+            .reasoning
+            .as_ref()
+            .expect("known DeepSeek preset should survive legacy rows without reasoning metadata");
+        assert_eq!(capability.supported_efforts, vec!["low", "high", "max"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("high"));
+        assert_eq!(capability.source.as_deref(), Some("builtin"));
+    }
+
+    #[test]
+    fn codex_subagent_v2_parent_policy_preserves_user_instructions_and_is_reversible() {
+        let settings = json!({
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v2",
+                "routes": [{
+                    "id": "deepseek",
+                    "enabled": true,
+                    "match": { "models": ["deepseek-v4-flash"] },
+                    "upstream": {
+                        "targetProviderId": "deepseek-provider",
+                        "auth": { "source": "provider_config" }
+                    }
+                }],
+                "subagentV2": {
+                    "schemaVersion": 1,
+                    "selectionPolicy": "balanced",
+                    "profiles": {
+                        "deepseek-v4-flash": {
+                            "model": "deepseek-v4-flash",
+                            "enabled": true,
+                            "questionnaire": {
+                                "taskStrengths": ["repository_exploration"],
+                                "optimization": "speed",
+                                "writeScope": "read_only",
+                                "preference": "preferred",
+                                "reasoningEffort": "medium"
+                            }
+                        }
+                    }
+                }
+            },
+            "modelCatalog": { "models": [{ "model": "deepseek-v4-flash" }] }
+        });
+        let specs = codex_catalog_model_specs(&settings, "");
+        let original = "developer_instructions = \"Keep my project-specific rule.\"\n";
+
+        let injected = project_codex_subagent_v2_parent_instructions(
+            &settings,
+            original,
+            &specs,
+            CodexSubagentVersion::V2,
+            None,
+        )
+        .expect("inject parent policy");
+        let doc = injected
+            .parse::<DocumentMut>()
+            .expect("parse injected config");
+        let instructions = doc["developer_instructions"]
+            .as_str()
+            .expect("developer instructions");
+        assert!(instructions.starts_with("Keep my project-specific rule."));
+        assert!(instructions.contains(CC_SWITCH_SUBAGENT_V2_POLICY_BEGIN));
+        assert!(instructions.contains("select `deepseek-v4-flash` via `agent_type`"));
+        assert!(instructions.contains("instead of `default`, `worker`, or `explorer`"));
+        assert!(instructions.contains("use `fork_turns=none` or a positive turn count"));
+        assert!(instructions.contains("retry the same `agent_type`"));
+        assert!(instructions.contains("never drop `agent_type` as a workaround"));
+
+        let removed = project_codex_subagent_v2_parent_instructions(
+            &settings,
+            &injected,
+            &specs,
+            CodexSubagentVersion::V1,
+            None,
+        )
+        .expect("remove parent policy in V1");
+        assert_eq!(removed, original);
+    }
+
+    #[test]
+    fn codex_subagent_parent_projection_does_not_leave_notify_shaped_instruction_lines() {
+        let settings = json!({
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v2",
+                "routes": [],
+                "subagentV2": {
+                    "schemaVersion": 2,
+                    "selectionPolicy": "balanced",
+                    "profiles": {}
+                }
+            },
+            "modelCatalog": { "models": [] }
+        });
+        let original = concat!(
+            "developer_instructions = \"\"\"\n",
+            "notify = ['C:\\\\Users\\\\sunda\\\\example.exe', \"turn-ended\"]\n",
+            "Keep this user instruction.\n",
+            "\"\"\"\n",
+        );
+
+        let projected = project_codex_subagent_v2_parent_instructions(
+            &settings,
+            original,
+            &[],
+            CodexSubagentVersion::V2,
+            None,
+        )
+        .expect("project parent policy");
+        validate_config_toml(&projected).expect("projected config must stay valid");
         assert!(
-            entry
-                .get("supported_reasoning_levels")
-                .and_then(|v| v.as_array())
-                .is_some_and(|levels| levels.iter().any(|level| {
-                    level.get("effort").and_then(|v| v.as_str()) == Some("medium")
-                })),
-            "spawn_agent runtime validation reads supported_reasoning_levels"
+            !projected.lines().any(|line| line.starts_with("notify =")),
+            "instruction contents must be escaped instead of resembling a root notify assignment"
+        );
+        let doc = projected.parse::<DocumentMut>().expect("parse projection");
+        assert!(doc["developer_instructions"]
+            .as_str()
+            .expect("developer instructions")
+            .contains("notify = ['C:\\Users\\sunda\\example.exe', \"turn-ended\"]"));
+    }
+
+    #[test]
+    fn codex_model_catalog_projects_declared_glm_reasoning_capability() {
+        let settings = json!({
+            "modelCatalog": { "models": [{
+                "model": "glm-5.2",
+                "reasoning": {
+                    "supported": true,
+                    "supportedEfforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                    "defaultEffort": "max",
+                    "disableAllowed": true,
+                    "upstream": { "format": "string", "parameter": "reasoning_effort" }
+                }
+            }]}
+        });
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            "model = \"glm-5.2\"",
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("build catalog")
+        .expect("catalog");
+        let entry = &catalog["models"][0];
+        let efforts = entry["supported_reasoning_levels"]
+            .as_array()
+            .expect("levels")
+            .iter()
+            .filter_map(|level| level["effort"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(entry["default_reasoning_level"], "max");
+        // P2：none 先按 disable capability 处理，不作为普通正向 effort 投影到
+        // supported_reasoning_levels（关闭走 disable 路径，不在可选档位里）。
+        assert_eq!(
+            efforts,
+            vec!["minimal", "low", "medium", "high", "xhigh", "max"]
         );
     }
 
     #[test]
-    fn codex_agent_defaults_are_added_without_overwriting_user_limits() {
+    fn codex_model_catalog_projects_grok_reasoning_without_none() {
+        let settings = json!({
+            "modelCatalog": { "models": [{
+                "model": "grok-4.5",
+                "reasoning": {
+                    "supported": true,
+                    "supportedEfforts": ["low", "medium", "high"],
+                    "defaultEffort": "high",
+                    "disableAllowed": false,
+                    "upstream": { "format": "reasoning_object", "parameter": "reasoning.effort" }
+                }
+            }]}
+        });
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            "model = \"grok-4.5\"",
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .expect("build catalog")
+        .expect("catalog");
+        let entry = &catalog["models"][0];
+        let efforts = entry["supported_reasoning_levels"]
+            .as_array()
+            .expect("levels")
+            .iter()
+            .filter_map(|level| level["effort"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(entry["default_reasoning_level"], "high");
+        assert_eq!(efforts, vec!["low", "medium", "high"]);
+        assert!(!efforts.contains(&"none"));
+    }
+
+    #[test]
+    fn codex_model_catalog_projects_distinct_step_model_efforts() {
+        let settings = json!({
+            "modelCatalog": { "models": [
+                {
+                    "model": "step-3.7-flash",
+                    "reasoning": {
+                        "supported": true,
+                        "supportedEfforts": ["low", "medium", "high"],
+                        "defaultEffort": "medium",
+                        "disableAllowed": false,
+                        "upstream": { "format": "string", "parameter": "reasoning_effort" }
+                    }
+                },
+                {
+                    "model": "step-3.5-flash-2603",
+                    "reasoning": {
+                        "supported": true,
+                        "supportedEfforts": ["low", "high"],
+                        "defaultEffort": "high",
+                        "disableAllowed": false,
+                        "upstream": { "format": "string", "parameter": "reasoning_effort" }
+                    }
+                }
+            ]}
+        });
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            "model = \"step-3.7-flash\"",
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("build catalog")
+        .expect("catalog");
+        let models = catalog["models"].as_array().expect("models");
+        let efforts = |index: usize| {
+            models[index]["supported_reasoning_levels"]
+                .as_array()
+                .expect("levels")
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(efforts(0), vec!["low", "medium", "high"]);
+        assert_eq!(models[0]["default_reasoning_level"], "medium");
+        assert_eq!(efforts(1), vec!["low", "high"]);
+        assert_eq!(models[1]["default_reasoning_level"], "high");
+    }
+
+    #[test]
+    fn unknown_third_party_model_does_not_inherit_template_reasoning() {
+        let settings = json!({
+            "modelCatalog": { "models": [{ "model": "private-model" }] }
+        });
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            "model = \"private-model\"",
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("build catalog")
+        .expect("catalog");
+        let entry = &catalog["models"][0];
+        assert!(entry.get("default_reasoning_level").is_none());
+        assert_eq!(entry.get("supported_reasoning_levels"), Some(&json!([])));
+        assert!(entry.get("supportedReasoningEfforts").is_none());
+    }
+
+    #[test]
+    fn catalog_spec_carries_reasoning_fingerprint_and_source_builtin() {
+        // P2：catalog 投影携带 fingerprint 与 source（builtin 来源）。
+        let settings = json!({
+            "modelCatalog": { "models": [{ "model": "deepseek-v4-flash" }] }
+        });
+        let specs = codex_catalog_model_specs(&settings, "");
+        let spec = specs
+            .iter()
+            .find(|spec| spec.model == "deepseek-v4-flash")
+            .expect("deepseek-v4-flash spec");
+        assert!(spec.reasoning.is_some());
+        assert!(!spec.reasoning_fingerprint.is_empty());
+        assert_eq!(spec.reasoning_source, "builtin");
+    }
+
+    #[test]
+    fn catalog_spec_carries_reasoning_fingerprint_and_source_user_config() {
+        // P2：catalog 投影携带 fingerprint 与 source（user_config 来源）。
+        let settings = json!({
+            "modelCatalog": { "models": [{
+                "model": "private-model",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "high"],
+                    "defaultEffort": "high",
+                    "disableAllowed": false,
+                    "upstream": {"format": "string", "parameter": "reasoning_effort"},
+                    "source": "user"
+                }
+            }]}
+        });
+        let specs = codex_catalog_model_specs(&settings, "");
+        let spec = specs
+            .iter()
+            .find(|spec| spec.model == "private-model")
+            .expect("private-model spec");
+        assert!(spec.reasoning.is_some());
+        assert!(!spec.reasoning_fingerprint.is_empty());
+        assert_eq!(spec.reasoning_source, "user_config");
+    }
+
+    #[test]
+    fn catalog_spec_fingerprint_matches_resolver_core() {
+        // P2：catalog 投影的 fingerprint 与 resolver 核心（同一输入）一致，
+        // 保证四层（catalog/请求/Sub-Agent/inspect）同源。
+        let settings = json!({
+            "modelCatalog": { "models": [{ "model": "deepseek-v4-flash" }] }
+        });
+        let specs = codex_catalog_model_specs(&settings, "");
+        let spec = specs
+            .iter()
+            .find(|spec| spec.model == "deepseek-v4-flash")
+            .expect("deepseek-v4-flash spec");
+        // 用同一输入直接调用 resolver 核心（platform=None、detection=None、
+        // library=全局、official=空缓存），fingerprint 必须与 catalog 投影一致。
+        let library = crate::reasoning_capabilities::catalog::global_library();
+        let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
+            &settings,
+            None,
+            "deepseek-v4-flash",
+            None,
+            library.as_ref(),
+            &[],
+        );
+        assert_eq!(spec.reasoning_fingerprint, resolved.fingerprint);
+        assert_eq!(spec.reasoning_source, resolved.source.as_str());
+    }
+
+    // ===== P0 契约：三态 schema 的 catalog 投影 =====
+
+    #[test]
+    fn new_schema_unknown_model_does_not_inherit_template_reasoning() {
+        // schema v2 显式 unknown：不得被当作解析失败丢弃，也不得继承模板档位。
+        let settings = json!({
+            "modelCatalog": { "models": [{
+                "model": "private-model",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "unknown",
+                    "controlKind": "unknown",
+                    "supportedEfforts": [],
+                    "disableAllowed": false,
+                    "upstream": {"format": "none", "parameter": "none"},
+                    "source": "provider"
+                }
+            }]}
+        });
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            "model = \"private-model\"",
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("build catalog")
+        .expect("catalog");
+        let entry = &catalog["models"][0];
+        assert!(entry.get("default_reasoning_level").is_none());
+        assert_eq!(entry.get("supported_reasoning_levels"), Some(&json!([])));
+        assert!(entry.get("supportedReasoningEfforts").is_none());
+    }
+
+    #[test]
+    fn explicit_empty_efforts_model_is_not_filled_by_template() {
+        // 明确的 supportedEfforts=[]（boolean 开关）：任何投影都不得回退到通用档位。
+        let settings = json!({
+            "modelCatalog": { "models": [{
+                "model": "private-model",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "boolean",
+                    "supportedEfforts": [],
+                    "disableAllowed": true,
+                    "upstream": {"format": "boolean", "parameter": "enable_thinking"},
+                    "outputFormat": "reasoning_content",
+                    "source": "user"
+                }
+            }]}
+        });
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            "model = \"private-model\"",
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("build catalog")
+        .expect("catalog");
+        let entry = &catalog["models"][0];
+        assert!(entry.get("default_reasoning_level").is_none());
+        assert_eq!(entry.get("supported_reasoning_levels"), Some(&json!([])));
+        assert!(entry.get("supportedReasoningEfforts").is_none());
+    }
+
+    #[test]
+    fn codex_agent_defaults_migrate_legacy_alias_without_overwriting_user_limits() {
         let specs = vec![CodexCatalogModelSpec {
             model: "qwen3.6".to_string(),
             upstream_model: None,
@@ -6648,6 +15444,10 @@ openai_base_url = "http://127.0.0.1:15721/v1"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         }];
         let config = r#"model_provider = "codex_model_router_v2"
 
@@ -6669,9 +15469,12 @@ base_url = "http://127.0.0.1:15721/v1"
         let agents = parsed.get("agents").expect("agents section should exist");
 
         assert_eq!(
-            agents.get("max_threads").and_then(|v| v.as_integer()),
+            agents
+                .get("max_concurrent_threads_per_session")
+                .and_then(|v| v.as_integer()),
             Some(8)
         );
+        assert!(agents.get("max_threads").is_none());
         assert_eq!(
             agents.get("max_depth").and_then(|v| v.as_integer()),
             Some(1)
@@ -6691,6 +15494,10 @@ base_url = "http://127.0.0.1:15721/v1"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         }];
         let catalog = json!({
             "models": [{
@@ -6747,6 +15554,105 @@ base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
+    fn codex_provider_inline_models_keep_deepseek_v4_reasoning_capabilities() {
+        let specs = vec![CodexCatalogModelSpec {
+            model: "deepseek-v4-pro".to_string(),
+            upstream_model: None,
+            display_name: "DeepSeek V4 Pro".to_string(),
+            context_window: 1_048_576,
+            text_only: true,
+            is_default: true,
+            supports_parallel_tool_calls: Some(true),
+            input_modalities: Some(vec!["text".to_string()]),
+            base_instructions: None,
+            reasoning: Some(
+                crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability {
+                    schema_version: None,
+                    support_status: None,
+                    control_kind: None,
+                    supported: Some(true),
+                    supported_efforts: vec!["low".into(), "high".into(), "max".into()],
+                    default_effort: Some("high".into()),
+                    disable_allowed: false,
+                    upstream:
+                        crate::proxy::providers::codex_reasoning::CodexModelReasoningUpstream {
+                            format: "reasoning_object".into(),
+                            parameter: "reasoning.effort".into(),
+                            effort_map: Default::default(),
+                        },
+                    output_format: None,
+                    source: Some("builtin".into()),
+                    confidence: None,
+                    fetched_at: None,
+                    provider_key: None,
+                    model_revision: None,
+                    codex_ultra_orchestration: None,
+                },
+            ),
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
+        }];
+        let catalog = codex_model_catalog_from_specs(
+            &specs,
+            &json!({
+                "slug": "gpt-5.5",
+                "display_name": "GPT-5.5",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [
+                    { "effort": "low" },
+                    { "effort": "medium" },
+                    { "effort": "high" },
+                    { "effort": "xhigh" }
+                ]
+            }),
+            CodexCatalogToolProfile::ProxyChat,
+            128_000,
+        );
+        let config = r#"model_provider = "codex_model_router_v2"
+
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+
+        let projected = set_codex_model_catalog_projection_fields(
+            config,
+            Some(Path::new("catalog")),
+            Some(&specs),
+            Some(&catalog),
+        )
+        .expect("project catalog fields");
+        let parsed: toml::Value = toml::from_str(&projected).expect("parse projected config");
+        let model = parsed["model_providers"]["codex_model_router_v2"]["models"]
+            .as_array()
+            .and_then(|models| models.first())
+            .expect("inline model");
+
+        for field in [
+            "supported_reasoning_levels",
+            "supported_reasoning_efforts",
+            "supportedReasoningEfforts",
+        ] {
+            let efforts = model[field]
+                .as_array()
+                .expect("inline reasoning levels")
+                .iter()
+                .filter_map(|level| {
+                    level
+                        .get("effort")
+                        .or_else(|| level.get("reasoning_effort"))
+                        .or_else(|| level.get("reasoningEffort"))
+                        .and_then(|effort| effort.as_str())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(efforts, vec!["low", "high", "max"], "field {field}");
+        }
+        assert_eq!(model["default_reasoning_level"].as_str(), Some("high"));
+        assert_eq!(model["default_reasoning_effort"].as_str(), Some("high"));
+        assert_eq!(model["defaultReasoningEffort"].as_str(), Some("high"));
+    }
+
+    #[test]
     fn codex_multi_agent_v2_keeps_spawn_agent_reserved_schema_compatible() {
         let specs = vec![CodexCatalogModelSpec {
             model: "qwen3.6".to_string(),
@@ -6758,6 +15664,10 @@ base_url = "http://127.0.0.1:15721/v1"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         }];
         let config = r#"model_provider = "codex_model_router_v2"
 
@@ -6795,6 +15705,134 @@ base_url = "http://127.0.0.1:15721/v1"
         );
     }
 
+    fn prepared_router_multi_agent_v2_config(
+        settings: &Value,
+        multi_agent_v2_body: &str,
+    ) -> toml::Value {
+        let _guard = TestHomeGuard::new();
+        let config = format!(
+            r#"model_provider = "codex_model_router_v2"
+
+[features.multi_agent_v2]
+enabled = true
+{multi_agent_v2_body}
+
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+"#
+        );
+        let prepared = prepare_codex_config_text_with_model_catalog_without_provider_context(
+            settings,
+            &config,
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("prepare router config");
+        toml::from_str::<toml::Value>(&prepared).expect("parse prepared router config")["features"]
+            ["multi_agent_v2"]
+            .clone()
+    }
+
+    #[test]
+    #[serial]
+    fn mixed_router_uses_non_reserved_agents_tool_namespace() {
+        let multi_agent_v2 = prepared_router_multi_agent_v2_config(
+            &json!({
+                "modelCatalog": {
+                    "models": [
+                        { "model": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol" },
+                        { "model": "qwen3.6", "displayName": "Qwen 3.6" }
+                    ]
+                },
+                "codexRouting": {
+                    "enabled": true,
+                    "routes": [
+                        {
+                            "id": "official",
+                            "match": { "models": ["gpt-5.6-sol"] },
+                            "upstream": { "auth": { "source": "managed_codex_oauth" } }
+                        },
+                        {
+                            "id": "qwen",
+                            "match": { "models": ["qwen3.6"] },
+                            "upstream": { "auth": { "source": "provider_config" } }
+                        }
+                    ]
+                }
+            }),
+            "tool_namespace = \"collaboration\"",
+        );
+
+        assert_eq!(
+            multi_agent_v2
+                .get("tool_namespace")
+                .and_then(toml::Value::as_str),
+            Some("agents"),
+            "mixed routing must avoid the backend-reserved collaboration namespace"
+        );
+        assert_eq!(
+            multi_agent_v2
+                .get("hide_spawn_agent_metadata")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mixed_router_preserves_custom_non_reserved_tool_namespace() {
+        let multi_agent_v2 = prepared_router_multi_agent_v2_config(
+            &json!({
+                "modelCatalog": {
+                    "models": [{ "model": "qwen3.6", "displayName": "Qwen 3.6" }]
+                },
+                "codexRouting": {
+                    "enabled": true,
+                    "routes": [{
+                        "id": "qwen",
+                        "match": { "models": ["qwen3.6"] },
+                        "upstream": { "auth": { "source": "provider_config" } }
+                    }]
+                }
+            }),
+            "tool_namespace = \"team_agents\"",
+        );
+
+        assert_eq!(
+            multi_agent_v2
+                .get("tool_namespace")
+                .and_then(toml::Value::as_str),
+            Some("team_agents")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn official_only_router_does_not_force_non_reserved_tool_namespace() {
+        let multi_agent_v2 = prepared_router_multi_agent_v2_config(
+            &json!({
+                "modelCatalog": {
+                    "models": [{ "model": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol" }]
+                },
+                "codexRouting": {
+                    "enabled": true,
+                    "routes": [{
+                        "id": "official",
+                        "match": { "models": ["gpt-5.6-sol"] },
+                        "upstream": { "auth": { "source": "managed_codex_oauth" } }
+                    }]
+                }
+            }),
+            "tool_namespace = \"collaboration\"",
+        );
+
+        assert_eq!(
+            multi_agent_v2
+                .get("tool_namespace")
+                .and_then(toml::Value::as_str),
+            Some("collaboration")
+        );
+    }
+
     fn prepared_router_catalog_models(settings: &Value) -> Vec<Value> {
         seed_codex_models_cache(json!([{
             "slug": "gpt-5.5",
@@ -6813,7 +15851,7 @@ multi_agent_v2 = true
 base_url = "http://127.0.0.1:15721/v1"
 "#;
 
-        prepare_codex_config_text_with_model_catalog(
+        prepare_codex_config_text_with_model_catalog_without_provider_context(
             settings,
             config,
             CodexCatalogToolProfile::ProxyChat,
@@ -6863,6 +15901,71 @@ base_url = "http://127.0.0.1:15721/v1"
 
     #[test]
     #[serial]
+    fn subagent_v1_disables_v2_feature_and_projects_every_router_model_as_v1() {
+        let _guard = TestHomeGuard::new();
+        seed_codex_models_cache(json!([{
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "context_window": 272000,
+            "multi_agent_version": "v2",
+            "use_responses_lite": true,
+            "model_messages": { "instructions_template": "template" }
+        }]));
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "gpt-5.5", "displayName": "GPT-5.5" },
+                    { "model": "deepseek-v4-flash", "displayName": "DeepSeek V4 Flash" }
+                ]
+            },
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v1",
+                "routes": [
+                    {
+                        "id": "official",
+                        "match": { "models": ["gpt-5.5"] },
+                        "upstream": { "auth": { "source": "managed_codex_oauth" } }
+                    },
+                    {
+                        "id": "deepseek",
+                        "match": { "models": ["deepseek-v4-flash"] },
+                        "upstream": { "auth": { "source": "provider_config" } }
+                    }
+                ]
+            }
+        });
+        let config = r#"model_provider = "codex_model_router_v2"
+
+[features.multi_agent_v2]
+enabled = true
+tool_namespace = "collaboration"
+
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+
+        let prepared = prepare_codex_config_text_with_model_catalog_without_provider_context(
+            &settings,
+            config,
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("prepare V1 router config");
+        let parsed: toml::Value = toml::from_str(&prepared).expect("parse prepared config");
+        let feature = &parsed["features"]["multi_agent_v2"];
+        let catalog = read_json_file::<Value>(&get_codex_model_catalog_path())
+            .expect("read generated catalog");
+        let models = catalog["models"].as_array().expect("generated models");
+
+        assert_eq!(feature["enabled"].as_bool(), Some(false));
+        assert!(models.iter().all(|model| {
+            model["multi_agent_version"].as_str() == Some("v1")
+                && model["multiAgentVersion"].as_str() == Some("v1")
+        }));
+    }
+
+    #[test]
+    #[serial]
     fn managed_oauth_only_router_preserves_multi_agent_v2() {
         let _guard = TestHomeGuard::new();
         let models = prepared_router_catalog_models(&json!({
@@ -6880,6 +15983,30 @@ base_url = "http://127.0.0.1:15721/v1"
         }));
 
         assert_eq!(models[0]["multi_agent_version"], "v2");
+    }
+
+    #[test]
+    #[serial]
+    fn managed_oauth_only_router_projects_selected_subagent_v1() {
+        let _guard = TestHomeGuard::new();
+        let models = prepared_router_catalog_models(&json!({
+            "modelCatalog": {
+                "models": [{ "model": "gpt-5.5", "displayName": "GPT-5.5" }]
+            },
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v1",
+                "routes": [{
+                    "id": "official",
+                    "match": { "models": ["gpt-5.5"] },
+                    "upstream": { "auth": { "source": "managed_codex_oauth" } }
+                }]
+            }
+        }));
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["multi_agent_version"], "v1");
+        assert_eq!(models[0]["multiAgentVersion"], "v1");
     }
 
     #[test]
@@ -6952,8 +16079,16 @@ base_url = "http://127.0.0.1:15721/v1"
         std::fs::write(
             &legacy_role_path,
             r#"name = "qwen-local"
+description = "Low-cost Qwen worker for read-heavy exploration, summaries, and bounded helper tasks."
+developer_instructions = """
+You are a CCSwitchMulti managed Codex subagent pinned to `qwen3.6`.
+Stay within the delegated task, report concrete file paths and verification results, and escalate risky decisions to the parent agent.
+Do not change unrelated files or override user-owned worktree changes.
+"""
+nickname_candidates = ["Qwen Local", "Qwen Scout", "Local Worker"]
 model = "qwen3.6"
 model_provider = "codex_model_router"
+model_context_window = 262144
 "#,
         )
         .expect("seed user role");
@@ -6967,9 +16102,14 @@ model_provider = "codex_model_router"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         }];
 
-        sync_codex_managed_agent_files(&specs).expect("sync managed agents");
+        sync_codex_managed_agent_files(&specs, CodexSubagentVersion::V2)
+            .expect("sync managed agents");
 
         let managed = std::fs::read_to_string(&legacy_role_path).expect("read migrated role");
         assert!(managed.contains(CC_SWITCH_MANAGED_AGENT_MARKER));
@@ -6984,6 +16124,66 @@ model_provider = "codex_model_router"
         assert!(
             !agents_dir.join("ccswitch-qwen-local.toml").exists(),
             "legacy CC Switch roles should be migrated in place so existing prompts keep working"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_v1_prunes_only_ccswitch_managed_roles() {
+        let _guard = TestHomeGuard::new();
+        let agents_dir = get_codex_agents_dir();
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        let managed_role_path = agents_dir.join("deepseek-flash.toml");
+        std::fs::write(
+            &managed_role_path,
+            format!(
+                "{CC_SWITCH_MANAGED_AGENT_MARKER}\nname = \"deepseek-flash\"\nmodel = \"deepseek-v4-flash\"\nmodel_provider = \"codex_model_router_v2\"\n"
+            ),
+        )
+        .expect("seed managed role");
+        let user_role_path = agents_dir.join("my-reviewer.toml");
+        std::fs::write(
+            &user_role_path,
+            "name = \"my-reviewer\"\nmodel = \"custom-model\"\n",
+        )
+        .expect("seed user role");
+        let settings = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "deepseek-v4-flash",
+                    "displayName": "DeepSeek V4 Flash"
+                }]
+            },
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v1",
+                "routes": [{
+                    "id": "deepseek",
+                    "match": { "models": ["deepseek-v4-flash"] },
+                    "upstream": { "auth": { "source": "provider_config" } }
+                }]
+            }
+        });
+        let config = r#"model_provider = "codex_model_router_v2"
+
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+
+        prepare_codex_config_text_with_model_catalog_without_provider_context(
+            &settings,
+            config,
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("prepare V1 router");
+
+        assert!(
+            !managed_role_path.exists(),
+            "V1 must remove CCSwitchMulti V2 role projections"
+        );
+        assert!(
+            user_role_path.exists(),
+            "V1 cleanup must never remove a user-authored role"
         );
     }
 
@@ -7012,9 +16212,14 @@ model_provider = "custom"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         }];
 
-        sync_codex_managed_agent_files(&specs).expect("sync managed agents");
+        sync_codex_managed_agent_files(&specs, CodexSubagentVersion::V2)
+            .expect("sync managed agents");
 
         let preserved = std::fs::read_to_string(&user_role_path).expect("read user role");
         assert!(preserved.contains(r#"model_provider = "custom""#));
@@ -7024,11 +16229,199 @@ model_provider = "custom"
         assert!(managed.contains(CC_SWITCH_MANAGED_AGENT_MARKER));
         assert!(managed.contains(r#"name = "ccswitch-qwen-local""#));
         assert!(managed.contains(r#"model_provider = "codex_model_router_v2""#));
+        let managed_toml: toml::Value =
+            toml::from_str(&managed).expect("parse generated Qwen role TOML");
+        assert_eq!(
+            managed_toml
+                .get("developer_instructions")
+                .and_then(toml::Value::as_str),
+            Some(
+                "You are a CCSwitchMulti managed Codex subagent pinned to `qwen3.6`.\nStay within the delegated task, report concrete file paths and verification results, and escalate risky decisions to the parent agent.\nDo not change unrelated files or override user-owned worktree changes.\n"
+            ),
+            "DeepSeek-only Windows guidance must not alter Qwen managed roles"
+        );
         assert!(
             !managed.contains("model_reasoning_effort"),
             "managed qwen agents should not pin an effort in fallback role files"
         );
         assert!(managed.contains(r#"nickname_candidates = ["Qwen Local""#));
+    }
+
+    #[test]
+    #[serial]
+    fn managed_agent_files_include_deepseek_roles_beyond_direct_override_window() {
+        let _guard = TestHomeGuard::new();
+        let specs = [
+            ("deepseek-v4-flash", "DeepSeek V4 Flash", 1_000_000),
+            ("gpt-5.6-sol", "GPT-5.6 Sol", 400_000),
+            ("qwen3.6", "Qwen 3.6", 262_144),
+            ("gpt-5.6-luna", "GPT-5.6 Luna", 400_000),
+            ("gpt-5.6-terra", "GPT-5.6 Terra", 400_000),
+            ("deepseek-v4-pro", "DeepSeek V4 Pro", 1_000_000),
+        ]
+        .into_iter()
+        .map(
+            |(model, display_name, context_window)| CodexCatalogModelSpec {
+                model: model.to_string(),
+                upstream_model: None,
+                display_name: display_name.to_string(),
+                context_window,
+                text_only: false,
+                is_default: false,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+                reasoning: None,
+                reasoning_fingerprint: String::new(),
+                reasoning_source: "unknown".to_string(),
+                sort_index: None,
+            },
+        )
+        .collect::<Vec<_>>();
+
+        sync_codex_managed_agent_files(&specs, CodexSubagentVersion::V2)
+            .expect("sync managed agents");
+
+        let mut reordered_specs = specs.clone();
+        reordered_specs.rotate_left(1);
+        sync_codex_managed_agent_files(&reordered_specs, CodexSubagentVersion::V2)
+            .expect("changing direct override order must not change managed roles");
+
+        let agents_dir = get_codex_agents_dir();
+        let flash = std::fs::read_to_string(agents_dir.join("deepseek-flash.toml"))
+            .expect("Flash role should be generated from the full routable catalog");
+        let pro = std::fs::read_to_string(agents_dir.join("deepseek-pro.toml")).expect(
+            "Pro role should be generated even when it is outside the direct override top five",
+        );
+
+        assert!(flash.contains(r#"name = "deepseek-flash""#));
+        assert!(flash.contains(r#"model = "deepseek-v4-flash""#));
+        assert!(flash.contains(r#"model_provider = "codex_model_router_v2""#));
+        assert!(flash.contains(r#"model_reasoning_effort = "high""#));
+        assert!(flash.contains("read-heavy exploration"));
+        assert!(flash.contains("lightweight verification"));
+        assert!(!flash.contains("architecture decisions"));
+
+        assert!(pro.contains(r#"name = "deepseek-pro""#));
+        assert!(pro.contains(r#"model = "deepseek-v4-pro""#));
+        assert!(pro.contains(r#"model_provider = "codex_model_router_v2""#));
+        assert!(pro.contains(r#"model_reasoning_effort = "high""#));
+        assert!(pro.contains("cross-module reasoning"));
+        assert!(pro.contains("architecture decisions"));
+        assert!(pro.contains("complex implementation"));
+        assert!(!pro.contains("routine scanning"));
+    }
+
+    #[test]
+    #[serial]
+    fn managed_deepseek_roles_render_windows_safe_execution_contract_without_changing_spark() {
+        let _guard = TestHomeGuard::new();
+        let specs = [
+            ("deepseek-v4-flash", "DeepSeek V4 Flash", 1_000_000),
+            ("deepseek-v4-pro", "DeepSeek V4 Pro", 1_000_000),
+            ("codex-spark", "Codex Spark", 400_000),
+        ]
+        .into_iter()
+        .map(
+            |(model, display_name, context_window)| CodexCatalogModelSpec {
+                model: model.to_string(),
+                upstream_model: None,
+                display_name: display_name.to_string(),
+                context_window,
+                text_only: false,
+                is_default: false,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+                reasoning: None,
+                reasoning_fingerprint: String::new(),
+                reasoning_source: "unknown".to_string(),
+                sort_index: None,
+            },
+        )
+        .collect::<Vec<_>>();
+
+        sync_codex_managed_agent_files(&specs, CodexSubagentVersion::V2)
+            .expect("sync managed DeepSeek roles");
+
+        let agents_dir = get_codex_agents_dir();
+        let flash: toml::Value = toml::from_str(
+            &std::fs::read_to_string(agents_dir.join("deepseek-flash.toml"))
+                .expect("read generated Flash role"),
+        )
+        .expect("parse generated Flash role TOML");
+        let pro: toml::Value = toml::from_str(
+            &std::fs::read_to_string(agents_dir.join("deepseek-pro.toml"))
+                .expect("read generated Pro role"),
+        )
+        .expect("parse generated Pro role TOML");
+        let spark: toml::Value = toml::from_str(
+            &std::fs::read_to_string(agents_dir.join("codex-spark-worker.toml"))
+                .expect("read generated Spark role"),
+        )
+        .expect("parse generated Spark role TOML");
+
+        let expected_shared_guidance = "On Windows, use PowerShell syntax and minimal directed commands. For content, use `rg <pattern> <named-path>`; for file discovery, use `rg --files <named-path>`. Use narrow `-g` includes and excludes, including `-g '!node_modules/**'`, `-g '!.git/**'`, `-g '!target/**'`, `-g '!dist/**'`, and `-g '!generated/**'`. First identify a narrow source or test subtree; never recursively scan a user profile/home, drive root, or broad repository root.\nDo not use Unix-only commands such as `wc`, and do not assume `Select-String -Recurse` exists; if `rg` is unavailable, only after identifying a narrow target use `Get-ChildItem -LiteralPath <narrow-target> -File -Recurse | Select-String`.\nFor ordinary read-only inspection, call tools without escalation metadata or a justification.\nStop and report as soon as the requested evidence is sufficient; do not keep scanning merely to be exhaustive.";
+        for (role, model, description, reasoning_effort) in [
+            (
+                &flash,
+                "deepseek-v4-flash",
+                "DeepSeek V4 Flash worker for long-context code reading, read-heavy exploration, architecture tracing, parallel evidence collection, and lightweight verification.",
+                "high",
+            ),
+            (
+                &pro,
+                "deepseek-v4-pro",
+                "DeepSeek V4 Pro worker for complex debugging, cross-module reasoning, architecture decisions, high-risk review, and complex implementation.",
+                "high",
+            ),
+        ] {
+            let expected_instructions = format!(
+                "You are a CCSwitchMulti managed Codex subagent pinned to `{model}`.\nStay within the delegated task, report concrete file paths and verification results, and escalate risky decisions to the parent agent.\nDo not change unrelated files or override user-owned worktree changes.\n{expected_shared_guidance}"
+            );
+            assert_eq!(role.get("model").and_then(toml::Value::as_str), Some(model));
+            assert_eq!(
+                role.get("description").and_then(toml::Value::as_str),
+                Some(description)
+            );
+            assert_eq!(
+                role.get("model_reasoning_effort")
+                    .and_then(toml::Value::as_str),
+                Some(reasoning_effort)
+            );
+            assert_eq!(
+                role.get("developer_instructions")
+                    .and_then(toml::Value::as_str),
+                Some(expected_instructions.as_str())
+            );
+        }
+
+        let expected_spark_instructions = "You are a CCSwitchMulti managed Codex subagent pinned to `codex-spark`.\nStay within the delegated task, report concrete file paths and verification results, and escalate risky decisions to the parent agent.\nDo not change unrelated files or override user-owned worktree changes.\n";
+        assert_eq!(
+            spark.get("description").and_then(toml::Value::as_str),
+            Some("Codex Spark worker for fast, focused edits, formatting, and quick verification.")
+        );
+        assert_eq!(
+            spark.get("model").and_then(toml::Value::as_str),
+            Some("codex-spark")
+        );
+        assert_eq!(
+            spark.get("model_provider").and_then(toml::Value::as_str),
+            Some("codex_model_router_v2")
+        );
+        assert_eq!(
+            spark
+                .get("model_reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("low")
+        );
+        assert_eq!(
+            spark
+                .get("developer_instructions")
+                .and_then(toml::Value::as_str),
+            Some(expected_spark_instructions),
+            "DeepSeek-only Windows guidance must not alter Spark managed roles"
+        );
     }
 
     #[test]
@@ -7045,6 +16438,7 @@ model_provider = "custom"
                 r#"{CC_SWITCH_MANAGED_AGENT_MARKER}
 name = "deepseek-flash"
 model = "deepseek-v4-flash"
+model_provider = "codex_model_router_v2"
 "#
             ),
         )
@@ -7066,9 +16460,14 @@ model = "handwritten"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         }];
 
-        sync_codex_managed_agent_files(&specs).expect("sync managed agents");
+        sync_codex_managed_agent_files(&specs, CodexSubagentVersion::V2)
+            .expect("sync managed agents");
 
         assert!(
             !stale_path.exists(),
@@ -7097,12 +16496,13 @@ model = "handwritten"
                 r#"{CC_SWITCH_MANAGED_AGENT_MARKER}
 name = "qwen-local"
 model = "qwen3.6"
+model_provider = "codex_model_router_v2"
 "#
             ),
         )
         .expect("seed managed role");
 
-        let prepared = prepare_codex_config_text_with_model_catalog(
+        let prepared = prepare_codex_config_text_with_model_catalog_without_provider_context(
             &json!({}),
             r#"model_provider = "custom""#,
             CodexCatalogToolProfile::ProxyChat,
@@ -7208,6 +16608,10 @@ model = "qwen3.6"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         };
         let entry = codex_catalog_model_entry(
             &template,
@@ -7261,6 +16665,10 @@ model = "qwen3.6"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
         };
         let entry = codex_catalog_model_entry(
             &template,
@@ -7395,21 +16803,70 @@ model = "qwen3.6"
     }
 
     #[test]
-    fn model_catalog_json_field_writes_relative_filename() {
+    fn model_catalog_user_image_override_reaches_generated_catalog() {
+        let template = json!({
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "context_window": 272000,
+            "max_context_window": 272000,
+            "supports_image_detail_original": true,
+            "input_modalities": ["text", "image"],
+            "model_messages": []
+        });
+        let settings = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "deepseek-v4-flash",
+                    "inputModalities": ["text", "image"],
+                    "supportsImage": true,
+                    "textOnly": false
+                }]
+            }
+        });
+
+        let specs = codex_catalog_model_specs(&settings, r#"model_context_window = 64000"#);
+        assert_eq!(specs.len(), 1);
+        assert!(
+            !specs[0].text_only,
+            "an explicit user image capability must override the text-model fallback"
+        );
+
+        let catalog = codex_model_catalog_from_specs(
+            &specs,
+            &template,
+            CodexCatalogToolProfile::ProxyChat,
+            128_000,
+        );
+        let model = &catalog["models"][0];
+        assert_eq!(
+            model.get("input_modalities"),
+            Some(&json!(["text", "image"]))
+        );
+        assert_eq!(
+            model.get("inputModalities"),
+            Some(&json!(["text", "image"]))
+        );
+    }
+
+    #[test]
+    fn model_catalog_json_field_writes_absolute_path_required_by_codex() {
         let input = r#"model_provider = "any"
 
 [model_providers.any]
 name = "any"
 "#;
-        let catalog_path = Path::new("/tmp/cc-switch-model-catalog.json");
+        let catalog_path = get_codex_model_catalog_path();
 
-        let result = set_codex_model_catalog_json_field(input, Some(catalog_path)).unwrap();
+        let result = set_codex_model_catalog_json_field(input, Some(&catalog_path)).unwrap();
         let parsed: toml::Value = toml::from_str(&result).unwrap();
-        assert_eq!(
-            parsed
-                .get("model_catalog_json")
-                .and_then(|value| value.as_str()),
-            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
+        let written = parsed
+            .get("model_catalog_json")
+            .and_then(|value| value.as_str())
+            .expect("model_catalog_json should be written");
+        assert_eq!(written, catalog_path.to_string_lossy());
+        assert!(
+            Path::new(written).is_absolute(),
+            "Codex AbsolutePathBuf rejects a relative model_catalog_json: {written}"
         );
         assert!(
             parsed
@@ -7422,31 +16879,134 @@ name = "any"
     }
 
     #[test]
-    fn resolve_catalog_path_returns_none_when_config_missing_field() {
-        let generated = PathBuf::from("/tmp/.codex/cc-switch-model-catalog.json");
-        assert!(resolve_cc_switch_catalog_path("", &generated).is_none());
+    fn catalog_projection_canonicalizes_agent_thread_aliases() {
+        let input = r#"model_provider = "codex_model_router_v2"
+
+[agents]
+max_threads = 10
+max_concurrent_threads_per_session = 8
+max_depth = 2
+"#;
+        let specs = vec![CodexCatalogModelSpec {
+            model: "gpt-5.6-sol".to_string(),
+            upstream_model: None,
+            display_name: "GPT-5.6-Sol".to_string(),
+            context_window: 1_000_000,
+            text_only: false,
+            is_default: true,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+            reasoning: None,
+            reasoning_fingerprint: String::new(),
+            reasoning_source: "unknown".to_string(),
+            sort_index: None,
+        }];
+        let catalog_path = get_codex_model_catalog_path();
+
+        let projected = set_codex_model_catalog_projection_fields(
+            input,
+            Some(&catalog_path),
+            Some(&specs),
+            None,
+        )
+        .expect("project catalog fields");
+        let parsed: toml::Value = toml::from_str(&projected).expect("parse projected config");
+        let agents = parsed.get("agents").expect("agents table");
+
+        assert_eq!(
+            agents
+                .get("max_concurrent_threads_per_session")
+                .and_then(|value| value.as_integer()),
+            Some(8),
+            "canonical user value must win"
+        );
         assert!(
-            resolve_cc_switch_catalog_path("model = \"gpt-5\"", &generated).is_none(),
+            agents.get("max_threads").is_none(),
+            "serde treats max_threads as an alias of max_concurrent_threads_per_session; both keys make Codex reject the config"
+        );
+        assert_eq!(
+            agents.get("max_depth").and_then(|value| value.as_integer()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn force_repair_canonicalizes_agent_aliases_and_preserves_user_config() {
+        let input = r#"model_provider = "codex_model_router_v2"
+
+[agents]
+max_threads = 10
+max_concurrent_threads_per_session = 8
+max_depth = 2
+
+[mcp_servers.user_owned]
+command = "example-mcp"
+
+[projects.'C:\Users\example\repo']
+trust_level = "trusted"
+"#;
+
+        let outcome = repair_codex_live_config_text_for_force_switch(input)
+            .expect("force repair should accept valid legacy TOML");
+        let parsed: toml::Value =
+            toml::from_str(&outcome.config_text).expect("repaired config should remain valid TOML");
+        let agents = parsed.get("agents").expect("agents table");
+
+        assert_eq!(
+            agents
+                .get("max_concurrent_threads_per_session")
+                .and_then(toml::Value::as_integer),
+            Some(8),
+            "canonical value must win when both spellings exist"
+        );
+        assert!(agents.get("max_threads").is_none());
+        assert_eq!(
+            agents.get("max_depth").and_then(toml::Value::as_integer),
+            Some(2)
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["user_owned"]["command"].as_str(),
+            Some("example-mcp"),
+            "force repair must preserve user-owned MCP config"
+        );
+        assert_eq!(
+            parsed["projects"][r"C:\Users\example\repo"]["trust_level"].as_str(),
+            Some("trusted"),
+            "force repair must preserve user-owned project config"
+        );
+        assert!(outcome
+            .repaired_fields
+            .iter()
+            .any(|field| field == "agents.max_threads"));
+    }
+
+    #[test]
+    fn resolve_catalog_path_returns_none_when_config_missing_field() {
+        let base = PathBuf::from("/tmp/.codex");
+        assert!(resolve_cc_switch_catalog_path("", &base).is_none());
+        assert!(
+            resolve_cc_switch_catalog_path("model = \"gpt-5\"", &base).is_none(),
             "no model_catalog_json field should yield None"
         );
     }
 
     #[test]
     fn resolve_catalog_path_accepts_cc_switch_owned_file() {
-        let generated = PathBuf::from("/tmp/.codex/cc-switch-model-catalog.json");
+        let base = PathBuf::from("/tmp/.codex");
         let config = r#"model_catalog_json = "/tmp/.codex/cc-switch-model-catalog.json"
 "#;
-        let resolved = resolve_cc_switch_catalog_path(config, &generated).expect("path resolves");
-        assert_eq!(resolved, generated);
+        let resolved = resolve_cc_switch_catalog_path(config, &base).expect("path resolves");
+        assert_eq!(resolved, base.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME));
     }
 
     #[test]
     fn resolve_catalog_path_rejects_user_owned_external_file() {
-        let generated = PathBuf::from("/tmp/.codex/cc-switch-model-catalog.json");
+        let base = PathBuf::from("/tmp/.codex");
         let config = r#"model_catalog_json = "/Users/me/.codex/my-handwritten-catalog.json"
 "#;
         assert!(
-            resolve_cc_switch_catalog_path(config, &generated).is_none(),
+            resolve_cc_switch_catalog_path(config, &base).is_none(),
             "external catalog files should be left alone"
         );
     }
@@ -7724,12 +17284,13 @@ name = "any"
 
     #[test]
     #[cfg(target_os = "windows")]
-    fn set_catalog_json_field_writes_filename_ignoring_unc_path() {
+    fn set_catalog_json_field_preserves_absolute_unc_path() {
         let input = r#"model_provider = "custom"
 model = "glm-5"
 "#;
-        // Simulate a WSL UNC path as cc-switch would see it on Windows;
-        // the function now writes just the relative filename.
+        // Simulate a WSL UNC path as cc-switch would see it on Windows. Codex's
+        // AbsolutePathBuf requires the full absolute path; UNC remains portable
+        // between the Windows process and its WSL-backed config directory.
         let unc_path =
             Path::new(r"\\wsl.localhost\Ubuntu\home\user\.codex\cc-switch-model-catalog.json");
 
@@ -7741,13 +17302,15 @@ model = "glm-5"
             .and_then(|v| v.as_str())
             .expect("model_catalog_json should be set");
         assert_eq!(
-            written_path, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
-            "should write only the relative filename, not the UNC path"
+            written_path,
+            unc_path.to_string_lossy(),
+            "should preserve the absolute UNC path"
         );
+        assert!(Path::new(written_path).is_absolute());
     }
 
     #[test]
-    fn set_catalog_json_field_writes_filename_for_any_path() {
+    fn set_catalog_json_field_preserves_absolute_path() {
         let input = r#"model_provider = "custom"
 model = "glm-5"
 "#;
@@ -7758,8 +17321,8 @@ model = "glm-5"
 
         assert_eq!(
             parsed.get("model_catalog_json").and_then(|v| v.as_str()),
-            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME),
-            "should write only the relative filename, not the full path"
+            Some(regular_path.to_string_lossy().as_ref()),
+            "should preserve the full path required by Codex AbsolutePathBuf"
         );
     }
 
@@ -7795,36 +17358,114 @@ model = "glm-5"
         let config_text = r#"model_provider = "custom"
 model_catalog_json = "cc-switch-model-catalog.json"
 "#;
-        let generated_path = PathBuf::from("/home/user/.codex/cc-switch-model-catalog.json");
-        let result = resolve_cc_switch_catalog_path(config_text, &generated_path);
+        let base_dir = PathBuf::from("/home/user/.codex");
+        let result = resolve_cc_switch_catalog_path(config_text, &base_dir);
         assert_eq!(
             result,
-            Some(generated_path),
-            "relative filename should resolve to generated_path for file I/O"
+            Some(base_dir.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)),
+            "relative filename should resolve under base_dir for file I/O"
         );
     }
 
     #[test]
-    fn resolve_catalog_ignores_user_owned_relative() {
-        let config_text = r#"model_catalog_json = "my-custom-catalog.json"
+    fn resolve_catalog_rejects_absolute_path_outside_config_dir() {
+        let config_text = r#"model_catalog_json = "/tmp/secret/cc-switch-model-catalog.json"
 "#;
-        let generated_path = PathBuf::from("/home/user/.codex/cc-switch-model-catalog.json");
-        let result = resolve_cc_switch_catalog_path(config_text, &generated_path);
+        let base_dir = PathBuf::from("/home/user/.codex");
+        let result = resolve_cc_switch_catalog_path(config_text, &base_dir);
         assert_eq!(
             result, None,
-            "user-owned catalog should not be claimed by cc-switch"
+            "absolute path outside ~/.codex must not be accepted"
         );
     }
 
     #[test]
-    fn set_catalog_json_none_removes_relative_path() {
-        let input = r#"model_catalog_json = "cc-switch-model-catalog.json"
+    fn resolve_catalog_accepts_absolute_path_inside_config_dir() {
+        let config_text = r#"model_catalog_json = "/home/user/.codex/cc-switch-model-catalog.json"
 "#;
-        let result = set_codex_model_catalog_json_field(input, None).unwrap();
-        let parsed: toml::Value = toml::from_str(&result).unwrap();
+        let base_dir = PathBuf::from("/home/user/.codex");
+        let result = resolve_cc_switch_catalog_path(config_text, &base_dir);
+        assert_eq!(
+            result,
+            Some(base_dir.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)),
+            "absolute path inside ~/.codex should be accepted"
+        );
+    }
+
+    #[test]
+    fn resolve_catalog_rejects_traversal_to_parent_directory() {
+        let config_text = r#"model_catalog_json = "../cc-switch-model-catalog.json"
+"#;
+        let base_dir = PathBuf::from("/home/user/.codex");
+        let result = resolve_cc_switch_catalog_path(config_text, &base_dir);
+        assert_eq!(
+            result, None,
+            "relative traversal outside ~/.codex must not be accepted"
+        );
+    }
+
+    #[test]
+    fn resolve_catalog_rejects_symlink_escaping_config_dir() {
+        // 词法包含可被符号链接绕过：~/.codex/link -> 外部目录，
+        // "link/cc-switch-model-catalog.json" 词法上在 base 内，真实读取却落到
+        // base 外。canonicalize 之后的二次校验必须拒绝。
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base_dir = temp.path().join("codex");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&base_dir).expect("create base");
+        fs::create_dir_all(&outside_dir).expect("create outside");
+        let escaped_file = outside_dir.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        fs::write(&escaped_file, r#"{"models":[]}"#).expect("write escaped catalog");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_dir, base_dir.join("link")).expect("symlink");
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(&outside_dir, base_dir.join("link")) {
+            if error.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("symlink: {error}");
+        }
+
+        let config_text = r#"model_catalog_json = "link/cc-switch-model-catalog.json"
+"#;
+        let result = resolve_cc_switch_catalog_path(config_text, &base_dir);
+        assert_eq!(
+            result, None,
+            "symlink escaping the config dir must be rejected after canonicalization"
+        );
+    }
+
+    #[test]
+    fn resolve_catalog_accepts_real_file_inside_config_dir() {
+        // 存在于 base 内的真实文件：canonical 校验通过后仍应接受
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base_dir = temp.path().join("codex");
+        fs::create_dir_all(&base_dir).expect("create base");
+        let catalog_file = base_dir.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        fs::write(&catalog_file, r#"{"models":[]}"#).expect("write catalog");
+
+        let config_text = r#"model_catalog_json = "cc-switch-model-catalog.json"
+"#;
+        let result = resolve_cc_switch_catalog_path(config_text, &base_dir);
+        let resolved = result.expect("real file inside config dir should be accepted");
+        assert_eq!(
+            resolved.file_name().and_then(|n| n.to_str()),
+            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
+        );
+    }
+
+    #[test]
+    fn read_limited_string_rejects_oversized_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("huge.json");
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(MAX_CODEX_CATALOG_BYTES + 1).expect("set_len");
+
+        let result = read_limited_string(&path, MAX_CODEX_CATALOG_BYTES);
         assert!(
-            parsed.get("model_catalog_json").is_none(),
-            "None arm should remove relative cc-switch-owned field"
+            result.is_err(),
+            "file larger than MAX_CODEX_CATALOG_BYTES must be rejected"
         );
     }
 
@@ -7870,10 +17511,12 @@ model_catalog_json = "cc-switch-model-catalog.json"
     }
 
     #[test]
-    /// GPT-5.6 同 slug 合并必须保留官方 max/ultra 推理档、速度档和展示名。
+    /// GPT-5.6 同 slug 合并必须保留官方 max/ultra 推理档、速度档和展示名，
+    /// 但 picker priority 必须使用路由目录的最终顺序，否则用户选择的前五会被官方优先级覆盖。
     fn merge_codex_models_preserves_official_gpt56_picker_metadata() {
         let official_models = json!([{
             "slug": "gpt-5.6-sol",
+            "priority": 1,
             "display_name": "GPT-5.6-Sol",
             "default_reasoning_level": "medium",
             "supported_reasoning_levels": [
@@ -7889,6 +17532,7 @@ model_catalog_json = "cc-switch-model-catalog.json"
         }]);
         let routed_models = json!([{
             "model": "gpt-5.6-sol",
+            "priority": 1004,
             "display_name": "gpt-5.6-sol",
             "default_reasoning_level": "medium",
             "supported_reasoning_levels": [
@@ -7919,6 +17563,11 @@ model_catalog_json = "cc-switch-model-catalog.json"
             Some("GPT-5.6-Sol")
         );
         assert_eq!(
+            model.get("priority").and_then(Value::as_u64),
+            Some(1004),
+            "routed picker priority must override the official same-slug priority"
+        );
+        assert_eq!(
             efforts,
             vec!["low", "medium", "high", "xhigh", "max", "ultra"]
         );
@@ -7929,6 +17578,75 @@ model_catalog_json = "cc-switch-model-catalog.json"
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(6)
+        );
+    }
+
+    #[test]
+    fn official_models_use_bundled_catalog_when_backup_is_empty() {
+        let owned_cache = json!({
+            "etag": CC_SWITCH_CODEX_MODELS_CACHE_ETAG,
+            "models": []
+        });
+        let empty_backup = json!({ "models": [] });
+        let bundled = json!([{
+            "slug": "gpt-5.6-terra",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                { "effort": "low" },
+                { "effort": "medium" },
+                { "effort": "high" },
+                { "effort": "xhigh" },
+                { "effort": "max" }
+            ],
+            "additional_speed_tiers": ["fast"],
+            "service_tiers": [{ "id": "priority", "name": "Fast" }]
+        }]);
+
+        let models = official_models_with_bundled_fallback(
+            Some(&owned_cache),
+            Some(&empty_backup),
+            bundled.as_array().map(Vec::as_slice),
+        )
+        .expect("bundled official models must be used when the local backup is empty");
+        assert_eq!(
+            models[0].get("slug").and_then(Value::as_str),
+            Some("gpt-5.6-terra")
+        );
+        assert_eq!(
+            models[0].get("service_tiers"),
+            Some(&json!([{ "id": "priority", "name": "Fast" }]))
+        );
+    }
+
+    #[test]
+    fn official_models_overlay_bundled_catalog_over_stale_backup() {
+        let owned_cache = json!({
+            "etag": CC_SWITCH_CODEX_MODELS_CACHE_ETAG,
+            "models": [{"slug": "gpt-5.4", "service_tiers": []}]
+        });
+        let backup = json!({
+            "models": [{"slug": "gpt-5.4", "service_tiers": [{ "id": "priority" }]}]
+        });
+        let bundled = json!([
+            {"slug": "gpt-5.4", "service_tiers": [{ "id": "new_tier" }]},
+            {"slug": "gpt-5.6-terra", "service_tiers": [{ "id": "priority" }]}
+        ]);
+
+        let models = official_models_with_bundled_fallback(
+            Some(&owned_cache),
+            Some(&backup),
+            bundled.as_array().map(Vec::as_slice),
+        )
+        .expect("bundled models must overlay a stale backup");
+        let ids = models
+            .iter()
+            .filter_map(codex_model_stable_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["gpt-5.4", "gpt-5.6-terra"]);
+        assert_eq!(
+            models[0].get("service_tiers"),
+            Some(&json!([{ "id": "new_tier" }])),
+            "the current bundled official entry must override the stale backup field"
         );
     }
 
@@ -7963,12 +17681,22 @@ model_catalog_json = "cc-switch-model-catalog.json"
         let _home = TestHomeGuard::new();
         seed_codex_models_cache(json!([{
             "slug": "gpt-5.5",
+            "priority": 1,
             "display_name": "GPT-5.5",
             "model_messages": { "instructions_template": "template" },
-            "context_window": 128000
+            "context_window": 128000,
+            "additional_speed_tiers": ["fast"],
+            "service_tiers": [{
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage"
+            }],
+            "supports_personality": true,
+            "model_specialty": "coding"
         }]));
         let settings = json!({
             "modelCatalog": {
+                "spawnAgentModels": ["qwen3.6", "deepseek-v4-flash", "gpt-5.5"],
                 "models": [
                     { "model": "gpt-5.5", "displayName": "GPT-5.5" },
                     { "model": "qwen3.6", "displayName": "Qwen 3.6" },
@@ -7991,7 +17719,7 @@ model_auto_compact_token_limit = 96000
 base_url = "http://127.0.0.1:15721/v1"
 "#;
 
-        let prepared = prepare_codex_config_text_with_model_catalog(
+        let prepared = prepare_codex_config_text_with_model_catalog_without_provider_context(
             &settings,
             config,
             CodexCatalogToolProfile::ProxyChat,
@@ -8027,6 +17755,81 @@ base_url = "http://127.0.0.1:15721/v1"
             provider_model_ids.contains(&"deepseek-v4-flash"),
             "inline provider models must include DeepSeek so the Desktop menu can enumerate it"
         );
+        let inline_official_model = provider_models
+            .iter()
+            .find(|model| model.get("model").and_then(|value| value.as_str()) == Some("gpt-5.5"))
+            .expect("inline provider models should include the routed official model");
+        assert_eq!(
+            inline_official_model
+                .get("supported_reasoning_levels")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(4),
+            "inline official models must retain the same reasoning choices as the merged catalog"
+        );
+        assert_eq!(
+            inline_official_model
+                .get("additional_speed_tiers")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1),
+            "inline official models must retain speed tiers when Desktop reloads provider models"
+        );
+        assert_eq!(
+            inline_official_model
+                .get("service_tiers")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1),
+            "inline official models must retain service tiers together with reasoning levels"
+        );
+        assert_eq!(
+            inline_official_model
+                .get("supportsPersonality")
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "inline official models must retain personality support"
+        );
+        assert_eq!(
+            inline_official_model
+                .get("modelSpecialty")
+                .and_then(toml::Value::as_str),
+            Some("coding"),
+            "inline official models must retain picker specialty"
+        );
+        let inline_qwen_model = provider_models
+            .iter()
+            .find(|model| model.get("model").and_then(|value| value.as_str()) == Some("qwen3.6"))
+            .expect("inline provider models should include Qwen");
+        assert_eq!(
+            inline_qwen_model
+                .get("service_tiers")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0),
+            "third-party models must not inherit OpenAI service tiers from the template"
+        );
+
+        let inline_qwen_modalities = inline_qwen_model
+            .get("input_modalities")
+            .expect("inline provider models must retain explicit input modalities");
+        assert_eq!(
+            inline_qwen_model.get("inputModalities"),
+            Some(inline_qwen_modalities),
+            "inline snake/camel modality aliases must stay equivalent"
+        );
+        assert_eq!(
+            inline_qwen_model
+                .get("multi_agent_version")
+                .and_then(toml::Value::as_str),
+            Some("v2"),
+            "inline models must retain the active Sub-Agent transport version"
+        );
+        assert_eq!(
+            inline_qwen_model.get("multiAgentVersion"),
+            inline_qwen_model.get("multi_agent_version"),
+            "inline snake/camel multi-agent aliases must stay equivalent"
+        );
 
         let cache: Value = read_json_file(&get_codex_models_cache_path()).expect("read cache");
         let slugs = cache
@@ -8057,6 +17860,69 @@ base_url = "http://127.0.0.1:15721/v1"
         assert!(slugs.contains(&"deepseek-v4-flash"));
         assert!(model_fields.contains(&"qwen3.6"));
         assert!(model_fields.contains(&"deepseek-v4-flash"));
+        assert_eq!(
+            &slugs[..3],
+            ["qwen3.6", "deepseek-v4-flash", "gpt-5.5"],
+            "cache order must follow the configured spawn_agent promotion order"
+        );
+        let priorities = cache["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .take(3)
+            .filter_map(|model| model.get("priority").and_then(Value::as_u64))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            priorities,
+            vec![1000, 1001, 1002],
+            "official same-slug priority must not jump ahead of routed Qwen/DeepSeek"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn model_cache_sync_applies_selected_subagent_transport_over_official_metadata() {
+        let _home = TestHomeGuard::new();
+        seed_codex_models_cache(json!([{
+            "slug": "gpt-5.6-luna",
+            "display_name": "GPT-5.6 Luna",
+            "context_window": 256000,
+            "multi_agent_version": "v1"
+        }]));
+        let settings = json!({
+            "modelCatalog": {
+                "models": [{ "model": "gpt-5.6-luna", "displayName": "GPT-5.6 Luna" }]
+            },
+            "codexRouting": {
+                "enabled": true,
+                "subagentVersion": "v2",
+                "routes": [{
+                    "id": "official",
+                    "match": { "models": ["gpt-5.6-luna"] },
+                    "upstream": { "auth": { "source": "managed_codex_oauth" } }
+                }]
+            }
+        });
+        let config = r#"model_provider = "codex_model_router_v2"
+
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+
+        prepare_codex_config_text_with_model_catalog_without_provider_context(
+            &settings,
+            config,
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("prepare V2 catalog and cache");
+
+        let cache: Value = read_json_file(&get_codex_models_cache_path()).expect("read cache");
+        let model = cache["models"]
+            .as_array()
+            .and_then(|models| models.first())
+            .expect("cached model");
+        assert_eq!(model["multi_agent_version"], "v2");
+        assert_eq!(model["multiAgentVersion"], "v2");
     }
 
     #[test]
@@ -8093,7 +17959,7 @@ base_url = "http://127.0.0.1:15721/v1"
 base_url = "http://127.0.0.1:15721/v1"
 "#;
 
-        prepare_codex_config_text_with_model_catalog(
+        prepare_codex_config_text_with_model_catalog_without_provider_context(
             &settings,
             config,
             CodexCatalogToolProfile::ProxyChat,
@@ -8172,7 +18038,7 @@ base_url = "http://127.0.0.1:15721/v1"
 [model_providers.custom]
 base_url = "http://127.0.0.1:15721/v1"
 "#;
-        prepare_codex_config_text_with_model_catalog(
+        prepare_codex_config_text_with_model_catalog_without_provider_context(
             &settings,
             config,
             CodexCatalogToolProfile::ProxyChat,
@@ -8182,7 +18048,7 @@ base_url = "http://127.0.0.1:15721/v1"
         let official_config = r#"model_provider = "openai"
 model_catalog_json = "cc-switch-model-catalog.json"
 "#;
-        let restored = prepare_codex_config_text_with_model_catalog(
+        let restored = prepare_codex_config_text_with_model_catalog_without_provider_context(
             &json!({}),
             official_config,
             CodexCatalogToolProfile::ProxyChat,
@@ -8204,5 +18070,194 @@ model_catalog_json = "cc-switch-model-catalog.json"
             .filter_map(|model| model.get("slug").and_then(|slug| slug.as_str()))
             .collect::<Vec<_>>();
         assert_eq!(slugs, vec!["gpt-5.5"]);
+    }
+
+    #[test]
+    #[serial]
+    fn force_builtin_openai_preserves_change_after_transform_before_writer_entry() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(
+            &config_path,
+            r#"model = "gpt-5.6"
+model_provider = "custom"
+base_url = "http://127.0.0.1:15721/v1"
+
+[model_providers.custom]
+name = "CCSwitchMulti"
+base_url = "http://127.0.0.1:15721/v1"
+
+[desktop]
+old = true
+
+[plugins."sdd@personal"]
+enabled = false
+
+[mcp_servers.user]
+command = "user-server"
+
+[custom_user_table]
+value = "old"
+"#,
+        )
+        .expect("seed config");
+        set_test_config_transform_mutations([r#"model = "gpt-5.6"
+model_provider = "custom"
+base_url = "http://127.0.0.1:15721/v1"
+
+[model_providers.custom]
+name = "CCSwitchMulti"
+base_url = "http://127.0.0.1:15721/v1"
+
+[desktop]
+external = true
+
+[plugins."sdd@personal"]
+enabled = true
+
+[mcp_servers.user]
+command = "user-server-external"
+
+[custom_user_table]
+value = "external"
+"#]);
+
+        force_codex_builtin_openai_live_provider()
+            .expect("force builtin provider should preserve external update");
+
+        let restored = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(restored.contains("model_provider = \"openai\""));
+        assert!(restored.contains("external = true"));
+        assert!(restored.contains("[plugins.\"sdd@personal\"]"));
+        assert!(restored.contains("command = \"user-server-external\""));
+        assert!(restored.contains("value = \"external\""));
+        assert!(!restored.contains("127.0.0.1:15721"));
+    }
+
+    #[test]
+    fn subagent_v2_hydration_does_not_persist_catalog_modalities_and_preserves_explicit_overrides()
+    {
+        let settings = json!({
+            "modelCatalog": { "models": [
+                {
+                    "model": "deepseek-v4-flash",
+                    "inputModalities": ["text"],
+                    "textOnly": true,
+                    "supportsImage": false
+                },
+                {
+                    "model": "gpt-vision",
+                    "inputModalities": ["text", "image"],
+                    "supportsImage": true
+                }
+            ] }
+        });
+        let raw = json!({
+            "schemaVersion": 1,
+            "profiles": {
+                "deepseek-v4-flash": {
+                    "model": "deepseek-v4-flash",
+                    "enabled": true,
+                    "questionnaire": {}
+                },
+                "gpt-vision": {
+                    "model": "gpt-vision",
+                    "enabled": true,
+                    "questionnaire": {}
+                },
+                "manual": {
+                    "model": "gpt-vision",
+                    "enabled": true,
+                    "inputModalities": ["text"],
+                    "questionnaire": {}
+                }
+            }
+        });
+
+        let hydrated = hydrate_codex_subagent_v2_input_modalities(&settings, &raw);
+
+        assert!(hydrated["profiles"]["deepseek-v4-flash"]
+            .get("inputModalities")
+            .is_none());
+        assert!(hydrated["profiles"]["gpt-vision"]
+            .get("inputModalities")
+            .is_none());
+        assert_eq!(
+            hydrated["profiles"]["manual"]["inputModalities"],
+            json!(["text"]),
+            "an explicit per-profile override must remain authoritative"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn multirouter_projection_publish_writes_and_reads_back_dependency_fingerprint() {
+        let _guard = TestHomeGuard::new();
+        write_codex_live_config_atomic(Some(
+            r#"model_provider = "codex_model_router_v2"
+
+[model_providers.codex_model_router_v2]
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+"#,
+        ))
+        .expect("seed live config");
+        seed_codex_models_cache(json!([]));
+        let settings = json!({
+            "modelCatalog": {"models": [{
+                "model": "qwen3.8",
+                "upstreamModel": "qwen3.8",
+                "contextWindow": 262144,
+                "inputModalities": ["text"]
+            }]},
+            "codexRouting": {
+                "schemaVersion": 2,
+                "enabled": true,
+                "routes": []
+            },
+            "codexRoutingProjection": {
+                "dependencyFingerprint": "fingerprint-v2"
+            }
+        });
+
+        let read_back = publish_codex_multirouter_projection(&settings)
+            .expect("publish projection with read-back");
+
+        assert_eq!(read_back.dependency_fingerprint, "fingerprint-v2");
+        assert!(read_back.catalog_verified);
+        assert!(read_back.config_verified);
+        assert!(read_back.cache_verified);
+        assert!(read_back.agent_files_verified);
+        let catalog: Value = read_json_file(&get_codex_model_catalog_path()).expect("read catalog");
+        assert_eq!(
+            catalog["ccSwitchRoutingDependencyFingerprint"],
+            "fingerprint-v2"
+        );
+    }
+
+    #[test]
+    fn codex_catalog_route_include_selection_blocks_coarse_prefix_escape() {
+        let route = json!({
+            "id": "official",
+            "enabled": true,
+            "modelSelection": {
+                "mode": "include",
+                "models": ["gpt-5.6-sol", "gpt-5.6-luna"]
+            },
+            "matchPrefixes": ["gpt"]
+        });
+
+        assert!(!codex_catalog_route_matches_model(&route, "gpt-5.4"));
+        assert!(codex_catalog_route_matches_model(&route, "gpt-5.6-sol"));
+
+        let all = json!({
+            "id": "official",
+            "enabled": true,
+            "modelSelection": { "mode": "all" },
+            "matchPrefixes": ["gpt"]
+        });
+        assert!(codex_catalog_route_matches_model(&all, "gpt-5.4"));
     }
 }

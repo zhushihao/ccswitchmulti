@@ -4,11 +4,54 @@ use tauri::{AppHandle, Emitter};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
+const UPDATER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Tauri Updater 使用自己的 HTTP client，不会自动继承代理转发器的 client。
+/// 因此显式复用用户已保存的全局代理，避免模型能访问外网而更新器直连超时。
+fn updater_builder_with_runtime_proxy(app: &AppHandle) -> tauri_plugin_updater::UpdaterBuilder {
+    let builder = app.updater_builder().timeout(UPDATER_TIMEOUT);
+    let Some(proxy_url) = crate::proxy::http_client::get_current_proxy_url() else {
+        return builder;
+    };
+
+    match tauri::Url::parse(&proxy_url) {
+        Ok(proxy) => builder.proxy(proxy),
+        Err(_) => {
+            log::warn!("应用更新器忽略了格式无效的全局代理地址");
+            builder
+        }
+    }
+}
+
 /// 应用更新下载进度（通过 `update-download-progress` 事件发给前端）。
 #[derive(Clone, serde::Serialize)]
 struct UpdateDownloadProgress {
     downloaded: u64,
     total: Option<u64>,
+}
+
+/// Release metadata consumed by the shared frontend update context.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUpdateInfo {
+    pub current_version: String,
+    pub available_version: String,
+    pub notes: Option<String>,
+    pub pub_date: Option<String>,
+}
+
+fn build_app_update_info(
+    current_version: String,
+    available_version: String,
+    notes: Option<String>,
+    pub_date: Option<String>,
+) -> AppUpdateInfo {
+    AppUpdateInfo {
+        current_version,
+        available_version,
+        notes,
+        pub_date,
+    }
 }
 
 fn merge_settings_for_save(
@@ -197,8 +240,7 @@ pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
 /// 这里把退出清理、安装和重启串在同一个后端流程中，避免依赖旧前端继续执行。
 #[tauri::command]
 pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> {
-    let updater = app
-        .updater_builder()
+    let updater = updater_builder_with_runtime_proxy(&app)
         .build()
         .map_err(|e| format!("初始化更新器失败: {e}"))?;
 
@@ -275,8 +317,7 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
 /// 升级无法解决，而不是让其反复尝试。
 #[tauri::command]
 pub async fn check_app_update_available(app: AppHandle) -> Result<Option<String>, String> {
-    let updater = app
-        .updater_builder()
+    let updater = updater_builder_with_runtime_proxy(&app)
         .build()
         .map_err(|e| format!("初始化更新器失败: {e}"))?;
     let update = updater
@@ -284,6 +325,28 @@ pub async fn check_app_update_available(app: AppHandle) -> Result<Option<String>
         .await
         .map_err(|e| format!("检查更新失败: {e}"))?;
     Ok(update.map(|u| u.version))
+}
+
+/// Check for an application update through the same proxy-aware updater used
+/// for download and installation, and return the metadata needed by the UI.
+#[tauri::command]
+pub async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateInfo>, String> {
+    let updater = updater_builder_with_runtime_proxy(&app)
+        .build()
+        .map_err(|e| format!("初始化更新器失败: {e}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("检查更新失败: {e}"))?;
+
+    Ok(update.map(|update| {
+        build_app_update_info(
+            update.current_version,
+            update.version,
+            update.body,
+            update.date.map(|date| date.to_string()),
+        )
+    }))
 }
 
 /// 获取 app_config_dir 覆盖配置 (从 Store)
@@ -316,12 +379,33 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_settings_for_save;
+    use super::{build_app_update_info, merge_settings_for_save};
     use crate::settings::{
         AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
         WebDavSyncSettings,
     };
+
+    #[test]
+    fn check_app_update_info_preserves_release_metadata() {
+        let info = build_app_update_info(
+            "3.19.1-19".to_string(),
+            "3.19.1-20".to_string(),
+            Some("Fix updater routing".to_string()),
+            Some("2026-08-11T08:00:00Z".to_string()),
+        );
+
+        assert_eq!(info.current_version, "3.19.1-19");
+        assert_eq!(info.available_version, "3.19.1-20");
+        assert_eq!(info.notes.as_deref(), Some("Fix updater routing"));
+        assert_eq!(info.pub_date.as_deref(), Some("2026-08-11T08:00:00Z"));
+
+        let json = serde_json::to_value(info).expect("serialize app update info");
+        assert_eq!(json["currentVersion"], "3.19.1-19");
+        assert_eq!(json["availableVersion"], "3.19.1-20");
+        assert_eq!(json["notes"], "Fix updater routing");
+        assert_eq!(json["pubDate"], "2026-08-11T08:00:00Z");
+    }
 
     #[test]
     fn save_settings_should_preserve_existing_webdav_when_payload_omits_it() {

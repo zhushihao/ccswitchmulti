@@ -1,3 +1,5 @@
+import type { CodexSubagentV2Config } from "./types/codexSubagentV2";
+
 export type ProviderCategory =
   | "official" // 官方
   | "cn_official" // 开源官方（原"国产官方"）
@@ -244,6 +246,8 @@ export interface ProviderMeta {
   codexFastMode?: boolean;
   // Codex Responses -> Chat Completions reasoning capability metadata
   codexChatReasoning?: CodexChatReasoning;
+  // Stable CCSwitchMulti preset identity used to resolve maintained model capabilities.
+  codexPresetId?: string;
   // Codex 单供应商模型目录是否投射为 /model 菜单映射；关闭时 modelCatalog 只作为目录/上下文元数据保存。
   codexLocalModelMapping?: boolean;
   // Codex -> Anthropic provider options.
@@ -285,14 +289,97 @@ export type CodexApiFormat =
   | "openai_messages"
   | "anthropic";
 
+export type CodexReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra";
+
+/**
+ * 三态支持状态（模型推理能力 schema v2）。
+ *
+ * 只有明确否定证据才能写 confirmed_unsupported；字段缺失、探测失败或
+ * 不在维护库中都只能得到 unknown。
+ */
+export type CodexReasoningSupportStatus =
+  | "confirmed_supported"
+  | "confirmed_unsupported"
+  | "unknown";
+
+/**
+ * 控制形态（模型推理能力 schema v2）。
+ *
+ * 与支持状态相互独立，不能互相推导。
+ */
+export type CodexReasoningControlKind =
+  | "none"
+  | "boolean"
+  | "graded"
+  | "budget"
+  | "unknown";
+
+/** 能力声明的证据等级（模型推理能力 schema v2）。 */
+export type CodexReasoningConfidence =
+  | "authoritative"
+  | "verified"
+  | "maintained"
+  | "inferred";
+
+export interface CodexModelReasoningCapability {
+  /**
+   * 能力 schema 版本。缺失表示 legacy v1；新写入固定为 2。
+   *
+   * 注意：这是模型推理能力 schema 的版本，与 Codex Sub-Agent V1/V2 无关，
+   * 代码、错误码与 UI 文案中禁止混用简称。
+   */
+  schemaVersion?: number;
+  /** 三态支持状态（schema v2）。 */
+  supportStatus?: CodexReasoningSupportStatus;
+  /** 控制形态（schema v2）。 */
+  controlKind?: CodexReasoningControlKind;
+  /** Legacy 字段：仅用于读取旧数据；新写入不得包含。 */
+  supported?: boolean;
+  supportedEfforts: CodexReasoningEffort[];
+  defaultEffort?: CodexReasoningEffort;
+  disableAllowed: boolean;
+  upstream: {
+    format: "none" | "boolean" | "string" | "reasoning_object";
+    parameter: CodexChatThinkingParam | CodexChatEffortParam;
+    effortMap?: Partial<Record<CodexReasoningEffort, CodexReasoningEffort>>;
+  };
+  outputFormat?: CodexChatReasoningOutputFormat;
+  source?: "provider" | "builtin" | "user" | "legacy" | "protocol";
+  /** 证据等级（schema v2）。易变元数据，不进入能力指纹。 */
+  confidence?: CodexReasoningConfidence;
+  /** 检测时间（schema v2）。易变元数据，不进入能力指纹。 */
+  fetchedAt?: string;
+  /** Provider 身份（schema v2）。易变元数据，不进入能力指纹。 */
+  providerKey?: string;
+  /** 模型 revision（schema v2）。易变元数据，不进入能力指纹。 */
+  modelRevision?: string;
+  /**
+   * Codex V2 产品层的复合模式：最大推理 + 主动 Sub-Agent 委派。
+   * 它不会把 literal `ultra` 传给 Provider；Codex 出站固定使用 `max`。
+   */
+  codexUltraOrchestration?: { enabled: boolean };
+}
+
 export interface CodexCatalogModel {
   model: string;
+  /** false keeps the row for editing/re-enabling but excludes it from runtime projections. */
+  enabled?: boolean;
   upstreamModel?: string;
   upstream_model?: string;
   displayName?: string;
+  display_name?: string;
   contextWindow?: string | number;
-  inputModalities?: Array<"text" | "image">;
-  input_modalities?: Array<"text" | "image">;
+  context_window?: string | number;
+  inputModalities?: string[];
+  input_modalities?: string[];
   textOnly?: boolean;
   text_only?: boolean;
   supportsImage?: boolean;
@@ -300,7 +387,23 @@ export interface CodexCatalogModel {
   vision?: boolean;
   // Native Responses profile overrides for generated Codex model catalogs.
   supportsParallelToolCalls?: boolean;
+  supports_parallel_tool_calls?: boolean;
   baseInstructions?: string;
+  base_instructions?: string;
+  reasoning?: CodexModelReasoningCapability;
+  /** Codex 产品层设置，不属于 Provider capability 或其来源。 */
+  codexUltra?: {
+    enabled: boolean;
+    providerEffort?: CodexReasoningEffort;
+  };
+  // MultiRouter schema v2: model-specific transport/caching overrides.
+  // Provider defaults remain authoritative when these fields are absent.
+  apiFormat?: CodexApiFormat;
+  api_format?: CodexApiFormat;
+  codexCache?: CodexCacheConfig;
+  codex_cache?: CodexCacheConfig;
+  // User-defined picker order. Lower values appear first in Codex.
+  sortIndex?: number;
 }
 
 export type CodexCacheMode =
@@ -326,6 +429,8 @@ export interface CodexModelCatalogConfig {
   models: CodexCatalogModel[];
   spawnAgentModels?: string[];
 }
+
+export type CodexSubagentVersion = "v1" | "v2";
 
 export type CodexRoutingAuthSource =
   | "provider_config"
@@ -369,6 +474,7 @@ export interface CodexRoutingRoute {
   upstream: {
     baseUrl?: string;
     apiFormat: CodexApiFormat;
+    apiFormatSource?: "provider" | "route_override";
     auth: CodexRoutingAuth;
     apiKey?: string;
     modelMap?: Record<string, string>;
@@ -380,8 +486,39 @@ export interface CodexRoutingConfig {
   enabled?: boolean;
   defaultRouteId?: string;
   officialAuth?: CodexOfficialAuthConfig;
+  subagentVersion?: CodexSubagentVersion;
+  subagentV2?: CodexSubagentV2Config;
   routes?: CodexRoutingRoute[];
 }
+
+export type CodexModelSelectionV2 =
+  | { mode: "all" }
+  | { mode: "include"; models: string[] };
+
+export interface CodexRoutingRouteV2 {
+  id: string;
+  label?: string;
+  enabled?: boolean;
+  targetProviderId: string;
+  modelSelection: CodexModelSelectionV2;
+  matchPrefixes?: string[];
+  aliases?: Record<string, string>;
+  authPolicy?: CodexRoutingAuth;
+}
+
+export interface CodexRoutingConfigV2 {
+  schemaVersion: 2;
+  enabled?: boolean;
+  defaultRouteId?: string;
+  subagentVersion?: CodexSubagentVersion;
+  subagentV2?: CodexSubagentV2Config;
+  spawnAgentModels?: string[];
+  routes: CodexRoutingRouteV2[];
+}
+
+export type CodexRoutingConfigDocument =
+  | CodexRoutingConfig
+  | CodexRoutingConfigV2;
 
 // Claude 认证字段类型
 export type ClaudeApiKeyField = "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY";
@@ -468,6 +605,8 @@ export interface Settings {
   skipClaudeOnboarding?: boolean;
   // 是否开机自启
   launchOnStartup?: boolean;
+  // 是否在 CCSwitchMulti 启动后启动 Codex Desktop（独立于开机自启）
+  launchCodexDesktopWithCcswitch?: boolean;
   // 静默启动（程序启动时不显示主窗口）
   silentStartup?: boolean;
   // 是否启用主页面本地代理功能（默认关闭）

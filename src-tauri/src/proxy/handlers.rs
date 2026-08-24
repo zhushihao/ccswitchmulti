@@ -32,10 +32,14 @@ use super::{
             create_responses_sse_stream_from_anthropic_with_context,
             responses_sse_events_from_anthropic_message,
         },
-        streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
+        streaming_codex_chat::{
+            create_responses_sse_stream_from_chat_with_context, HOSTED_TOOL_STREAM_RESPONSE_HEADER,
+        },
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_retry::{
-            create_resilient_anthropic_sse_stream_from_responses, StreamReconnector,
+            create_resilient_anthropic_sse_stream_from_responses,
+            create_resilient_responses_sse_stream_with_context, StreamLogContext,
+            StreamReconnector,
         },
         transform, transform_codex_anthropic, transform_codex_chat,
         transform_codex_responses_namespace, transform_gemini, transform_responses,
@@ -450,10 +454,10 @@ pub async fn handle_models(
     State(state): State<ProxyState>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ProxyError> {
-    let generated_path = crate::codex_config::get_codex_model_catalog_path();
+    let config_dir = crate::codex_config::get_codex_config_dir();
     let active_catalog_path = match crate::codex_config::read_codex_config_text() {
         Ok(config_text) => {
-            crate::codex_config::resolve_cc_switch_catalog_path(&config_text, &generated_path)
+            crate::codex_config::resolve_cc_switch_catalog_path(&config_text, &config_dir)
         }
         Err(_) => None,
     };
@@ -462,7 +466,8 @@ pub async fn handle_models(
         let catalog = if let Some(catalog_path) =
             active_catalog_path.as_ref().filter(|path| path.exists())
         {
-            let text = std::fs::read_to_string(catalog_path).unwrap_or_default();
+            let text = crate::codex_config::read_codex_model_catalog_text(catalog_path)
+                .unwrap_or_default();
             serde_json::from_str(&text).unwrap_or(json!({"models": []}))
         } else {
             if active_catalog_path.is_none() {
@@ -540,6 +545,14 @@ pub async fn handle_external_models(
     handle_models(State(state), headers).await
 }
 
+/// 判断请求是否应按 Codex 自身客户端处理。
+///
+/// 本地 15721 是 Codex takeover 的专用入口，Desktop 的 Responses 请求并不
+/// 保证携带稳定的 User-Agent（部分版本甚至不带）。因此 User-Agent 不能是
+/// 唯一的 Codex 信号；同时也不能把“完全没有身份头”的普通 OpenAI 请求默认
+/// 放进本地 Codex 路径，否则会绕过 External API 鉴权。无 UA 的官方请求必须
+/// 至少带有一个稳定的 Codex 指纹头（`originator`、session/thread、`x-codex-*`
+/// 或 Responses 客户端头）。
 fn is_codex_model_catalog_client(headers: &HeaderMap) -> bool {
     headers
         .get(axum::http::header::USER_AGENT)
@@ -548,14 +561,58 @@ fn is_codex_model_catalog_client(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// 判断请求是否应按 Codex 自身客户端处理。
-///
-/// External API key 优先级高于 User-Agent，避免第三方 agent 名称中包含
-/// `codex` 时绕过 External API profile。
 fn should_handle_as_codex_client(headers: &HeaderMap) -> bool {
     !headers.contains_key(FORCE_EXTERNAL_OPENAI_API_HEADER)
-        && is_codex_model_catalog_client(headers)
         && !external_openai_api::has_external_api_key(headers)
+        && (is_codex_model_catalog_client(headers) || has_codex_client_fingerprint(headers))
+}
+
+fn has_codex_client_fingerprint(headers: &HeaderMap) -> bool {
+    headers.keys().any(|name| {
+        let key = name.as_str();
+        matches!(
+            key,
+            "originator"
+                | "session_id"
+                | "session-id"
+                | "thread-id"
+                | "conversation_id"
+                | "chatgpt-account-id"
+                | "x-openai-subagent"
+                | "x-client-request-id"
+                | "openai-beta"
+                | "openai-organization"
+                | "openai-project"
+        ) || key.starts_with("x-stainless-")
+            || key.starts_with("x-codex-")
+    })
+}
+
+fn codex_request_classification_fields(headers: &HeaderMap) -> Vec<(&'static str, String)> {
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let has_user_agent = !user_agent.is_empty();
+    let user_agent_contains_codex = user_agent.to_ascii_lowercase().contains("codex");
+    let has_external_api_key = external_openai_api::has_external_api_key(headers);
+    let force_external_marker = headers.contains_key(FORCE_EXTERNAL_OPENAI_API_HEADER);
+    let selected_path = if should_handle_as_codex_client(headers) {
+        "codex"
+    } else {
+        "external_openai_api"
+    };
+
+    vec![
+        ("has_user_agent", has_user_agent.to_string()),
+        (
+            "user_agent_contains_codex",
+            user_agent_contains_codex.to_string(),
+        ),
+        ("has_external_api_key", has_external_api_key.to_string()),
+        ("force_external_marker", force_external_marker.to_string()),
+        ("selected_path", selected_path.to_string()),
+    ]
 }
 
 fn mark_external_openai_headers(headers: &mut HeaderMap) {
@@ -1459,9 +1516,28 @@ fn resolve_codex_image_generation_provider(
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(ToString::to_string);
-    for model in codex_image_generation_route_probe_models(provider, body) {
+    for model in codex_image_generation_route_probe_models(state, provider, body)? {
         let mut probe_body = body.clone();
         probe_body["model"] = json!(model);
+        let v2_routing = codex_provider_has_v2_routing(provider);
+        if let Some(candidate) =
+            resolve_codex_v2_runtime_provider_from_db(state, provider, &probe_body, None)?
+        {
+            if provider_is_codex_image_generation_oauth_target(&candidate) {
+                return Ok(Some(sanitize_codex_image_generation_provider(candidate)));
+            }
+            if request_model
+                .as_deref()
+                .is_some_and(|request_model| request_model.eq_ignore_ascii_case(&model))
+                && codex_route_provider_matched_request_model(&candidate)
+            {
+                return Ok(None);
+            }
+            continue;
+        }
+        if v2_routing {
+            continue;
+        }
         let Some(route_provider) =
             super::providers::resolve_codex_model_routed_provider(provider, &probe_body)
         else {
@@ -1485,6 +1561,46 @@ fn resolve_codex_image_generation_provider(
     resolve_codex_image_generation_official_route_by_identity(state, provider)
 }
 
+fn resolve_codex_v2_runtime_provider_from_db(
+    state: &ProxyState,
+    provider: &crate::provider::Provider,
+    body: &Value,
+    explicit_route_id: Option<&str>,
+) -> Result<Option<crate::provider::Provider>, ProxyError> {
+    if provider
+        .settings_config
+        .pointer("/codexRouting/schemaVersion")
+        .and_then(Value::as_u64)
+        != Some(2)
+    {
+        return Ok(None);
+    }
+    let providers = state
+        .db
+        .get_all_providers("codex")
+        .map_err(|error| ProxyError::DatabaseError(error.to_string()))?
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let resolved = if explicit_route_id.is_some() {
+        super::providers::resolve_codex_v2_raw_passthrough_provider(
+            provider,
+            body,
+            &providers,
+            explicit_route_id,
+        )
+    } else {
+        super::providers::resolve_codex_v2_routed_provider(provider, body, &providers)
+    };
+    resolved
+        .map(|resolved| resolved.map(super::providers::ResolvedCodexRoute::into_effective_provider))
+        .map_err(|error| {
+            ProxyError::ConfigError(format!(
+                "Codex MultiRouter v2 编译失败 [{}]: {}",
+                error.code, error.message
+            ))
+        })
+}
+
 /// 判断 provider 是否显式包含 Codex router 配置。
 ///
 /// 兼容 `codexRouting` 新 schema 以及旧版 `codexModelRoutes` / `modelRoutes`，
@@ -1498,31 +1614,62 @@ fn codex_provider_has_routing_config(provider: &crate::provider::Provider) -> bo
         .is_some()
 }
 
+fn codex_provider_has_v2_routing(provider: &crate::provider::Provider) -> bool {
+    provider
+        .settings_config
+        .pointer("/codexRouting/schemaVersion")
+        .and_then(Value::as_u64)
+        == Some(2)
+}
+
 /// 生成用于探测 official route 的模型列表。
 ///
 /// 图片请求的模型通常是 `gpt-image-*`，旧 MultiRouter 可能只在 official route
 /// 里匹配 `gpt-5.5` / `gpt-5.4` 等文本模型；因此先尝试真实请求模型，再从
 /// catalog 和一组稳定 OpenAI/Codex 模型名里探测 official route。
 fn codex_image_generation_route_probe_models(
+    state: &ProxyState,
     provider: &crate::provider::Provider,
     body: &Value,
-) -> Vec<String> {
+) -> Result<Vec<String>, ProxyError> {
     let mut models = Vec::new();
     if let Some(model) = body.get("model").and_then(|value| value.as_str()) {
         push_unique_probe_model(&mut models, model);
     }
 
-    if let Some(entries) = provider
+    if codex_provider_has_v2_routing(provider) {
+        let providers = state
+            .db
+            .get_all_providers("codex")
+            .map_err(|error| ProxyError::DatabaseError(error.to_string()))?
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let compiled = crate::codex_multirouter::compiler::compile_provider_v2(
+            provider, &providers,
+        )
+        .map_err(|error| {
+            ProxyError::ConfigError(format!(
+                "Codex MultiRouter v2 compile failed [{}]: {}",
+                error.code, error.message
+            ))
+        })?;
+        if let Some((_, compiled)) = compiled {
+            for model in compiled.visible_models {
+                if model_looks_like_openai_codex_route(&model) {
+                    push_unique_probe_model(&mut models, &model);
+                }
+            }
+        }
+    } else if let Some(entries) = provider
         .settings_config
         .pointer("/modelCatalog/models")
         .and_then(|value| value.as_array())
     {
         for entry in entries {
-            let Some(model) = codex_catalog_model_id(entry) else {
-                continue;
-            };
-            if model_looks_like_openai_codex_route(&model) {
-                push_unique_probe_model(&mut models, &model);
+            if let Some(model) = codex_catalog_model_id(entry) {
+                if model_looks_like_openai_codex_route(&model) {
+                    push_unique_probe_model(&mut models, &model);
+                }
             }
         }
     }
@@ -1539,7 +1686,7 @@ fn codex_image_generation_route_probe_models(
         push_unique_probe_model(&mut models, model);
     }
 
-    models
+    Ok(models)
 }
 
 /// 向探测列表追加非空且不重复的模型名。
@@ -1889,6 +2036,26 @@ fn resolve_external_codex_router_target(
         if !codex_router_contains_route(provider, profile.route_id.as_deref()) {
             continue;
         }
+        if let Some(resolved) = resolve_codex_v2_runtime_provider_from_db(
+            state,
+            provider,
+            body,
+            profile.route_id.as_deref(),
+        )? {
+            if profile.route_id.is_some()
+                && resolved
+                    .settings_config
+                    .get("codexResolvedRouteId")
+                    .and_then(Value::as_str)
+                    != profile.route_id.as_deref()
+            {
+                continue;
+            }
+            return Ok(Some(resolved));
+        }
+        if codex_provider_has_v2_routing(provider) {
+            continue;
+        }
         if let Some(resolved) =
             super::providers::resolve_codex_model_routed_provider(provider, body)
         {
@@ -1932,7 +2099,7 @@ fn resolve_external_codex_router_target(
 /// 让 forwarder 的 raw resolver 负责“显式模型命中 -> official -> default”的统一策略。
 fn resolve_external_codex_router_raw_target(
     state: &ProxyState,
-    _body: &Value,
+    body: &Value,
     profile: &ExternalOpenAiApiProfile,
 ) -> Result<Option<crate::provider::Provider>, ProxyError> {
     let providers = state
@@ -1957,6 +2124,14 @@ fn resolve_external_codex_router_raw_target(
         let Some(route_id) = profile.route_id.as_deref() else {
             return Ok(Some(provider.clone()));
         };
+        if let Some(resolved) =
+            resolve_codex_v2_runtime_provider_from_db(state, provider, body, Some(route_id))?
+        {
+            return Ok(Some(resolved));
+        }
+        if codex_provider_has_v2_routing(provider) {
+            continue;
+        }
         let Some(route) = codex_router_route_by_id(provider, route_id) else {
             continue;
         };
@@ -2138,6 +2313,56 @@ fn external_codex_router_model_entries(
     let Some(provider) = providers.get(provider_id) else {
         return Ok(Vec::new());
     };
+    if codex_provider_has_v2_routing(provider) {
+        let providers = providers
+            .iter()
+            .map(|(id, provider)| (id.clone(), provider.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let compiled = crate::codex_multirouter::compiler::compile_provider_v2(
+            provider, &providers,
+        )
+        .map_err(|error| {
+            ProxyError::ConfigError(format!(
+                "Codex MultiRouter v2 compile failed [{}]: {}",
+                error.code, error.message
+            ))
+        })?;
+        let Some((_, compiled)) = compiled else {
+            return Ok(Vec::new());
+        };
+        let entries = compiled
+            .model_catalog
+            .into_iter()
+            .filter(|model| {
+                profile
+                    .route_id
+                    .as_deref()
+                    .is_none_or(|route_id| model.route_id == route_id)
+            })
+            .map(|model| {
+                let mut source = serde_json::Map::new();
+                source.insert("displayName".to_string(), json!(model.display_name));
+                if let Some(context_window) = model.capability_summary.context_window {
+                    source.insert("contextWindow".to_string(), json!(context_window));
+                }
+                if !model.capability_summary.input_modalities.is_empty() {
+                    source.insert(
+                        "inputModalities".to_string(),
+                        json!(model.capability_summary.input_modalities),
+                    );
+                }
+                if let Some(reasoning) = model.capability_summary.reasoning {
+                    source.insert("reasoning".to_string(), reasoning);
+                }
+                openai_model_entry_with_source(
+                    &model.visible_model,
+                    "cc-switch",
+                    &Value::Object(source),
+                )
+            })
+            .collect::<Vec<_>>();
+        return Ok(dedup_openai_model_entries(entries));
+    }
     let mut ids = Vec::new();
     let mut entries = Vec::new();
     let catalog_sources =
@@ -2158,10 +2383,14 @@ fn external_codex_router_model_entries(
             }
             collect_string_array(&mut ids, route.pointer("/match/models"));
             collect_string_array(&mut ids, route.get("models"));
+            collect_string_array(&mut ids, route.pointer("/modelSelection/models"));
             collect_model_objects(&mut entries, route.pointer("/match/models"));
             collect_model_objects(&mut entries, route.get("models"));
+            collect_model_objects(&mut entries, route.pointer("/modelSelection/models"));
             if ids.is_empty() {
                 collect_string_array(&mut ids, route.pointer("/match/prefixes"));
+                collect_string_array(&mut ids, route.get("matchPrefixes"));
+                collect_string_array(&mut ids, route.get("match_prefixes"));
             }
         }
     }
@@ -2235,9 +2464,16 @@ fn openai_model_entry(id: &str, owner: &str) -> Value {
     })
 }
 
-/// 根据 catalog/source 对象构造 OpenAI model entry，透传明确的上下文窗口字段。
+/// 根据 catalog/source 对象构造 OpenAI model entry，透传明确的上下文窗口与显示名字段。
 fn openai_model_entry_with_source(id: &str, owner: &str, source: &Value) -> Value {
     let mut entry = openai_model_entry(id, owner);
+    if let Some(display_name) = extract_model_display_name(source) {
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("display_name".to_string(), json!(display_name));
+            object.insert("displayName".to_string(), json!(display_name));
+            object.insert("name".to_string(), json!(display_name));
+        }
+    }
     if let Some(context_window) = extract_model_context_window(source) {
         if let Some(object) = entry.as_object_mut() {
             // Codex Desktop 不同版本在 `/v1/models` 的 data[] 分支上读取的字段名不完全一致；
@@ -2249,6 +2485,19 @@ fn openai_model_entry_with_source(id: &str, owner: &str, source: &Value) -> Valu
         }
     }
     entry
+}
+
+/// 从 model catalog 条目读取用户声明的显示名，兼容已有字段命名。
+fn extract_model_display_name(value: &Value) -> Option<String> {
+    const KEYS: &[&str] = &["display_name", "displayName", "name", "title"];
+    KEYS.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(|name| {
+            name.as_str()
+                .map(str::trim)
+                .filter(|display| !display.is_empty())
+                .map(str::to_string)
+        })
 }
 
 /// 从 model catalog 条目中读取正整数上下文窗口，兼容 snake_case 与 camelCase。
@@ -2603,6 +2852,13 @@ pub async fn handle_responses(
     handle_responses_for_app(state, request, AppType::Codex, "Codex", "codex").await
 }
 
+fn should_wrap_native_codex_responses_stream(
+    request_is_streaming: bool,
+    response: &super::hyper_client::ProxyResponse,
+) -> bool {
+    request_is_streaming && response.status().is_success() && !response.is_json()
+}
+
 pub async fn handle_grokbuild_responses(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
@@ -2629,6 +2885,14 @@ async fn handle_responses_for_app(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let extensions = parts.extensions;
+
+    if app_type == AppType::Codex {
+        let mut fields = codex_request_classification_fields(&headers);
+        fields.push(("method", method.to_string()));
+        fields.push(("endpoint", endpoint_with_query(&uri, "/responses")));
+        super::codex_router_log::append_event("request_classified", &fields);
+    }
+
     let body_bytes = req_body
         .collect()
         .await
@@ -2706,6 +2970,7 @@ async fn handle_responses_for_app(
     };
 
     let connection_guard = result.connection_guard.take();
+    let stream_reconnect = result.stream_reconnect.take();
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
@@ -2790,6 +3055,29 @@ async fn handle_responses_for_app(
         return handle_codex_native_compaction_fallback(response, &ctx, &state, connection_guard)
             .await;
     }
+
+    let response = if should_wrap_native_codex_responses_stream(is_stream, &response) {
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        super::hyper_client::ProxyResponse::streamed(
+            status,
+            response_headers,
+            create_resilient_responses_sse_stream_with_context(
+                Box::pin(response.bytes_stream()),
+                stream_reconnect,
+                Some(StreamLogContext {
+                    session_id: ctx.session_id.clone(),
+                    model: ctx
+                        .outbound_model
+                        .clone()
+                        .unwrap_or_else(|| ctx.request_model.clone()),
+                    provider_id: ctx.provider.id.clone(),
+                }),
+            ),
+        )
+    } else {
+        response
+    };
 
     process_response_with_stream_hint(
         response,
@@ -3139,12 +3427,98 @@ async fn handle_codex_chat_to_responses_transform(
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
     let hosted_tool_loop_response = response.headers().contains_key(HOSTED_TOOL_LOOP_HEADER);
+    let hosted_tool_stream_response = response
+        .headers()
+        .contains_key(HOSTED_TOOL_STREAM_RESPONSE_HEADER);
 
     if !status.is_success() {
         // 上游 Chat 错误体形状与 Responses 不一致（如 MiniMax 的 base_resp、自定义 detail 字段）；
         // 直接透传会让 Codex 客户端无法识别错误码。这里统一转换为 Responses 风格
         // `{"error": {message, type, code, param}}`，保留原始 HTTP 状态码。
         return handle_codex_chat_error_response(response, ctx, status).await;
+    }
+
+    if is_stream && hosted_tool_stream_response {
+        let mut headers = response.headers().clone();
+        headers.remove(HOSTED_TOOL_STREAM_RESPONSE_HEADER);
+        headers.remove(HOSTED_TOOL_LOOP_HEADER);
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+        headers.remove(axum::http::header::CONTENT_ENCODING);
+        headers.remove(axum::http::header::TRANSFER_ENCODING);
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+        let stream =
+            record_responses_sse_stream(response.bytes_stream(), state.codex_chat_history.clone());
+        let usage_collector = if usage_logging_enabled(state) {
+            let state = state.clone();
+            let provider_id = ctx.provider.id.clone();
+            let request_model = ctx.request_model.clone();
+            let fallback_model = ctx
+                .outbound_model
+                .clone()
+                .unwrap_or_else(|| ctx.request_model.clone());
+            let app_type_str = ctx.app_type_str;
+            let start_time = ctx.start_time;
+            let session_id = ctx.session_id.clone();
+
+            Some(SseUsageCollector::new(
+                start_time,
+                Some(codex_stream_usage_event_filter),
+                move |events, first_token_ms| {
+                    let usage =
+                        TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
+                    if !usage.has_billable_tokens() {
+                        log::debug!("[Codex] hosted 流式响应 usage 全 0 或缺失，跳过消费记录");
+                        return;
+                    }
+                    let model = usage
+                        .model
+                        .clone()
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or_else(|| fallback_model.clone());
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    let state = state.clone();
+                    let provider_id = provider_id.clone();
+                    let request_model = request_model.clone();
+                    let outbound_model = fallback_model.clone();
+                    let session_id = session_id.clone();
+                    tokio::spawn(async move {
+                        log_usage(
+                            &state,
+                            &provider_id,
+                            app_type_str,
+                            &model,
+                            &request_model,
+                            &outbound_model,
+                            usage,
+                            latency_ms,
+                            first_token_ms,
+                            true,
+                            status.as_u16(),
+                            Some(session_id),
+                        )
+                        .await;
+                    });
+                },
+            ))
+        } else {
+            None
+        };
+        let logged_stream = create_logged_passthrough_stream(
+            stream,
+            ctx.tag,
+            usage_collector,
+            ctx.streaming_timeout_config(),
+            connection_guard,
+        );
+        let body = axum::body::Body::from_stream(logged_stream);
+        return Ok((headers, body).into_response());
     }
 
     if is_compaction {
@@ -4141,8 +4515,8 @@ fn build_codex_proxy_error_response(
     endpoint: &str,
     error: &ProxyError,
 ) -> Result<axum::response::Response, ProxyError> {
-    let status = axum::http::StatusCode::from_u16(map_proxy_error_to_status(error))
-        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let status = codex_proxy_error_status(endpoint, error);
+    let image_result_unknown = codex_image_result_unknown(endpoint, error);
     let body = codex_proxy_error_json(&ctx.provider.name, &ctx.request_model, endpoint, error);
     let body = serde_json::to_vec(&body).map_err(|e| {
         log::error!("[Codex] 序列化代理错误体失败: {e}");
@@ -4153,9 +4527,11 @@ fn build_codex_proxy_error_response(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/json"),
     );
-    if let Some(retry_after_secs) = error.retry_after_secs() {
-        if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
-            builder = builder.header(axum::http::header::RETRY_AFTER, value);
+    if !image_result_unknown {
+        if let Some(retry_after_secs) = error.retry_after_secs() {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
+                builder = builder.header(axum::http::header::RETRY_AFTER, value);
+            }
         }
     }
     builder.body(axum::body::Body::from(body)).map_err(|e| {
@@ -4164,12 +4540,35 @@ fn build_codex_proxy_error_response(
     })
 }
 
+fn codex_proxy_error_status(_endpoint: &str, error: &ProxyError) -> axum::http::StatusCode {
+    if codex_response_result_unknown(error) {
+        return axum::http::StatusCode::FAILED_DEPENDENCY;
+    }
+    axum::http::StatusCode::from_u16(map_proxy_error_to_status(error))
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn codex_image_result_unknown(endpoint: &str, error: &ProxyError) -> bool {
+    codex_response_result_unknown(error) && codex_image_endpoint(endpoint)
+}
+
+fn codex_response_result_unknown(error: &ProxyError) -> bool {
+    matches!(error, ProxyError::ResponsePending(_))
+}
+
+fn codex_image_endpoint(endpoint: &str) -> bool {
+    let path = endpoint.split('?').next().unwrap_or(endpoint);
+    path.ends_with("/images/generations") || path.ends_with("/images/edits")
+}
+
 fn codex_proxy_error_json(
     provider_name: &str,
     request_model: &str,
     endpoint: &str,
     error: &ProxyError,
 ) -> Value {
+    let result_unknown = codex_response_result_unknown(error);
+    let image_result_unknown = result_unknown && codex_image_endpoint(endpoint);
     let (mut body, upstream_status) = match error {
         ProxyError::UpstreamError { status, body } => {
             let parsed_body = body
@@ -4185,7 +4584,13 @@ fn codex_proxy_error_json(
                 "error": {
                     "message": get_error_message(error),
                     "type": "proxy_error",
-                    "code": codex_proxy_error_code(error),
+                    "code": if image_result_unknown {
+                        "cc_switch_image_result_unknown"
+                    } else if result_unknown {
+                        "cc_switch_response_result_unknown"
+                    } else {
+                        codex_proxy_error_code(error)
+                    },
                     "param": Value::Null,
                 }
             }),
@@ -4229,9 +4634,28 @@ fn codex_proxy_error_json(
         let status_fragment = upstream_status
             .map(|status| format!("; upstream_status: HTTP {status}"))
             .unwrap_or_default();
-        format!(
-            "CC Switch local proxy failed while handling Codex endpoint {endpoint}. Provider: {provider_name}; model: {request_model}{status_fragment}; cause: {cause}"
-        )
+        if image_result_unknown {
+            format!(
+                "The OpenAI image request was sent, but the connection closed before a final result was received. Provider: {provider_name}; model: {request_model}; endpoint: {endpoint}; cause: {cause}. The result state is unknown and this request must not be replayed automatically."
+            )
+        } else if result_unknown {
+            format!(
+                "The upstream request entered the send phase, but the connection closed before a final response was received. Provider: {provider_name}; model: {request_model}; endpoint: {endpoint}; cause: {cause}. This is not a rate limit. The result state is unknown and this request must not be replayed automatically."
+            )
+        } else if matches!(error, ProxyError::ForwardFailed(_)) {
+            let failure = if provider_name.eq_ignore_ascii_case("OpenAI Official") {
+                "OpenAI Codex upstream connection failed"
+            } else {
+                "Upstream provider connection failed"
+            };
+            format!(
+                "{failure} while sending Codex endpoint {endpoint}. Provider: {provider_name}; model: {request_model}; cause: {cause}"
+            )
+        } else {
+            format!(
+                "CC Switch local proxy failed while handling Codex endpoint {endpoint}. Provider: {provider_name}; model: {request_model}{status_fragment}; cause: {cause}"
+            )
+        }
     };
 
     error_obj.insert(
@@ -4248,7 +4672,20 @@ fn codex_proxy_error_json(
         error_obj.insert("type".to_string(), Value::String("proxy_error".to_string()));
     }
 
-    if error_obj.get("code").map(Value::is_null).unwrap_or(true) {
+    if result_unknown {
+        error_obj.insert(
+            "code".to_string(),
+            Value::String(
+                if image_result_unknown {
+                    "cc_switch_image_result_unknown"
+                } else {
+                    "cc_switch_response_result_unknown"
+                }
+                .to_string(),
+            ),
+        );
+        error_obj.insert("retryable".to_string(), Value::Bool(false));
+    } else if error_obj.get("code").map(Value::is_null).unwrap_or(true) {
         error_obj.insert(
             "code".to_string(),
             Value::String(codex_proxy_error_code(error).to_string()),
@@ -4300,7 +4737,8 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         | ProxyError::NotRunning
         | ProxyError::BindFailed(_)
         | ProxyError::StopTimeout
-        | ProxyError::StopFailed(_) => "cc_switch_proxy_error",
+        | ProxyError::StopFailed(_)
+        | ProxyError::ResponseBodyTooLarge(_) => "cc_switch_proxy_error",
     }
 }
 
@@ -4413,7 +4851,7 @@ fn should_use_claude_transform_streaming(
 ///
 /// 复用 `proxy::sse` 的 `take_sse_block`/`strip_sse_field`：`take_sse_block` 同时支持
 /// `\n\n` 与 `\r\n\r\n` 两种分隔符，`strip_sse_field` 兼容带/不带空格的字段写法。
-fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
+pub(crate) fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
     let mut buffer = body.trim_start_matches('\u{feff}').to_string();
     let mut completed_response: Option<Value> = None;
     let mut output_items = Vec::new();
@@ -4685,7 +5123,6 @@ fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
     let mut finish_reason = Value::Null;
     let mut usage = Value::Null;
     let mut saw_choice = false;
-    let mut saw_done = false;
 
     // strict=false 用于残余尾块：截断的半截 JSON 忽略而非报错，与
     // responses_sse_to_response_value 的残余处理对称（C2），否则一个被掐断的
@@ -4694,7 +5131,6 @@ fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
         |event_name: &str, data_str: &str, strict: bool| -> Result<(), ProxyError> {
             let trimmed = data_str.trim();
             if trimmed == "[DONE]" {
-                saw_done = true;
                 return Ok(());
             }
             if trimmed.is_empty() {
@@ -4856,12 +5292,11 @@ fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
             "No chat completion choices in upstream SSE".to_string(),
         ));
     }
-    // 完成性守卫：close-delimited 响应的中途截断在字节层不可检测，缺少
-    // finish_reason 与 [DONE] 两个完成证据时按截断处理，避免把半截内容
-    // 包装成"看起来成功"的响应静默返回（比 422 更难诊断的失败形态）。
-    if finish_reason.is_null() && !saw_done {
+    // [DONE] 只结束 SSE 传输，不能替代模型的 finish_reason。缺失语义终态时
+    // 一律按截断处理，避免把半截内容包装成成功响应。
+    if finish_reason.is_null() {
         return Err(ProxyError::TransformError(
-            "Upstream SSE stream appears truncated (no finish_reason or [DONE] marker)".to_string(),
+            "Upstream SSE stream appears truncated (no finish_reason)".to_string(),
         ));
     }
 
@@ -5193,14 +5628,15 @@ mod tests {
     use super::{
         body_looks_like_sse, build_external_codex_official_oauth_provider,
         chat_sse_to_response_value, classify_body_for_diagnostics, codex_catalog_models_response,
-        codex_proxy_error_json, external_openai_api_models_response,
-        external_openai_api_unsupported_response, mark_external_openai_headers,
-        resolve_codex_image_generation_provider, resolve_external_codex_router_target,
+        codex_proxy_error_json, codex_proxy_error_status, codex_request_classification_fields,
+        external_openai_api_models_response, external_openai_api_unsupported_response,
+        mark_external_openai_headers, resolve_codex_image_generation_provider,
+        resolve_external_codex_router_raw_target, resolve_external_codex_router_target,
         resolve_forward_error_provider_for_logging, resolve_forward_error_route_provider,
         responses_response_to_compaction_sse, responses_response_to_completed_sse,
         responses_response_to_full_sse, responses_sse_to_response_value,
-        should_handle_as_codex_client, should_use_claude_transform_streaming, transform,
-        upstream_body_parse_error,
+        should_handle_as_codex_client, should_use_claude_transform_streaming,
+        should_wrap_native_codex_responses_stream, transform, upstream_body_parse_error,
     };
     use crate::{
         app_config::AppType,
@@ -5250,6 +5686,29 @@ mod tests {
     }
 
     #[test]
+    fn native_codex_stream_recovery_only_wraps_successful_non_json_streams() {
+        let response = crate::proxy::hyper_client::ProxyResponse::streamed(
+            StatusCode::OK,
+            HeaderMap::new(),
+            futures::stream::empty::<Result<bytes::Bytes, std::io::Error>>(),
+        );
+        assert!(should_wrap_native_codex_responses_stream(true, &response));
+        assert!(!should_wrap_native_codex_responses_stream(false, &response));
+
+        let mut json_headers = HeaderMap::new();
+        json_headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let json_response = crate::proxy::hyper_client::ProxyResponse::buffered(
+            StatusCode::OK,
+            json_headers,
+            bytes::Bytes::new(),
+        );
+        assert!(!should_wrap_native_codex_responses_stream(
+            true,
+            &json_response
+        ));
+    }
+
+    #[test]
     fn codex_catalog_models_response_keeps_catalog_and_openai_data() {
         let response = codex_catalog_models_response(json!({
             "models": [
@@ -5294,6 +5753,18 @@ mod tests {
             qwen.get("maxContextWindow")
                 .and_then(|value| value.as_u64()),
             Some(262_144)
+        );
+        assert_eq!(
+            qwen.get("display_name").and_then(|value| value.as_str()),
+            Some("Qwen 3.6")
+        );
+        assert_eq!(
+            qwen.get("displayName").and_then(|value| value.as_str()),
+            Some("Qwen 3.6")
+        );
+        assert_eq!(
+            qwen.get("name").and_then(|value| value.as_str()),
+            Some("Qwen 3.6")
         );
         assert!(
             qwen.get("upstreamModel").is_none(),
@@ -5661,18 +6132,15 @@ data: [DONE]\r\n\
     }
 
     #[test]
-    fn chat_sse_to_response_value_accepts_done_marker_without_finish_reason() {
-        // 非规范上游可能不发 finish_reason 但正常收尾 [DONE]：视为完成
+    fn chat_sse_to_response_value_terminal_semantics_rejects_done_without_finish_reason() {
+        // [DONE] 只证明 SSE 传输关闭，不能替代模型的 finish_reason。
         let sse = "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
 data: [DONE]\n\n";
 
-        let response = chat_sse_to_response_value(sse).unwrap();
+        let err = chat_sse_to_response_value(sse).unwrap_err();
 
-        assert_eq!(response["choices"][0]["message"]["content"], "hi");
-        assert_eq!(
-            response["choices"][0]["finish_reason"],
-            serde_json::Value::Null
-        );
+        assert!(matches!(err, ProxyError::TransformError(_)));
+        assert!(err.to_string().contains("finish_reason"));
     }
 
     #[test]
@@ -5943,6 +6411,39 @@ data: [DONE]\n\n";
         );
 
         assert!(should_handle_as_codex_client(&headers));
+    }
+
+    #[test]
+    /// Codex Desktop 某些 Responses 请求不带 User-Agent，但会带官方指纹头。
+    fn missing_user_agent_uses_local_client_context() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-turn-metadata",
+            HeaderValue::from_static(r#"{"request_kind":"turn"}"#),
+        );
+
+        assert!(should_handle_as_codex_client(&headers));
+    }
+
+    #[test]
+    fn missing_identity_headers_still_require_external_api_auth() {
+        assert!(!should_handle_as_codex_client(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn classification_diagnostics_are_boolean_and_secret_free() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            HeaderValue::from_static("codex_cli/0.148.0"),
+        );
+
+        let fields = codex_request_classification_fields(&headers);
+        assert!(fields.contains(&("has_user_agent", "true".to_string())));
+        assert!(fields.contains(&("user_agent_contains_codex", "true".to_string())));
+        assert!(fields.contains(&("has_external_api_key", "false".to_string())));
+        assert!(fields.contains(&("force_external_marker", "false".to_string())));
+        assert!(fields.contains(&("selected_path", "codex".to_string())));
     }
 
     #[test]
@@ -6440,19 +6941,66 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
     }
 
     #[test]
-    fn codex_proxy_forward_error_includes_context_and_cause() {
+    fn codex_proxy_forward_error_points_to_upstream_connection() {
         let error = ProxyError::ForwardFailed("连接失败: dns lookup failed".to_string());
+        let body = codex_proxy_error_json("OpenAI Official", "gpt-5.6-sol", "/responses", &error);
+
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(!message.contains("CC Switch local proxy failed"));
+        assert!(message.contains("OpenAI Codex upstream connection failed"));
+        assert!(message.contains("OpenAI Official"));
+        assert!(message.contains("gpt-5.6-sol"));
+        assert!(message.contains("/responses"));
+        assert!(message.contains("dns lookup failed"));
+        assert_eq!(body["error"]["code"], "cc_switch_forward_failed");
+        assert_eq!(body["error"]["provider"], "OpenAI Official");
+        assert_eq!(body["error"]["model"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn codex_proxy_internal_error_keeps_local_proxy_classification() {
+        let error = ProxyError::Internal("failed to serialize local response".to_string());
         let body = codex_proxy_error_json("DeepSeek", "deepseek-chat", "/responses", &error);
 
         let message = body["error"]["message"].as_str().unwrap();
         assert!(message.contains("CC Switch local proxy failed"));
-        assert!(message.contains("DeepSeek"));
-        assert!(message.contains("deepseek-chat"));
-        assert!(message.contains("/responses"));
-        assert!(message.contains("dns lookup failed"));
-        assert_eq!(body["error"]["code"], "cc_switch_forward_failed");
-        assert_eq!(body["error"]["provider"], "DeepSeek");
-        assert_eq!(body["error"]["model"], "deepseek-chat");
+        assert!(message.contains("failed to serialize local response"));
+    }
+
+    #[test]
+    fn codex_image_response_pending_is_result_unknown_and_not_retryable() {
+        let error = ProxyError::ResponsePending(
+            "connection_closed_before_message_completed after request upload".to_string(),
+        );
+        let endpoint = "/v1/images/edits";
+        let body = codex_proxy_error_json("OpenAI Official", "gpt-image-2", endpoint, &error);
+
+        assert_eq!(
+            codex_proxy_error_status(endpoint, &error),
+            StatusCode::FAILED_DEPENDENCY
+        );
+        assert_eq!(body["error"]["code"], "cc_switch_image_result_unknown");
+        assert_eq!(body["error"]["retryable"], false);
+        assert!(body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("must not be replayed automatically"));
+    }
+
+    #[test]
+    fn codex_responses_pending_is_result_unknown_not_fake_rate_limit() {
+        let error = ProxyError::ResponsePending(
+            "connection_closed_before_message_completed after request upload".to_string(),
+        );
+        let endpoint = "/responses";
+        let body = codex_proxy_error_json("OpenAI Official", "gpt-5.6-sol", endpoint, &error);
+
+        assert_eq!(
+            codex_proxy_error_status(endpoint, &error),
+            StatusCode::FAILED_DEPENDENCY
+        );
+        assert_eq!(body["error"]["code"], "cc_switch_response_result_unknown");
+        assert_eq!(body["error"]["retryable"], false);
     }
 
     /// 验证 MultiRouter 请求失败时，usage/error 归因回到已命中的 route provider。
@@ -6704,29 +7252,40 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
         db.save_provider(
             "codex",
             &Provider::with_id(
+                "deepseek-provider".to_string(),
+                "DeepSeek".to_string(),
+                json!({
+                    "base_url": "https://api.deepseek.example/v1",
+                    "auth": { "OPENAI_API_KEY": "secret" },
+                    "modelCatalog": {
+                        "models": [
+                            { "model": "deepseek-v4-flash", "contextWindow": 1000000 },
+                            { "model": "deepseek-v4-pro", "contextWindow": 262144 }
+                        ]
+                    }
+                }),
+                None,
+            ),
+        )
+        .expect("save target provider");
+        db.save_provider(
+            "codex",
+            &Provider::with_id(
                 "codex-router".to_string(),
                 "Codex Router".to_string(),
                 json!({
                     "modelCatalog": {
-                        "models": [
-                            { "model": "deepseek-v4-flash", "contextWindow": 1000000 },
-                            { "model": "qwen3.6", "context_window": 262144 }
-                        ]
+                        "models": [{ "model": "stale-router-model", "contextWindow": 8192 }]
                     },
                     "codexRouting": {
+                        "schemaVersion": 2,
                         "enabled": true,
-                        "routes": [
-                            {
-                                "id": "deepseek",
-                                "label": "DeepSeek",
-                                "match": { "models": ["deepseek-v4-flash"] }
-                            },
-                            {
-                                "id": "qwen",
-                                "label": "Qwen",
-                                "match": { "models": [{ "model": "qwen3.6", "context_window": 262144 }] }
-                            }
-                        ]
+                        "routes": [{
+                            "id": "deepseek",
+                            "label": "DeepSeek",
+                            "targetProviderId": "deepseek-provider",
+                            "modelSelection": { "mode": "all" }
+                        }]
                     }
                 }),
                 None,
@@ -6756,10 +7315,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
             .iter()
             .find(|model| model.get("id").and_then(|id| id.as_str()) == Some("deepseek-v4-flash"))
             .expect("deepseek entry");
-        let qwen = data
+        let deepseek_pro = data
             .iter()
-            .find(|model| model.get("id").and_then(|id| id.as_str()) == Some("qwen3.6"))
-            .expect("qwen entry");
+            .find(|model| model.get("id").and_then(|id| id.as_str()) == Some("deepseek-v4-pro"))
+            .expect("deepseek pro entry");
 
         assert_eq!(
             deepseek
@@ -6768,9 +7327,14 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
             Some(1_000_000)
         );
         assert_eq!(
-            qwen.get("context_window").and_then(|value| value.as_u64()),
+            deepseek_pro
+                .get("context_window")
+                .and_then(|value| value.as_u64()),
             Some(262_144)
         );
+        assert!(data.iter().all(|model| {
+            model.get("id").and_then(|id| id.as_str()) != Some("stale-router-model")
+        }));
     }
 
     #[test]
@@ -7164,6 +7728,87 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
                 .and_then(|value| value.as_str()),
             Some("deepseek")
         );
+    }
+
+    #[test]
+    fn external_v2_raw_route_id_uses_compiler_and_latest_target_provider() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        db.save_provider(
+            "codex",
+            &Provider::with_id(
+                "codex-router".to_string(),
+                "Codex Router".to_string(),
+                json!({
+                    "codexRouting": {
+                        "schemaVersion": 2,
+                        "enabled": true,
+                        "defaultRouteId": "qwen",
+                        "routes": [{
+                            "id": "qwen",
+                            "label": "Qwen",
+                            "enabled": true,
+                            "targetProviderId": "qwen-target",
+                            "modelSelection": {"mode": "all"},
+                            "authPolicy": {"source": "provider_config"}
+                        }]
+                    }
+                }),
+                None,
+            ),
+        )
+        .expect("save router");
+        let mut target = Provider::with_id(
+            "qwen-target".to_string(),
+            "Qwen Target".to_string(),
+            json!({
+                "base_url": "https://qwen-latest.example/v1",
+                "modelCatalog": {"models": [{"model": "qwen3.8"}]}
+            }),
+            None,
+        );
+        target.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("codex", &target).expect("save target");
+        let state = build_state(db);
+        let profile = ExternalOpenAiApiProfile {
+            enabled: true,
+            backend_type: ExternalOpenAiApiBackendType::CodexRouterRoute,
+            app_type: Some("codex".to_string()),
+            provider_id: Some("codex-router".to_string()),
+            route_id: Some("qwen".to_string()),
+            default_model: Some("qwen3.8".to_string()),
+            listen_address: None,
+            listen_port: None,
+            api_key_hash: None,
+            api_key_prefix: None,
+            api_keys: Vec::new(),
+            updated_at: None,
+        };
+
+        let resolved = resolve_external_codex_router_raw_target(&state, &json!({}), &profile)
+            .expect("resolve")
+            .expect("compiled v2 route");
+
+        assert_eq!(resolved.settings_config["codexResolvedRouteId"], "qwen");
+        assert_eq!(
+            resolved.settings_config["base_url"],
+            "https://qwen-latest.example/v1"
+        );
+        assert!(resolved
+            .settings_config
+            .get("codexRoutingDependencyFingerprint")
+            .and_then(Value::as_str)
+            .is_some());
+        assert!(resolved
+            .settings_config
+            .get("codexResolvedUpstreamModelOverride")
+            .is_none());
+        assert!(!should_convert_codex_responses_to_chat(
+            &resolved,
+            "/v1/responses"
+        ));
     }
 
     #[test]

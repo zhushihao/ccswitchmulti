@@ -22,7 +22,7 @@ use super::sync_protocol::{
     persist_sync_success_best_effort, sha256_hex, validate_artifact_size_limit,
     validate_manifest_compat, verify_artifact, ArtifactMeta, RemoteLayout, SyncManifest,
     DB_COMPAT_VERSION, MAX_MANIFEST_BYTES, MAX_SYNC_ARTIFACT_BYTES, PROTOCOL_VERSION,
-    REMOTE_DB_SQL, REMOTE_MANIFEST, REMOTE_SKILLS_ZIP,
+    REMOTE_DB_SQL, REMOTE_MANIFEST, REMOTE_PRESET_TABLE, REMOTE_SKILLS_ZIP,
 };
 
 pub(crate) mod archive;
@@ -78,6 +78,12 @@ pub async fn upload(
 
     let skills_url = remote_file_url(settings, RemoteLayout::Current, REMOTE_SKILLS_ZIP)?;
     put_bytes(&skills_url, &auth, snapshot.skills_zip, "application/zip").await?;
+
+    // 预设表是可选 artifact：本地存在才上传（manifest 已登记其 hash/size）。
+    if let Some(preset_bytes) = &snapshot.preset_table {
+        let preset_url = remote_file_url(settings, RemoteLayout::Current, REMOTE_PRESET_TABLE)?;
+        put_bytes(&preset_url, &auth, preset_bytes.clone(), "application/json").await?;
+    }
 
     let manifest_url = remote_file_url(settings, RemoteLayout::Current, REMOTE_MANIFEST)?;
     put_bytes(
@@ -143,8 +149,28 @@ pub async fn download(
     )
     .await?;
 
+    // 预设表是可选 artifact：远端 manifest 没有时跳过（保留本地现有文件）。
+    let preset_table = if snapshot
+        .manifest
+        .artifacts
+        .contains_key(REMOTE_PRESET_TABLE)
+    {
+        Some(
+            download_and_verify(
+                settings,
+                &auth,
+                snapshot.layout,
+                REMOTE_PRESET_TABLE,
+                &snapshot.manifest.artifacts,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     // Apply snapshot
-    apply_snapshot(db, &db_sql, &skills_zip)?;
+    apply_snapshot(db, &db_sql, &skills_zip, preset_table.as_deref())?;
 
     let manifest_hash = sha256_hex(&snapshot.manifest_bytes);
     let _persisted = persist_sync_success_best_effort(
@@ -310,6 +336,60 @@ fn auth_for(settings: &WebDavSyncSettings) -> WebDavAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opt-in transport regression that exercises upload + download against a
+    /// disposable local WebDAV server. `CC_SWITCH_TEST_HOME` must point at an
+    /// isolated profile containing `webdavSync` and `preset-table.json`.
+    #[tokio::test]
+    #[ignore = "requires an explicitly started local WebDAV server and isolated CC_SWITCH_TEST_HOME"]
+    async fn e2e_round_trip_restores_preset_table_artifact() {
+        crate::proxy::http_client::init(None).expect("initialize direct HTTP client");
+
+        let mut settings = crate::settings::get_webdav_sync_settings()
+            .expect("isolated test profile must configure WebDAV sync");
+        let bundle_path = crate::config::get_app_config_dir().join(REMOTE_PRESET_TABLE);
+        let expected_bundle = std::fs::read(&bundle_path).expect("read seeded preset table");
+        let db = crate::database::Database::memory().expect("create test database");
+        let provider = crate::provider::Provider::with_id(
+            "webdav-e2e-provider".to_string(),
+            "WebDAV E2E Provider".to_string(),
+            serde_json::json!({}),
+            None,
+        );
+        db.save_provider("codex", &provider)
+            .expect("seed valid snapshot provider");
+
+        check_connection(&settings)
+            .await
+            .expect("local WebDAV must be reachable");
+        upload(&db, &mut settings)
+            .await
+            .expect("upload snapshot with preset table artifact");
+
+        let info = fetch_remote_info(&settings)
+            .await
+            .expect("read uploaded manifest")
+            .expect("uploaded manifest exists");
+        assert!(
+            info["artifacts"]
+                .as_array()
+                .expect("manifest artifacts array")
+                .iter()
+                .any(|name| name.as_str() == Some(REMOTE_PRESET_TABLE)),
+            "manifest must advertise preset-table.json"
+        );
+
+        std::fs::write(&bundle_path, b"locally-corrupted-preset-table")
+            .expect("corrupt only the isolated local preset table");
+        download(&db, &mut settings)
+            .await
+            .expect("download snapshot and restore preset table artifact");
+
+        assert_eq!(
+            std::fs::read(&bundle_path).expect("read restored preset table"),
+            expected_bundle
+        );
+    }
 
     #[test]
     fn remote_dir_segments_uses_current_layout() {

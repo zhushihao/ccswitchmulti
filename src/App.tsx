@@ -27,6 +27,8 @@ import {
   LayoutDashboard,
   Network,
   Route as RouteIcon,
+  Loader2,
+  RefreshCw,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Provider, VisibleApps } from "@/types";
@@ -34,10 +36,10 @@ import type { EnvConflict } from "@/types/env";
 import { proxyKeys, useProvidersQuery, useSettingsQuery } from "@/lib/query";
 import {
   providersApi,
-  proxyApi,
   settingsApi,
   type AppId,
   type ProviderSwitchEvent,
+  type RecoveryOutcome,
 } from "@/lib/api";
 import { checkAllEnvConflicts, checkEnvConflicts } from "@/lib/api/env";
 import { useProviderActions } from "@/hooks/useProviderActions";
@@ -56,6 +58,8 @@ import { extractErrorMessage } from "@/utils/errorUtils";
 import { isTextEditableTarget } from "@/utils/domUtils";
 import { deepClone } from "@/utils/deepClone";
 import { cn } from "@/lib/utils";
+import { enableCodexMultiRouterPlan } from "@/lib/codexMultiRouterEnable";
+import { loadPresetCatalog } from "@/lib/presetCatalog";
 import {
   isWindows,
   isLinux,
@@ -70,6 +74,7 @@ import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
 import { UpdateBadge } from "@/components/UpdateBadge";
+import { CCSWITCHMULTI_REPOSITORY_URL } from "@/config/productLinks";
 import { EnvWarningBanner } from "@/components/env/EnvWarningBanner";
 import { ProxyToggle } from "@/components/proxy/ProxyToggle";
 import { ClaudeDesktopRouteToggle } from "@/components/proxy/ClaudeDesktopRouteToggle";
@@ -82,7 +87,9 @@ import {
   getSkillsPageHeaderActions,
   type SkillsPageSource,
 } from "@/components/skills/SkillsPage";
-import UnifiedSkillsPanel from "@/components/skills/UnifiedSkillsPanel";
+import UnifiedSkillsPanel, {
+  type SkillsCheckUpdatesState,
+} from "@/components/skills/UnifiedSkillsPanel";
 import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
 import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
 import { AgentsPanel } from "@/components/agents/AgentsPanel";
@@ -142,6 +149,13 @@ interface SyncStatusUpdatedPayload {
   error?: string;
 }
 
+function recoveryFieldSummary(
+  fields: string[] | undefined,
+  fallback: string,
+): string {
+  return fields && fields.length > 0 ? fields.join(", ") : fallback;
+}
+
 const DEFAULT_DRAG_BAR_HEIGHT = isWindows() || isLinux() ? 0 : 28; // px
 const HEADER_HEIGHT = 64; // px
 
@@ -198,6 +212,129 @@ function App() {
   useAdaptiveUiZoom();
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const lastRecoveryOutcomeKeyRef = useRef<string | undefined>(undefined);
+
+  const showRecoveryOutcome = (outcome: RecoveryOutcome | null | undefined) => {
+    if (!outcome) return;
+    const key = `${outcome.kind}:${outcome.timestamp}`;
+    if (lastRecoveryOutcomeKeyRef.current === key) return;
+    lastRecoveryOutcomeKeyRef.current = key;
+
+    const kept = recoveryFieldSummary(
+      outcome.keptFields,
+      t("notifications.recoveryNoFields", {
+        defaultValue: "no user fields were confirmed",
+      }),
+    );
+    const lost = recoveryFieldSummary(
+      outcome.lostFields,
+      t("notifications.recoveryNoLostFields", {
+        defaultValue: "no specific lost fields were recorded",
+      }),
+    );
+    const nextStep = outcome.nextStep
+      ? t(`notifications.recoveryNextStep.${outcome.nextStep}`, {
+          defaultValue: outcome.nextStep,
+        })
+      : "";
+    const detailSuffix = nextStep ? ` ${nextStep}` : "";
+    const openLogsAction = {
+      label: t("notifications.recoveryOpenLogs", {
+        defaultValue: "Open log directory",
+      }),
+      onClick: () => {
+        void settingsApi.openLogDir();
+      },
+    };
+
+    switch (outcome.kind) {
+      case "providerOnlyRestored":
+        toast.warning(
+          t("notifications.recoveryProviderOnlyRestored", {
+            kept,
+            lost,
+            nextStep: detailSuffix,
+            defaultValue: `Configuration was restored, but only provider fields were available. Kept: ${kept}; not confirmed: ${lost}.${detailSuffix}`,
+          }),
+          { duration: 10000 },
+        );
+        break;
+      case "unrecoverableUserTables":
+        toast.error(
+          t("notifications.recoveryUnrecoverable", {
+            lost,
+            nextStep: detailSuffix,
+            defaultValue: `Configuration recovery could not be completed. Not recovered: ${lost}.${detailSuffix}`,
+          }),
+          { duration: 12000, action: openLogsAction },
+        );
+        break;
+      case "userBackupCandidateFound":
+        toast.warning(
+          t("notifications.recoveryBackupCandidate", {
+            nextStep: detailSuffix,
+            defaultValue: `A configuration backup candidate was found.${detailSuffix}`,
+          }),
+          { duration: 10000, action: openLogsAction },
+        );
+        break;
+      case "concurrentModificationDeferred":
+        toast.warning(
+          t("notifications.recoveryConcurrentDeferred", {
+            nextStep: detailSuffix,
+            defaultValue: `Another program is changing the configuration, so this write was deferred.${detailSuffix}`,
+          }),
+          { duration: 9000 },
+        );
+        break;
+      case "portOwnedByUnknownOwner":
+        toast.error(
+          t("notifications.recoveryPortUnknownOwner", {
+            nextStep: detailSuffix,
+            defaultValue: `The local proxy port is owned by another program. CCSwitchMulti did not terminate it.${detailSuffix}`,
+          }),
+          { duration: 10000 },
+        );
+        break;
+      case "activePreviousInstance":
+        toast.warning(
+          t("notifications.recoveryActivePreviousInstance", {
+            nextStep: detailSuffix,
+            defaultValue:
+              "Another CCSwitchMulti instance is still running. This launch will not take over or restore its configuration.",
+          }),
+          { duration: 10000 },
+        );
+        break;
+      case "noPreviousRun":
+      case "uncleanExit":
+      case "confirmedCrash":
+      case "plannedRestartOrUpdate":
+      case "healthyBackupRestored":
+      case "livePreservedProviderRepaired":
+      case "pluginRegistrationRepairAvailable":
+      case "pluginRegistrationRepairCompleted":
+      case "pluginRegistrationRepairFailed":
+      case "portOwnedByCompatibleInstance":
+        // These states either describe an internal startup classification or a
+        // successful/handled action.  They do not need a duplicate toast here.
+        break;
+    }
+  };
+
+  useTauriEvent<RecoveryOutcome | null | undefined>(
+    "codex-config-recovery-outcome",
+    showRecoveryOutcome,
+  );
+
+  useEffect(() => {
+    void settingsApi
+      .getLastRecoveryOutcome()
+      .then(showRecoveryOutcome)
+      .catch((error) => {
+        console.debug("[App] Failed to read last recovery outcome", error);
+      });
+  }, [t]);
 
   const [activeApp, setActiveApp] = useState<AppId>(getInitialApp);
   const sharedFeatureApp: AppId =
@@ -210,15 +347,6 @@ function App() {
     providerId?: string | null;
     tab: WorkspaceTab;
   }>({ tab: "status" });
-  const codexPostSetupGuideRef = useRef<{
-    planId: string;
-    successSeen: boolean;
-    historyRepairPrompted: boolean;
-  } | null>(null);
-  const [
-    openCodexHistoryRepairOnSessions,
-    setOpenCodexHistoryRepairOnSessions,
-  ] = useState(false);
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [
     isCodexMultiRouterEntryChoiceOpen,
@@ -226,11 +354,32 @@ function App() {
   ] = useState(false);
   const [isCodexMultiRouterWizardOpen, setIsCodexMultiRouterWizardOpen] =
     useState(false);
+  const [codexMultiRouterWizardMode, setCodexMultiRouterWizardMode] = useState<
+    "create" | "edit"
+  >("create");
+  const [codexMultiRouterWizardPlanId, setCodexMultiRouterWizardPlanId] =
+    useState<string>();
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
+  const [mcpManagementBusy, setMcpManagementBusy] = useState(false);
+  const [skillsManagementBusy, setSkillsManagementBusy] = useState(false);
+  const [skillsNavigationBusy, setSkillsNavigationBusy] = useState(false);
+  const [promptManagementBusy, setPromptManagementBusy] = useState(false);
+  const [promptNavigationBusy, setPromptNavigationBusy] = useState(false);
+  const [skillsCheckUpdatesState, setSkillsCheckUpdatesState] =
+    useState<SkillsCheckUpdatesState>({
+      isChecking: false,
+      hasSkills: false,
+    });
 
   useEffect(() => {
     localStorage.setItem(VIEW_STORAGE_KEY, currentView);
   }, [currentView]);
+
+  // 启动时预加载本地预设表（WebDAV 同步的模型能力目录），供上下文推断同步查询。
+  // 失败静默：调用方回退内置硬编码预设。
+  useEffect(() => {
+    void loadPresetCatalog();
+  }, []);
 
   // Codex 专属工具页只在 Codex 应用语境下保留，避免切到其他应用后还停留在 Codex 工具。
   useEffect(() => {
@@ -346,6 +495,10 @@ function App() {
   const codexWizardProviders = useMemo(
     () => (activeApp === "codex" ? Object.values(providers) : []),
     [activeApp, providers],
+  );
+  const codexRoutingPlans = useMemo(
+    () => codexWizardProviders.filter(isRoutingPlan),
+    [codexWizardProviders],
   );
   const currentProviderId = data?.currentProviderId ?? "";
   const isOpenClawView =
@@ -500,6 +653,48 @@ function App() {
       );
     },
   );
+
+  useEffect(() => {
+    let active = true;
+    void settingsApi
+      .detectCodexPluginRegistration()
+      .then((plugins) => {
+        if (!active || plugins.length === 0) return;
+        const plugin = plugins[0];
+        toast.warning(
+          `检测到 Codex 插件 ${plugin.name}@${plugin.version} 尚未登记到个人 marketplace。`,
+          {
+            duration: Infinity,
+            closeButton: true,
+            action: {
+              label: "修复登记",
+              onClick: () => {
+                void settingsApi
+                  .repairCodexPluginRegistration(plugin.id)
+                  .then(() => {
+                    toast.success(`Codex 插件 ${plugin.name} 登记已修复。`, {
+                      closeButton: true,
+                    });
+                  })
+                  .catch((error) => {
+                    toast.error(
+                      `Codex 插件 ${plugin.name} 登记修复失败：${extractErrorMessage(error)}`,
+                      { closeButton: true },
+                    );
+                  });
+              },
+            },
+          },
+        );
+      })
+      .catch((error) => {
+        console.debug("[App] Failed to inspect Codex plugin registration", error);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useTauriEvent<{ appType: string; providerName: string }>(
     "proxy-official-warning",
@@ -661,6 +856,10 @@ function App() {
   }, [activeApp]);
 
   const currentViewRef = useRef(currentView);
+  const managementBusy =
+    mcpManagementBusy || skillsNavigationBusy || promptNavigationBusy;
+  const managementBusyRef = useRef(false);
+  managementBusyRef.current = managementBusy;
 
   useEffect(() => {
     currentViewRef.current = currentView;
@@ -669,6 +868,10 @@ function App() {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "," && (event.metaKey || event.ctrlKey)) {
+        if (managementBusyRef.current) {
+          event.preventDefault();
+          return;
+        }
         event.preventDefault();
         setCurrentView("settings");
         return;
@@ -680,6 +883,7 @@ function App() {
 
       const view = currentViewRef.current;
       if (view === "providers") return;
+      if (managementBusyRef.current) return;
 
       if (isTextEditableTarget(event.target)) return;
 
@@ -718,24 +922,8 @@ function App() {
     provider: Provider;
     originalId?: string;
   }) => {
-    const result = await updateProvider(provider, originalId);
+    await updateProvider(provider, originalId);
     setEditingProvider(null);
-    for (const syncResult of result?.codexMultiRouterSyncResults ?? []) {
-      if (syncResult.removedSpawnAgentModels.length === 0) continue;
-      const removedModels = syncResult.removedSpawnAgentModels.join("、");
-      toast.warning(
-        `MultiRouter「${syncResult.plan.name}」的子 Agent 候选已移除不可用模型，请手动处理。`,
-        {
-          description: `已移除：${removedModels}`,
-          closeButton: true,
-          duration: 12000,
-          action: {
-            label: "处理",
-            onClick: () => openCodexRouterWorkspace(syncResult.plan, "routes"),
-          },
-        },
-      );
-    }
   };
 
   /**
@@ -986,15 +1174,26 @@ function App() {
   };
 
   // 从首页 CTA 进入入口选择面板；用户可以随时退出，也可以选择引导或直接进入工作台。
-  const handleStartCodexMultiRouterWizard = () => {
+  const handleStartCodexMultiRouterWizard = async () => {
     setActiveApp("codex");
     setCurrentView("providers");
+    await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
+    await refetch();
     setIsCodexMultiRouterEntryChoiceOpen(true);
   };
 
-  // 用户明确选择引导时才打开遮罩式向导，避免每次点击入口都被强制带入教程。
-  const handleOpenCodexMultiRouterGuide = () => {
+  const handleCreateCodexMultiRouter = () => {
     setActiveApp("codex");
+    setCodexMultiRouterWizardMode("create");
+    setCodexMultiRouterWizardPlanId(undefined);
+    setIsCodexMultiRouterEntryChoiceOpen(false);
+    setIsCodexMultiRouterWizardOpen(true);
+  };
+
+  const handleEditCodexMultiRouter = (provider: Provider) => {
+    setActiveApp("codex");
+    setCodexMultiRouterWizardMode("edit");
+    setCodexMultiRouterWizardPlanId(provider.id);
     setIsCodexMultiRouterEntryChoiceOpen(false);
     setIsCodexMultiRouterWizardOpen(true);
   };
@@ -1008,16 +1207,11 @@ function App() {
     openCodexRouterWorkspace(existingPlan ?? null, "status");
   };
 
-  // 用户在向导里选择启用 MultiRouter 时，必须把 CCSwitchMulti 本地代理和 Codex 接管一起打开。
+  // 目标 Provider 的 switch 路径会在同一个后端切换锁内启动代理并完成接管；
+  // 这里不能先接管当前 Provider，否则会短暂写入错误的模型目录与 managed roles。
   const handleEnableCodexMultiRouterPlan = async (provider: Provider) => {
     setActiveApp("codex");
-    if (!isProxyRunning) {
-      await proxyApi.startProxyServer();
-    }
-    if (!takeoverStatus?.codex) {
-      await proxyApi.setProxyTakeoverForApp("codex", true);
-    }
-    await switchProvider(provider);
+    await enableCodexMultiRouterPlan(provider, switchProvider);
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["proxyStatus"] }),
       queryClient.invalidateQueries({ queryKey: ["proxyTakeoverStatus"] }),
@@ -1036,32 +1230,23 @@ function App() {
       }),
       queryClient.refetchQueries({ queryKey: usageKeys.all, type: "active" }),
     ]);
-    codexPostSetupGuideRef.current = {
-      planId: provider.id,
-      successSeen: false,
-      historyRepairPrompted: false,
-    };
     openCodexRouterWorkspace(provider, "status");
   };
 
-  // MultiRouter 工作台确认运行态全绿后，进入历史修复，并给用户明确下一步。
-  const handleCodexMultiRouterReady = (provider: Provider) => {
-    const current = codexPostSetupGuideRef.current;
-    if (!current || current.planId !== provider.id || current.successSeen) {
-      return;
+  // Provider 列表也是启用入口。schema v1 必须先进入带 preview/token/revision
+  // 的编辑向导，不能绕过显式迁移直接 switch；schema v2 才允许原子启用。
+  const handleSwitchProviderFromList = (provider: Provider) => {
+    if (activeApp === "codex" && isRoutingPlan(provider)) {
+      const routing = provider.settingsConfig?.codexRouting as
+        | { schemaVersion?: number }
+        | undefined;
+      if (routing?.schemaVersion !== 2) {
+        handleEditCodexMultiRouter(provider);
+        return;
+      }
+      return handleEnableCodexMultiRouterPlan(provider);
     }
-    toast.success(
-      "Codex MultiRouter 配置成功：当前 provider、代理监听、Codex 接管、路由入口和最近请求转发都已成功。下一步请修复历史记录可见性。",
-      { closeButton: true, duration: 10000 },
-    );
-    setActiveApp("codex");
-    setOpenCodexHistoryRepairOnSessions(true);
-    setCurrentView("sessions");
-    codexPostSetupGuideRef.current = {
-      ...current,
-      successSeen: true,
-      historyRepairPrompted: true,
-    };
+    return switchProvider(provider);
   };
 
   // 历史修复写入完成后，先提示重启 Codex，再征求点赞并用默认浏览器打开 CCSwitchMulti 仓库。
@@ -1147,6 +1332,8 @@ function App() {
               open={true}
               onOpenChange={() => setCurrentView("providers")}
               appId={sharedFeatureApp}
+              onInteractionBlockedChange={setPromptManagementBusy}
+              onNavigationBlockedChange={setPromptNavigationBusy}
             />
           );
         case "hermesMemory":
@@ -1177,7 +1364,6 @@ function App() {
               onDeletePlan={(provider) =>
                 setConfirmAction({ provider, action: "delete" })
               }
-              onRuntimeReady={handleCodexMultiRouterReady}
             />
           );
         case "codexUsage":
@@ -1187,6 +1373,9 @@ function App() {
             <UnifiedSkillsPanel
               ref={unifiedSkillsPanelRef}
               onOpenDiscovery={handleOpenSkillsDiscovery}
+              onInteractionBlockedChange={setSkillsManagementBusy}
+              onNavigationBlockedChange={setSkillsNavigationBusy}
+              onCheckUpdatesStateChange={setSkillsCheckUpdatesState}
               currentApp={
                 sharedFeatureApp === "openclaw" ? "claude" : sharedFeatureApp
               }
@@ -1207,6 +1396,7 @@ function App() {
             <UnifiedMcpPanel
               ref={mcpPanelRef}
               onOpenChange={() => setCurrentView("providers")}
+              onInteractionBlockedChange={setMcpManagementBusy}
             />
           );
         case "agents":
@@ -1225,10 +1415,6 @@ function App() {
             <SessionManagerPage
               key={sharedFeatureApp}
               appId={sharedFeatureApp}
-              initialCodexHistoryRepair={openCodexHistoryRepairOnSessions}
-              onInitialCodexHistoryRepairConsumed={() =>
-                setOpenCodexHistoryRepairOnSessions(false)
-              }
               onCodexHistoryRepairCompleted={
                 sharedFeatureApp === "codex"
                   ? handleCodexHistoryRepairCompleted
@@ -1267,7 +1453,7 @@ function App() {
                         isProxyRunning && isCurrentAppTakeoverActive
                       }
                       activeProviderId={activeProviderId}
-                      onSwitch={switchProvider}
+                      onSwitch={handleSwitchProviderFromList}
                       onEdit={(provider) => {
                         if (activeApp === "codex" && isRoutingPlan(provider)) {
                           openCodexRouterWorkspace(provider, "routes");
@@ -1443,6 +1629,7 @@ function App() {
                 <Button
                   variant="outline"
                   size="icon"
+                  disabled={managementBusy}
                   onClick={() =>
                     setCurrentView(
                       currentView === "skillsDiscovery"
@@ -1450,7 +1637,10 @@ function App() {
                         : "providers",
                     )
                   }
-                  className="mr-2 rounded-lg"
+                  className={cn(
+                    "mr-2 rounded-lg",
+                    managementBusy && "disabled:opacity-100",
+                  )}
                 >
                   <ArrowLeft className="w-4 h-4" />
                 </Button>
@@ -1484,7 +1674,7 @@ function App() {
               <div className="flex items-center gap-2">
                 <div className="relative inline-flex items-center">
                   <a
-                    href="https://ccswitch.io"
+                    href={CCSWITCHMULTI_REPOSITORY_URL}
                     target="_blank"
                     rel="noreferrer"
                     className={cn(
@@ -1566,17 +1756,27 @@ function App() {
                   <ProfileSwitcher activeApp={activeApp} />
                 </div>
               )}
-            <div className="flex flex-1 min-w-0 overflow-x-hidden items-center py-4 pr-2">
+            <div className="flex min-w-0 flex-1 items-center justify-end overflow-hidden py-4">
+              {currentView === "providers" && (
+                <AppSwitcher
+                  activeApp={activeApp}
+                  onSwitch={setActiveApp}
+                  visibleApps={visibleApps}
+                />
+              )}
+            </div>
+            <div className="flex shrink-0 items-center py-4 pr-2">
               <div
-                className="flex shrink-0 items-center gap-1.5 ml-auto"
+                className="flex shrink-0 items-center gap-1.5"
                 style={{ WebkitAppRegion: "no-drag" } as any}
               >
                 {currentView === "prompts" && (
                   <Button
                     variant="ghost"
                     size="sm"
+                    disabled={promptManagementBusy}
                     onClick={() => promptPanelRef.current?.openAdd()}
-                    className="hover:bg-black/5 dark:hover:bg-white/5"
+                    className="hover:bg-black/5 disabled:opacity-100 dark:hover:bg-white/5"
                   >
                     <Plus className="w-4 h-4 mr-2" />
                     {t("prompts.add")}
@@ -1587,8 +1787,9 @@ function App() {
                     <Button
                       variant="ghost"
                       size="sm"
+                      disabled={mcpManagementBusy}
                       onClick={() => mcpPanelRef.current?.openImport()}
-                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                      className="hover:bg-black/5 disabled:opacity-100 dark:hover:bg-white/5"
                     >
                       <Download className="w-4 h-4 mr-2" />
                       {t("mcp.importExisting")}
@@ -1596,8 +1797,9 @@ function App() {
                     <Button
                       variant="ghost"
                       size="sm"
+                      disabled={mcpManagementBusy}
                       onClick={() => mcpPanelRef.current?.openAdd()}
-                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                      className="hover:bg-black/5 disabled:opacity-100 dark:hover:bg-white/5"
                     >
                       <Plus className="w-4 h-4 mr-2" />
                       {t("mcp.addMcp")}
@@ -1609,10 +1811,36 @@ function App() {
                     <Button
                       variant="ghost"
                       size="sm"
+                      disabled={
+                        skillsManagementBusy ||
+                        skillsCheckUpdatesState.isChecking ||
+                        !skillsCheckUpdatesState.hasSkills
+                      }
+                      onClick={() =>
+                        unifiedSkillsPanelRef.current?.checkUpdates()
+                      }
+                      className={cn(
+                        "hover:bg-black/5 dark:hover:bg-white/5",
+                        skillsManagementBusy && "disabled:opacity-100",
+                      )}
+                    >
+                      {skillsCheckUpdatesState.isChecking ? (
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      ) : (
+                        <RefreshCw className="w-4 h-4 mr-2" />
+                      )}
+                      {skillsCheckUpdatesState.isChecking
+                        ? t("skills.checkingUpdates")
+                        : t("skills.checkUpdates")}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={skillsManagementBusy}
                       onClick={() =>
                         unifiedSkillsPanelRef.current?.openRestoreFromBackup()
                       }
-                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                      className="hover:bg-black/5 disabled:opacity-100 dark:hover:bg-white/5"
                     >
                       <History className="w-4 h-4 mr-2" />
                       {t("skills.restoreFromBackup.button")}
@@ -1620,10 +1848,11 @@ function App() {
                     <Button
                       variant="ghost"
                       size="sm"
+                      disabled={skillsManagementBusy}
                       onClick={() =>
                         unifiedSkillsPanelRef.current?.openInstallFromZip()
                       }
-                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                      className="hover:bg-black/5 disabled:opacity-100 dark:hover:bg-white/5"
                     >
                       <FolderArchive className="w-4 h-4 mr-2" />
                       {t("skills.installFromZip.button")}
@@ -1631,10 +1860,11 @@ function App() {
                     <Button
                       variant="ghost"
                       size="sm"
+                      disabled={skillsManagementBusy}
                       onClick={() =>
                         unifiedSkillsPanelRef.current?.openImport()
                       }
-                      className="relative hover:bg-black/5 dark:hover:bg-white/5"
+                      className="relative hover:bg-black/5 disabled:opacity-100 dark:hover:bg-white/5"
                       title={
                         hasUnmanagedSkills
                           ? t("skills.unmanagedAvailable")
@@ -1653,8 +1883,11 @@ function App() {
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={handleOpenSkillsDiscovery}
-                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                      disabled={skillsManagementBusy}
+                      onClick={() =>
+                        unifiedSkillsPanelRef.current?.openDiscovery()
+                      }
+                      className="hover:bg-black/5 disabled:opacity-100 dark:hover:bg-white/5"
                     >
                       <Search className="w-4 h-4 mr-2" />
                       {t("skills.discover")}
@@ -1681,12 +1914,6 @@ function App() {
                 )}
                 {currentView === "providers" && (
                   <>
-                    <AppSwitcher
-                      activeApp={activeApp}
-                      onSwitch={setActiveApp}
-                      visibleApps={visibleApps}
-                    />
-
                     <div className="flex items-center gap-1 p-1 bg-muted rounded-xl">
                       <AnimatePresence mode="wait">
                         <motion.div
@@ -1924,40 +2151,63 @@ function App() {
               配置多路模型
             </DialogTitle>
             <DialogDescription className="leading-6">
-              你可以开始完整引导，也可以随时退出并直接进入 MultiRouter
-              工作台。再次点击首页入口时仍会先回到这个选择面板。
+              先明确是创建独立的新方案，还是编辑一条已有方案。打开此窗口时会重新读取
+              Provider 数据，避免沿用上次向导草稿。
             </DialogDescription>
           </DialogHeader>
 
           <div className="grid gap-3 px-6 py-4">
             <button
               type="button"
-              onClick={handleOpenCodexMultiRouterGuide}
-              className="rounded-lg border border-primary/30 bg-primary/5 p-4 text-left transition-colors hover:bg-primary/10"
+              onClick={handleCreateCodexMultiRouter}
+              className="rounded-xl border border-blue-500/25 bg-gradient-to-r from-blue-500/10 via-background to-cyan-500/10 p-4 text-left shadow-sm transition-colors hover:border-blue-500/45 hover:from-blue-500/15"
             >
               <div className="flex items-center gap-2 font-medium">
-                <Wrench className="h-4 w-4 text-primary" />
-                开始引导配置
+                <Plus className="h-4 w-4 text-blue-500" />
+                创建新配置
               </div>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                按步骤创建 provider、获取模型、处理重名、生成路由、启用
-                MultiRouter，并接到状态页和历史修复流程。
+                从空白方案开始选择模型源。不会覆盖任何已有 MultiRouter。
               </p>
             </button>
 
-            <button
-              type="button"
-              onClick={handleOpenCodexMultiRouterWorkspaceDirectly}
-              className="rounded-lg border bg-card p-4 text-left transition-colors hover:bg-muted/60"
-            >
+            <div className="rounded-xl border border-violet-500/25 bg-gradient-to-r from-violet-500/10 via-background to-fuchsia-500/10 p-4 shadow-sm">
               <div className="flex items-center gap-2 font-medium">
-                <LayoutDashboard className="h-4 w-4 text-muted-foreground" />
-                直接打开工作台
+                <Wrench className="h-4 w-4 text-violet-500" />
+                编辑旧配置
               </div>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                跳过教程，直接进入 MultiRouter 状态页查看、编辑或测试现有路由。
+                选择明确的方案后再进入向导；方案名称和 ID 会始终显示在顶部。
               </p>
-            </button>
+              <div className="mt-3 max-h-40 space-y-2 overflow-y-auto pr-1">
+                {codexRoutingPlans.length > 0 ? (
+                  codexRoutingPlans.map((plan) => (
+                    <button
+                      key={plan.id}
+                      type="button"
+                      onClick={() => handleEditCodexMultiRouter(plan)}
+                      className="flex w-full items-center justify-between gap-3 rounded-lg border border-border/60 bg-background/65 px-3 py-2 text-left transition hover:border-violet-500/40 hover:bg-violet-500/10"
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-medium">
+                          {plan.name}
+                        </span>
+                        <span className="block truncate text-xs text-muted-foreground">
+                          {plan.id}
+                        </span>
+                      </span>
+                      <span className="shrink-0 text-xs text-violet-600 dark:text-violet-300">
+                        编辑
+                      </span>
+                    </button>
+                  ))
+                ) : (
+                  <div className="rounded-lg border border-dashed border-border/70 px-3 py-3 text-xs text-muted-foreground">
+                    暂无已有 MultiRouter，请先创建新配置。
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
 
           <DialogFooter>
@@ -1967,7 +2217,13 @@ function App() {
             >
               暂不配置
             </Button>
-            <Button onClick={handleOpenCodexMultiRouterGuide}>开始引导</Button>
+            <Button
+              variant="outline"
+              onClick={handleOpenCodexMultiRouterWorkspaceDirectly}
+            >
+              <LayoutDashboard className="mr-2 h-4 w-4" />
+              直接打开工作台
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1976,6 +2232,8 @@ function App() {
         <CodexMultiRouterWizard
           open
           providers={codexWizardProviders}
+          mode={codexMultiRouterWizardMode}
+          planId={codexMultiRouterWizardPlanId}
           onOpenChange={setIsCodexMultiRouterWizardOpen}
           onCreateProvider={() => {
             setActiveApp("codex");

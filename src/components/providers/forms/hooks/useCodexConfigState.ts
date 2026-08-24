@@ -107,6 +107,7 @@ export function extractCodexRoutingConfig(
 
   if (routing && typeof routing === "object") {
     return {
+      ...routing,
       enabled: routing.enabled !== false,
       defaultRouteId:
         typeof routing.defaultRouteId === "string"
@@ -145,7 +146,9 @@ interface CodexConfigInitialState {
 }
 
 // 归一化 modelCatalog.models，保证编辑页首帧就能拿到可渲染的模型行。
-function extractCodexCatalogModels(modelCatalog: any): CodexCatalogModel[] {
+export function extractCodexCatalogModels(
+  modelCatalog: any,
+): CodexCatalogModel[] {
   const rawCatalogModels = Array.isArray(modelCatalog?.models)
     ? modelCatalog.models
     : [];
@@ -165,6 +168,20 @@ function extractCodexCatalogModels(modelCatalog: any): CodexCatalogModel[] {
         : Array.isArray(item?.input_modalities)
           ? item.input_modalities
           : undefined;
+      const supportsImage =
+        typeof item?.supportsImage === "boolean"
+          ? item.supportsImage
+          : typeof item?.supports_image === "boolean"
+            ? item.supports_image
+            : typeof item?.vision === "boolean"
+              ? item.vision
+              : undefined;
+      const textOnly =
+        typeof item?.textOnly === "boolean"
+          ? item.textOnly
+          : typeof item?.text_only === "boolean"
+            ? item.text_only
+            : undefined;
       const baseInstructions =
         typeof item?.baseInstructions === "string"
           ? item.baseInstructions
@@ -191,9 +208,42 @@ function extractCodexCatalogModels(modelCatalog: any): CodexCatalogModel[] {
               typeof item?.context_window === "number"
             ? item.context_window
             : undefined;
+      const reasoning =
+        item?.reasoning && typeof item.reasoning === "object"
+          ? item.reasoning
+          : undefined;
+      const enabled =
+        typeof item?.enabled === "boolean" ? item.enabled : undefined;
+      const codexUltra =
+        item?.codexUltra && typeof item.codexUltra === "object"
+          ? item.codexUltra
+          : undefined;
+      const apiFormat =
+        typeof item?.apiFormat === "string"
+          ? item.apiFormat
+          : typeof item?.api_format === "string"
+            ? item.api_format
+            : undefined;
+      const codexCache =
+        item?.codexCache && typeof item.codexCache === "object"
+          ? item.codexCache
+          : item?.codex_cache && typeof item.codex_cache === "object"
+            ? item.codex_cache
+            : undefined;
+      const sortIndex =
+        typeof item?.sortIndex === "number" &&
+        Number.isInteger(item.sortIndex) &&
+        item.sortIndex >= 0
+          ? item.sortIndex
+          : typeof item?.sort_index === "number" &&
+              Number.isInteger(item.sort_index) &&
+              item.sort_index >= 0
+            ? item.sort_index
+            : undefined;
 
       return {
         model: typeof item?.model === "string" ? item.model : "",
+        ...(enabled !== undefined ? { enabled } : {}),
         ...(upstreamModel ? { upstreamModel } : {}),
         ...(displayName ? { displayName } : {}),
         ...(contextWindow ? { contextWindow } : {}),
@@ -201,7 +251,14 @@ function extractCodexCatalogModels(modelCatalog: any): CodexCatalogModel[] {
           ? { supportsParallelToolCalls }
           : {}),
         ...(inputModalities ? { inputModalities } : {}),
+        ...(supportsImage !== undefined ? { supportsImage } : {}),
+        ...(textOnly !== undefined ? { textOnly } : {}),
         ...(baseInstructions ? { baseInstructions } : {}),
+        ...(reasoning ? { reasoning } : {}),
+        ...(codexUltra ? { codexUltra } : {}),
+        ...(apiFormat ? { apiFormat } : {}),
+        ...(codexCache ? { codexCache } : {}),
+        ...(sortIndex !== undefined ? { sortIndex } : {}),
       };
     })
     .filter((item: CodexCatalogModel) => item.model.trim());

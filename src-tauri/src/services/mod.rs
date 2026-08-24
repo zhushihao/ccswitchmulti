@@ -1,5 +1,6 @@
 pub mod balance;
 pub mod codex_oauth_models;
+pub mod codex_plugin_registry;
 pub mod coding_plan;
 pub mod config;
 pub mod env_checker;
@@ -8,11 +9,14 @@ pub mod mcp;
 pub mod model_fetch;
 pub mod model_pricing;
 pub mod omo;
+pub mod preset_catalog;
+pub mod preset_registry;
 pub mod profile;
 pub mod prompt;
 pub mod provider;
 pub mod proxy;
 pub mod quota_collaboration;
+pub mod recovery_outcome;
 pub mod s3;
 pub mod s3_auto_sync;
 pub mod s3_sync;
@@ -38,7 +42,10 @@ pub use config::ConfigService;
 pub use mcp::McpService;
 pub use omo::OmoService;
 pub use prompt::PromptService;
-pub use provider::{ProviderService, ProviderSortUpdate, SwitchResult};
+pub use provider::{
+    CodexForceRepairOutcome, CodexSubagentV2MutationResult, ProviderService, ProviderSortUpdate,
+    SwitchResult,
+};
 pub use proxy::ProxyService;
 #[allow(unused_imports)]
 pub use skill::{DiscoverableSkill, Skill, SkillRepo, SkillService};

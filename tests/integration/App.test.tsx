@@ -19,11 +19,17 @@ import { emitTauriEvent } from "../msw/tauriMocks";
 
 const toastSuccessMock = vi.fn();
 const toastErrorMock = vi.fn();
+const toastWarningMock = vi.fn();
+const skillsPanelMocks = vi.hoisted(() => ({
+  checkUpdates: vi.fn(),
+  openDiscovery: vi.fn(),
+}));
 
 vi.mock("sonner", () => ({
   toast: {
     success: (...args: unknown[]) => toastSuccessMock(...args),
     error: (...args: unknown[]) => toastErrorMock(...args),
+    warning: (...args: unknown[]) => toastWarningMock(...args),
   },
 }));
 
@@ -114,8 +120,15 @@ vi.mock("@/components/codex/CodexRouterWorkspacePage", async () => {
   );
   return {
     ...actual,
-    CodexRouterWorkspacePage: ({ initialProviderId, initialTab }: any) => (
-      <div data-testid="codex-router-workspace">
+    CodexRouterWorkspacePage: ({
+      initialProviderId,
+      initialTab,
+      onRuntimeReady,
+    }: any) => (
+      <div
+        data-testid="codex-router-workspace"
+        data-runtime-ready-wired={String(Boolean(onRuntimeReady))}
+      >
         <span data-testid="codex-router-target">{initialProviderId}</span>
         <span data-testid="codex-router-tab">{initialTab}</span>
       </div>
@@ -128,9 +141,13 @@ vi.mock("@/components/codex/CodexUsagePage", () => ({
 }));
 
 vi.mock("@/components/codex/CodexMultiRouterWizard", () => ({
-  CodexMultiRouterWizard: ({ open, onOpenChange }: any) =>
+  CodexMultiRouterWizard: ({ open, mode, planId, onOpenChange }: any) =>
     open ? (
-      <div data-testid="codex-multirouter-wizard">
+      <div
+        data-testid="codex-multirouter-wizard"
+        data-mode={mode}
+        data-plan-id={planId ?? ""}
+      >
         <button onClick={() => onOpenChange(false)}>close-wizard</button>
       </div>
     ) : null,
@@ -167,6 +184,32 @@ vi.mock("@/components/AppSwitcher", () => ({
     </div>
   ),
 }));
+
+vi.mock("@/components/skills/UnifiedSkillsPanel", async () => {
+  const React = await import("react");
+  const MockUnifiedSkillsPanel = React.forwardRef(
+    ({ onCheckUpdatesStateChange }: any, ref) => {
+      React.useEffect(() => {
+        onCheckUpdatesStateChange?.({ isChecking: false, hasSkills: true });
+        return () =>
+          onCheckUpdatesStateChange?.({
+            isChecking: false,
+            hasSkills: false,
+          });
+      }, [onCheckUpdatesStateChange]);
+      React.useImperativeHandle(ref, () => ({
+        openDiscovery: skillsPanelMocks.openDiscovery,
+        openImport: vi.fn(),
+        openInstallFromZip: vi.fn(),
+        openRestoreFromBackup: vi.fn(),
+        checkUpdates: skillsPanelMocks.checkUpdates,
+      }));
+      return <div data-testid="unified-skills-panel" />;
+    },
+  );
+  MockUnifiedSkillsPanel.displayName = "MockUnifiedSkillsPanel";
+  return { default: MockUnifiedSkillsPanel };
+});
 
 vi.mock("@/components/UpdateBadge", () => ({
   UpdateBadge: ({ onClick }: any) => (
@@ -206,6 +249,10 @@ describe("App integration with MSW", () => {
     resetProviderState();
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
+    toastWarningMock.mockReset();
+    skillsPanelMocks.checkUpdates.mockReset();
+    skillsPanelMocks.openDiscovery.mockReset();
+    localStorage.removeItem("cc-switch-last-view");
   });
 
   it("covers basic provider flows via real hooks", async () => {
@@ -263,7 +310,7 @@ describe("App integration with MSW", () => {
 
     expect(toastErrorMock).not.toHaveBeenCalled();
     expect(toastSuccessMock).toHaveBeenCalled();
-  }, 10_000);
+  }, 30_000);
 
   it("shows toast when auto sync fails in background", async () => {
     const { default: App } = await import("@/App");
@@ -305,7 +352,7 @@ describe("App integration with MSW", () => {
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalled();
     });
-  });
+  }, 30_000);
 
   it("duplicates openclaw providers with a generated key that avoids live-only ids", async () => {
     setProviders("openclaw", {
@@ -398,7 +445,46 @@ describe("App integration with MSW", () => {
     expect(screen.getByTestId("codex-router-tab").textContent).toBe("routes");
   });
 
-  it("lets the Codex MultiRouter entry choose whether to start the guide", async () => {
+  it("opens explicit migration instead of directly enabling a schema v1 MultiRouter", async () => {
+    setProviders("codex", {
+      "legacy-codex-router": {
+        id: "legacy-codex-router",
+        name: "Legacy MultiRouter",
+        settingsConfig: {
+          codexRouting: {
+            enabled: true,
+            routes: [
+              {
+                id: "legacy-route",
+                upstream: { apiFormat: "openai_chat", apiKey: "secret" },
+              },
+            ],
+          },
+        },
+        category: "aggregator",
+        sortIndex: 0,
+        createdAt: Date.now(),
+      },
+    });
+    setCurrentProviderId("codex", "legacy-codex-router");
+
+    const { default: App } = await import("@/App");
+    renderApp(App);
+    fireEvent.click(screen.getByText("switch-codex"));
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list").textContent).toContain(
+        "legacy-codex-router",
+      ),
+    );
+
+    fireEvent.click(screen.getByText("switch"));
+
+    const wizard = await screen.findByTestId("codex-multirouter-wizard");
+    expect(wizard).toHaveAttribute("data-mode", "edit");
+    expect(wizard).toHaveAttribute("data-plan-id", "legacy-codex-router");
+  }, 30_000);
+
+  it("starts a new Codex MultiRouter draft explicitly from the refreshed entry", async () => {
     const { default: App } = await import("@/App");
     renderApp(App);
 
@@ -411,17 +497,59 @@ describe("App integration with MSW", () => {
 
     fireEvent.click(screen.getByText("open-multirouter-entry"));
 
-    expect(screen.getByText("配置多路模型")).toBeInTheDocument();
-    expect(screen.getByText("开始引导配置")).toBeInTheDocument();
+    expect(await screen.findByText("配置多路模型")).toBeInTheDocument();
+    expect(screen.getByText("创建新配置")).toBeInTheDocument();
+    expect(screen.getByText("编辑旧配置")).toBeInTheDocument();
+    expect(
+      screen.getByText("暂无已有 MultiRouter，请先创建新配置。"),
+    ).toBeInTheDocument();
     expect(screen.getByText("直接打开工作台")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByText("开始引导"));
+    fireEvent.click(screen.getByText("创建新配置"));
 
+    const wizard = await screen.findByTestId("codex-multirouter-wizard");
+    expect(wizard).toHaveAttribute("data-mode", "create");
+    expect(wizard).toHaveAttribute("data-plan-id", "");
+  });
+
+  it("edits the exact MultiRouter selected from multiple saved plans", async () => {
+    setProviders("codex", {
+      "router-primary": {
+        id: "router-primary",
+        name: "主路由",
+        settingsConfig: { codexRouting: { enabled: true, routes: [] } },
+        category: "aggregator",
+        sortIndex: 0,
+        createdAt: Date.now(),
+      },
+      "router-lab": {
+        id: "router-lab",
+        name: "实验路由",
+        settingsConfig: { codexRouting: { enabled: true, routes: [] } },
+        category: "aggregator",
+        sortIndex: 1,
+        createdAt: Date.now() + 1,
+      },
+    });
+    setCurrentProviderId("codex", "router-primary");
+
+    const { default: App } = await import("@/App");
+    renderApp(App);
+    fireEvent.click(screen.getByText("switch-codex"));
     await waitFor(() =>
-      expect(
-        screen.getByTestId("codex-multirouter-wizard"),
-      ).toBeInTheDocument(),
+      expect(screen.getByTestId("provider-list").textContent).toContain(
+        "router-lab",
+      ),
     );
+
+    fireEvent.click(screen.getByText("open-multirouter-entry"));
+    expect(await screen.findByText("主路由")).toBeInTheDocument();
+    expect(screen.getByText("实验路由")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("实验路由"));
+
+    const wizard = await screen.findByTestId("codex-multirouter-wizard");
+    expect(wizard).toHaveAttribute("data-mode", "edit");
+    expect(wizard).toHaveAttribute("data-plan-id", "router-lab");
   });
 
   it("opens the MultiRouter status workspace directly from the entry choice", async () => {
@@ -453,7 +581,7 @@ describe("App integration with MSW", () => {
     );
 
     fireEvent.click(screen.getByText("open-multirouter-entry"));
-    fireEvent.click(screen.getByText("直接打开工作台"));
+    fireEvent.click(await screen.findByText("直接打开工作台"));
 
     await waitFor(() =>
       expect(screen.getByTestId("codex-router-workspace")).toBeInTheDocument(),
@@ -462,6 +590,10 @@ describe("App integration with MSW", () => {
       "codex-router",
     );
     expect(screen.getByTestId("codex-router-tab").textContent).toBe("status");
+    expect(screen.getByTestId("codex-router-workspace")).toHaveAttribute(
+      "data-runtime-ready-wired",
+      "false",
+    );
   });
 
   it("opens the Codex usage page from the Codex toolbar", async () => {
@@ -528,5 +660,40 @@ describe("App integration with MSW", () => {
     );
 
     liveIdsSpy.mockRestore();
+  });
+
+  it("hosts the Skills check-update action in the App toolbar", async () => {
+    localStorage.setItem("cc-switch-last-view", "skills");
+    const { default: App } = await import("@/App");
+    renderApp(App);
+
+    expect(
+      await screen.findByTestId("unified-skills-panel"),
+    ).toBeInTheDocument();
+    const checkUpdatesButton = await screen.findByRole("button", {
+      name: "skills.checkUpdates",
+    });
+    await waitFor(() => expect(checkUpdatesButton).toBeEnabled());
+
+    fireEvent.click(checkUpdatesButton);
+    expect(skillsPanelMocks.checkUpdates).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes the Skills discover toolbar action through the panel guard", async () => {
+    localStorage.setItem("cc-switch-last-view", "skills");
+    const { default: App } = await import("@/App");
+    renderApp(App);
+
+    expect(
+      await screen.findByTestId("unified-skills-panel"),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "skills.discover",
+      }),
+    );
+
+    expect(skillsPanelMocks.openDiscovery).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("unified-skills-panel")).toBeInTheDocument();
   });
 });

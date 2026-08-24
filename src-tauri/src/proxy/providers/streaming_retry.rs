@@ -25,6 +25,9 @@
 //! 器（本代理 120s passthrough 超时、Claude Code 字节级 stream watchdog）把
 //! 长思考误判为断流。
 
+use super::codex_terminal::{
+    classify_native_responses_terminal, NativeResponsesEvidence, NativeResponsesTerminalDisposition,
+};
 use super::streaming_responses::{
     anthropic_error_sse, anthropic_sse, create_anthropic_sse_stream_from_responses,
     RETRYABLE_STREAM_MARKER,
@@ -32,9 +35,10 @@ use super::streaming_responses::{
 use crate::proxy::error::ProxyError;
 use crate::proxy::hyper_client::ProxyResponse;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -74,6 +78,17 @@ pub struct StreamReconnector {
     first_byte_timeout: Duration,
 }
 
+/// 上游原生 Responses SSE 的最小排障关联信息。
+///
+/// 这里只保留本地 session/provider/model 标识，不携带请求正文、header 或完整
+/// 上游错误消息；错误消息只会以固定类别和短 hash 进入 router log。
+#[derive(Clone, Debug)]
+pub(crate) struct StreamLogContext {
+    pub(crate) session_id: String,
+    pub(crate) model: String,
+    pub(crate) provider_id: String,
+}
+
 impl StreamReconnector {
     pub fn new(connect: ConnectFn, first_byte_timeout: Duration) -> Self {
         Self {
@@ -101,6 +116,401 @@ impl StreamReconnector {
 /// Codex CLI 的标称退避序列（无抖动）：200/400/800/1600/3200ms。
 fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(200u64 << attempt.saturating_sub(1).min(4))
+}
+
+/// 从原始 Responses SSE 字节缓冲中取出一个完整事件（连同分隔空行）。
+///
+/// 不在 chunk 边界上作 UTF-8 解码，避免上游刚好在中文字符中间切块时篡改
+/// passthrough 字节；只有取得完整 SSE block 后才用 UTF-8 读取事件名。
+fn take_raw_sse_block(buffer: &mut BytesMut) -> Option<Bytes> {
+    let bytes = buffer.as_ref();
+    let boundary = bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| index + 2)
+        .or_else(|| {
+            bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+        })?;
+    Some(buffer.split_to(boundary).freeze())
+}
+
+/// 读取原始 Responses SSE block 的事件名；注释或不含事件名的 block 返回 `None`。
+fn raw_responses_sse_event_name(block: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(block).ok()?;
+    for line in text.lines() {
+        if let Some(event) = strip_sse_field(line, "event") {
+            return Some(event.trim().to_string());
+        }
+        if let Some(data) = strip_sse_field(line, "data") {
+            if let Ok(value) = serde_json::from_str::<Value>(data) {
+                if let Some(kind) = value.get("type").and_then(Value::as_str) {
+                    return Some(kind.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn raw_responses_sse_payload(block: &[u8]) -> Option<Value> {
+    let text = std::str::from_utf8(block).ok()?;
+    let data = text
+        .lines()
+        .filter_map(|line| strip_sse_field(line, "data"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.trim().is_empty() || data.trim() == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str(&data).ok()
+}
+
+struct NativeResponsesSseErrorDiagnostic {
+    event_name: String,
+    error_type: String,
+    message_class: &'static str,
+    message_hash: String,
+}
+
+/// 从原生 Responses SSE 错误事件提取不含正文的诊断摘要。
+///
+/// 上游可能把错误放在 `/error`、`/response/error`，也可能只给事件名。日志只
+/// 保存固定类别、受限 error type 和消息 hash，避免把 prompt、策略文本或 token
+/// 写入本机日志。
+fn native_responses_sse_error_diagnostic(
+    block: &[u8],
+) -> Option<NativeResponsesSseErrorDiagnostic> {
+    let text = std::str::from_utf8(block).ok()?;
+    let mut event_name = None;
+    let mut data_lines = Vec::new();
+    for line in text.lines() {
+        if let Some(event) = strip_sse_field(line, "event") {
+            event_name = Some(event.trim().to_string());
+        } else if let Some(data) = strip_sse_field(line, "data") {
+            data_lines.push(data);
+        }
+    }
+
+    let value = serde_json::from_str::<Value>(&data_lines.join("\n")).ok();
+    let event_name = event_name.or_else(|| {
+        value
+            .as_ref()
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })?;
+    if !matches!(
+        event_name.as_str(),
+        "response.failed" | "error" | "response.error"
+    ) {
+        return None;
+    }
+
+    let error = value.as_ref().and_then(|value| {
+        value
+            .pointer("/response/error")
+            .or_else(|| value.get("error"))
+    });
+    let error_type = error
+        .and_then(|error| {
+            error
+                .get("type")
+                .and_then(Value::as_str)
+                .or_else(|| error.get("code").and_then(Value::as_str))
+        })
+        .map(sanitize_diagnostic_token)
+        .unwrap_or_else(|| "upstream_error".to_string());
+    let message = error
+        .and_then(|error| error.get("message").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .as_ref()
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("");
+    let lower = format!("{} {}", error_type, message).to_ascii_lowercase();
+    let message_class = if lower.contains("policy")
+        || lower.contains("safety")
+        || lower.contains("moderation")
+        || lower.contains("violat")
+        || lower.contains("invalid prompt")
+    {
+        "policy_or_safety"
+    } else {
+        "upstream_error"
+    };
+    let digest = Sha256::digest(message.as_bytes());
+    let message_hash = format!("{digest:x}")[..16].to_string();
+
+    Some(NativeResponsesSseErrorDiagnostic {
+        event_name,
+        error_type,
+        message_class,
+        message_hash,
+    })
+}
+
+fn sanitize_diagnostic_token(value: &str) -> String {
+    let token: String = value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+        .take(64)
+        .collect();
+    if token.is_empty() {
+        "upstream_error".to_string()
+    } else {
+        token
+    }
+}
+
+fn log_native_responses_sse_error(context: &StreamLogContext, block: &[u8], attempt: u32) {
+    let Some(diagnostic) = native_responses_sse_error_diagnostic(block) else {
+        return;
+    };
+    crate::proxy::codex_router_log::append_event(
+        "upstream_sse_error",
+        &[
+            ("stage", "native_responses".to_string()),
+            ("session", context.session_id.clone()),
+            ("model", context.model.clone()),
+            ("provider", context.provider_id.clone()),
+            ("event", diagnostic.event_name),
+            ("error_type", diagnostic.error_type),
+            ("message_class", diagnostic.message_class.to_string()),
+            ("message_hash", diagnostic.message_hash),
+            ("attempt", attempt.to_string()),
+        ],
+    );
+}
+
+fn raw_sse_block_is_comment(block: &[u8]) -> bool {
+    block
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b':')
+}
+
+fn native_responses_transport_error_message(error: &std::io::Error) -> &'static str {
+    let chain = crate::proxy::error::error_chain_message(error).to_ascii_lowercase();
+    if chain.contains("unexpected eof during chunk size line") {
+        "上游响应流连接提前关闭（HTTP 分块响应未完整结束），请检查网络或代理后重试"
+    } else if error.kind() == std::io::ErrorKind::TimedOut
+        || chain.contains("timed out")
+        || chain.contains("timeout")
+    {
+        "上游响应流读取超时，请检查网络或代理后重试"
+    } else {
+        "上游响应流传输中断，请检查网络或代理后重试"
+    }
+}
+
+fn native_responses_transport_error_sse(message: &str) -> Bytes {
+    let payload = json!({
+        "type": "error",
+        "error": {
+            "type": "stream_error",
+            "message": message,
+        }
+    });
+    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+}
+
+fn native_responses_protocol_error_sse(code: &str, message: &str) -> Bytes {
+    let payload = json!({
+        "type": "error",
+        "error": {
+            "type": "upstream_protocol_error",
+            "code": code,
+            "message": message,
+        }
+    });
+    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+}
+
+/// 原生 Codex Responses 的安全 SSE 重连。
+///
+/// 与 Anthropic 转换路径不同，这里不重写协议字节。只有 `response.created` 和
+/// SSE 注释已被发出时，重新执行同一上游请求仍可对客户端透明；任何其它事件
+/// （包括 malformed block）都可能已经进入 Codex 持久化/工具状态机，立即封死
+/// 重放路径。这样中途异常只会作为一次普通断流交给 Codex，而不会造成重复调用。
+#[allow(dead_code)]
+pub fn create_resilient_responses_sse_stream(
+    initial: ByteStream,
+    reconnector: Option<StreamReconnector>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_resilient_responses_sse_stream_with_context(initial, reconnector, None)
+}
+
+/// 原生 Responses SSE 透传的可观测版本：在不记录正文的前提下，把中途
+/// `response.failed`/`error` 事件写入 CCSM router log，并保留原有重连语义。
+pub(crate) fn create_resilient_responses_sse_stream_with_context(
+    initial: ByteStream,
+    reconnector: Option<StreamReconnector>,
+    log_context: Option<StreamLogContext>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut attempt = 0;
+        let mut created_forwarded = false;
+        let mut semantic_output_forwarded = false;
+        let mut evidence = NativeResponsesEvidence::default();
+        let mut current = Some(initial);
+
+        'attempts: loop {
+            let Some(mut stream) = current.take() else { break };
+            let mut buffer = BytesMut::new();
+            let mut silence = Duration::ZERO;
+
+            let mut reason = 'stream: loop {
+                let item = match tokio::time::timeout(KEEPALIVE_INTERVAL, stream.next()).await {
+                    Ok(item) => {
+                        silence = Duration::ZERO;
+                        item
+                    }
+                    Err(_) => {
+                        silence += KEEPALIVE_INTERVAL;
+                        if created_forwarded && silence <= UPSTREAM_SILENCE_KEEPALIVE_LIMIT {
+                            yield Ok(Bytes::from_static(b": ping\n\n"));
+                        }
+                        continue;
+                    }
+                };
+
+                let Some(item) = item else {
+                    if !buffer.is_empty() {
+                        // 不能验证残块是否只是脚手架；原样发出并关闭重放通道。
+                        semantic_output_forwarded = true;
+                        yield Ok(buffer.split().freeze());
+                    }
+                    if semantic_output_forwarded {
+                        let message = "Upstream Responses SSE ended without a terminal event after semantic output";
+                        log::error!("[Codex/Responses] {message}");
+                        yield Ok(native_responses_protocol_error_sse(
+                            "upstream_terminal_event_missing",
+                            message,
+                        ));
+                        break 'attempts;
+                    }
+                    break 'stream "upstream Responses SSE ended before semantic output".into();
+                };
+
+                let chunk = match item {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        if semantic_output_forwarded {
+                            let message = native_responses_transport_error_message(&error);
+                            log::error!(
+                                "[Codex/Responses] upstream stream failed after semantic output: {}; client_message={message}",
+                                crate::proxy::error::error_chain_message(&error)
+                            );
+                            yield Ok(native_responses_transport_error_sse(message));
+                            break 'attempts;
+                        }
+                        break 'stream format!("upstream Responses SSE transport error: {error}");
+                    }
+                };
+                buffer.extend_from_slice(&chunk);
+
+                while let Some(block) = take_raw_sse_block(&mut buffer) {
+                    let event_name = raw_responses_sse_event_name(&block);
+                    let payload = raw_responses_sse_payload(&block);
+                    let terminal_disposition =
+                        if let (Some(event_name), Some(payload)) =
+                            (event_name.as_deref(), payload.as_ref())
+                        {
+                            evidence.observe_event(event_name, payload);
+                            classify_native_responses_terminal(event_name, payload, evidence)
+                        } else {
+                            None
+                        };
+                    match (event_name.as_deref(), terminal_disposition) {
+                        (Some("response.created"), _) if created_forwarded => {
+                            // 新连接会再次宣告 response.created；客户端已经见过它。
+                        }
+                        (Some("response.created"), _) => {
+                            created_forwarded = true;
+                            yield Ok(block);
+                        }
+                        (None, _) if raw_sse_block_is_comment(&block) => {
+                            yield Ok(block);
+                        }
+                        (Some(_), Some(disposition)) => {
+                            if let Some(context) = log_context.as_ref() {
+                                log_native_responses_sse_error(context, &block, attempt);
+                            }
+                            match disposition {
+                                NativeResponsesTerminalDisposition::Completed
+                                | NativeResponsesTerminalDisposition::Incomplete
+                                | NativeResponsesTerminalDisposition::Failed => {
+                                    yield Ok(block);
+                                }
+                                NativeResponsesTerminalDisposition::ProtocolError {
+                                    code,
+                                    message,
+                                } => {
+                                    log::error!(
+                                        "[Codex/Responses] rejected invalid terminal event: code={code}; {message}"
+                                    );
+                                    yield Ok(native_responses_protocol_error_sse(code, &message));
+                                }
+                            }
+                            break 'attempts;
+                        }
+                        _ => {
+                            semantic_output_forwarded = true;
+                            yield Ok(block);
+                        }
+                    }
+                }
+            };
+
+            loop {
+                let Some(reconnector) = reconnector.as_ref() else {
+                    let message = if semantic_output_forwarded {
+                        "Upstream Responses SSE ended without a terminal event after semantic output"
+                    } else {
+                        "Upstream Responses SSE ended without a terminal event"
+                    };
+                    log::error!("[Codex/Responses] {message}: {reason}");
+                    yield Ok(native_responses_protocol_error_sse(
+                        "upstream_terminal_event_missing",
+                        message,
+                    ));
+                    break 'attempts;
+                };
+                if attempt >= RESPONSES_STREAM_MAX_RETRIES {
+                    let message = "上游响应流在输出正文前反复中断，自动重连已耗尽，请检查网络或代理后重试";
+                    log::error!(
+                        "[Codex/Responses] stream failed after {attempt} reconnect attempt(s): {reason}; client_message={message}"
+                    );
+                    yield Ok(native_responses_transport_error_sse(message));
+                    break 'attempts;
+                }
+                attempt += 1;
+                log::warn!(
+                    "[Codex/Responses] upstream stream dropped before semantic output ({reason}); reconnecting (attempt {attempt}/{RESPONSES_STREAM_MAX_RETRIES})"
+                );
+                if created_forwarded {
+                    yield Ok(Bytes::from_static(b": ping\n\n"));
+                }
+                tokio::time::sleep(backoff_delay(attempt)).await;
+                match reconnector.connect().await {
+                    Ok(response) if response.status().is_success() => {
+                        current = Some(Box::pin(response.bytes_stream()));
+                        continue 'attempts;
+                    }
+                    Ok(response) => reason = format!("reconnect got HTTP {} from upstream", response.status().as_u16()),
+                    Err(error) => reason = format!("reconnect failed: {error}"),
+                }
+            }
+        }
+    }
 }
 
 /// 单个转换器输出块里解析出的 Anthropic SSE 事件。
@@ -452,6 +862,15 @@ mod tests {
         Box::pin(stream::iter(items))
     }
 
+    fn chunks_then_named_error(parts: &[&str], message: &str) -> ByteStream {
+        let mut items: Vec<Result<Bytes, std::io::Error>> = parts
+            .iter()
+            .map(|part| Ok(Bytes::from(part.to_string())))
+            .collect();
+        items.push(Err(std::io::Error::other(message.to_string())));
+        Box::pin(stream::iter(items))
+    }
+
     /// head 立即到达，tail 在 `delay` 之后到达——模拟推理模型隐藏思考的静默窗口。
     fn delayed_chunks(head: &str, delay: Duration, tail: &str) -> ByteStream {
         let head = Bytes::from(head.to_string());
@@ -476,6 +895,20 @@ mod tests {
             http::HeaderMap::new(),
             stream::iter(items),
         )
+    }
+
+    #[test]
+    fn native_responses_sse_error_diagnostic_is_redacted_and_classified() {
+        let block = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"policy_violation\",\"message\":\"secret prompt text\"}}}\n\n";
+
+        let diagnostic = native_responses_sse_error_diagnostic(block)
+            .expect("response.failed should produce a diagnostic");
+
+        assert_eq!(diagnostic.event_name, "response.failed");
+        assert_eq!(diagnostic.error_type, "policy_violation");
+        assert_eq!(diagnostic.message_class, "policy_or_safety");
+        assert_eq!(diagnostic.message_hash.len(), 16);
+        assert!(!diagnostic.message_hash.contains("secret"));
     }
 
     /// 每次 connect 弹出脚本队列里的下一个结果。
@@ -533,6 +966,344 @@ mod tests {
         assert!(out.contains("hello"));
         assert!(out.contains("event: message_stop"));
         assert!(!out.contains("event: error"), "unexpected error in: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_reconnects_after_created_before_semantic_output() {
+        let retry_body = [created(), text_delta("hello"), completed()].concat();
+        let (reconnector, calls) =
+            scripted_reconnector(vec![Ok(streamed_response(&[retry_body.as_str()]))]);
+        let first = chunks_then_error(&[created().as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(out.matches("event: response.created").count(), 1);
+        assert!(out.contains("hello"));
+        assert!(out.contains("event: response.completed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_never_reconnects_after_output_item_done() {
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let item_done = sse(
+            "response.output_item.done",
+            json!({"type":"response.output_item.done","item":{"type":"function_call","name":"write_file"}}),
+        );
+        let first = ok_chunks(&[[created(), item_done].concat().as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "must not replay a completed item"
+        );
+        assert!(out.contains("response.output_item.done"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_surfaces_post_content_chunked_eof_as_protocol_error() {
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let first = chunks_then_named_error(
+            &[[created(), text_delta("partial")].concat().as_str()],
+            "error decoding response body: unexpected EOF during chunk size line",
+        );
+
+        let items: Vec<_> = create_resilient_responses_sse_stream(first, Some(reconnector))
+            .collect()
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "must not replay output");
+        assert!(
+            items.iter().all(Result::is_ok),
+            "the downstream HTTP body must close cleanly: {items:?}"
+        );
+        let out = items
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(String::new(), |mut output, bytes| {
+                output.push_str(&String::from_utf8_lossy(&bytes));
+                output
+            });
+        assert!(out.contains("event: error"), "got: {out}");
+        assert!(out.contains("上游响应流连接提前关闭"), "got: {out}");
+        assert!(out.contains("HTTP 分块响应未完整结束"), "got: {out}");
+        assert!(!out.contains("error decoding response body"), "got: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_terminal_semantic_output_eof_is_error_without_retry() {
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let first = ok_chunks(&[[created(), text_delta("partial")].concat().as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "must not replay output");
+        assert!(out.contains("event: error"), "got: {out}");
+        assert!(out.contains("terminal event"), "got: {out}");
+        assert!(!out.contains("event: response.completed"), "got: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_terminal_without_reconnector_still_rejects_missing_terminal() {
+        let first = ok_chunks(&[[created(), text_delta("partial")].concat().as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(first, None)).await;
+
+        assert!(out.contains("event: error"), "got: {out}");
+        assert!(out.contains("terminal event"), "got: {out}");
+        assert!(!out.contains("event: response.completed"), "got: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_terminal_completed_with_failed_status_is_error() {
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let invalid_terminal = sse(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "failed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "not complete"}]
+                    }]
+                }
+            }),
+        );
+        let first = ok_chunks(&[[created(), invalid_terminal].concat().as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(out.contains("event: error"), "got: {out}");
+        assert!(out.contains("status=failed"), "got: {out}");
+        assert!(!out.contains("event: response.completed"), "got: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_terminal_completed_with_incomplete_status_is_error() {
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let invalid_terminal = sse(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "incomplete",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "cut off"}]
+                    }]
+                }
+            }),
+        );
+        let first = ok_chunks(&[[created(), invalid_terminal].concat().as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(out.contains("event: error"), "got: {out}");
+        assert!(out.contains("status=incomplete"), "got: {out}");
+        assert!(!out.contains("event: response.completed"), "got: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_terminal_reasoning_only_completed_is_error() {
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let reasoning = sse(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "Need another tool."}]
+                }
+            }),
+        );
+        let invalid_terminal = sse(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [{
+                        "type": "reasoning",
+                        "content": [{"type": "reasoning_text", "text": "Need another tool."}]
+                    }]
+                }
+            }),
+        );
+        let first = ok_chunks(&[[created(), reasoning, invalid_terminal].concat().as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(out.contains("event: error"), "got: {out}");
+        assert!(out.contains("final output"), "got: {out}");
+        assert!(!out.contains("event: response.completed"), "got: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_terminal_completed_with_valid_tool_call_is_forwarded() {
+        let tool = json!({
+            "type": "function_call",
+            "status": "completed",
+            "call_id": "call_1",
+            "name": "read_file",
+            "arguments": "{\"path\":\"README.md\"}"
+        });
+        let item_done = sse(
+            "response.output_item.done",
+            json!({"type": "response.output_item.done", "item": tool.clone()}),
+        );
+        let terminal = sse(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {"status": "completed", "output": [tool]}
+            }),
+        );
+        let first = ok_chunks(&[[created(), item_done, terminal].concat().as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(first, None)).await;
+
+        assert!(out.contains("event: response.completed"), "got: {out}");
+        assert!(!out.contains("event: error"), "got: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_terminal_completed_with_compaction_output_is_forwarded() {
+        let compaction = json!({
+            "type": "compaction",
+            "encrypted_content": "ocx1:YWJj"
+        });
+        let item_done = sse(
+            "response.output_item.done",
+            json!({"type": "response.output_item.done", "item": compaction.clone()}),
+        );
+        let terminal = sse(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {"status": "completed", "output": [compaction]}
+            }),
+        );
+        let first = ok_chunks(&[[created(), item_done, terminal].concat().as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(first, None)).await;
+
+        assert!(out.contains("event: response.completed"), "got: {out}");
+        assert!(!out.contains("event: error"), "got: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_terminal_completed_with_incomplete_tool_call_is_error() {
+        let terminal = sse(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": "call_1",
+                        "name": "",
+                        "arguments": "{}"
+                    }]
+                }
+            }),
+        );
+        let first = ok_chunks(&[[created(), terminal].concat().as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(first, None)).await;
+
+        assert!(out.contains("event: error"), "got: {out}");
+        assert!(out.contains("structurally incomplete"), "got: {out}");
+        assert!(!out.contains("event: response.completed"), "got: {out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_terminal_incomplete_stops_following_events() {
+        let (reconnector, calls) = scripted_reconnector(vec![]);
+        let incomplete = sse(
+            "response.incomplete",
+            json!({
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"}
+                }
+            }),
+        );
+        let first = ok_chunks(&[[created(), incomplete, text_delta("must-not-leak")]
+            .concat()
+            .as_str()]);
+
+        let out = collect(create_resilient_responses_sse_stream(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(out.contains("event: response.incomplete"), "got: {out}");
+        assert!(!out.contains("must-not-leak"), "got: {out}");
+        assert!(!out.contains("event: error"), "got: {out}");
+    }
+
+    #[test]
+    fn native_responses_transport_error_message_distinguishes_true_timeout() {
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
+
+        assert_eq!(
+            native_responses_transport_error_message(&timeout),
+            "上游响应流读取超时，请检查网络或代理后重试"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_responses_reconnects_after_comment_keepalive() {
+        let retry_body = [created(), text_delta("recovered"), completed()].concat();
+        let (reconnector, calls) =
+            scripted_reconnector(vec![Ok(streamed_response(&[retry_body.as_str()]))]);
+        let first = chunks_then_error(&[created().as_str(), ": upstream-ping\n\n"]);
+
+        let out = collect(create_resilient_responses_sse_stream(
+            first,
+            Some(reconnector),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(out.contains("recovered"));
     }
 
     #[tokio::test(start_paused = true)]

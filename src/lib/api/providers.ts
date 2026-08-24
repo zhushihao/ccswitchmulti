@@ -21,6 +21,14 @@ export interface SwitchResult {
   warnings: string[];
 }
 
+export interface CodexForceRepairOutcome {
+  providerId: string;
+  backupDirectory: string;
+  repairedFields: string[];
+  repairedModels: string[];
+  warnings: string[];
+}
+
 export interface CodexOfficialRestoreOutcome {
   officialProviderId: string;
   switchWarnings: string[];
@@ -31,6 +39,79 @@ export interface CodexOfficialRestoreOutcome {
     skippedReason?: string | null;
     backupDir?: string | null;
   };
+}
+
+export interface ProviderDeleteOutcome {
+  deletedProviderId: string;
+  affectedPlanIds: string[];
+  disabledPlanIds: string[];
+  removedCandidates: string[];
+  projections: CodexRoutingProjectionStatus[];
+}
+
+export interface CodexMultiRouterMigrationDiff {
+  removedRouteFields: string[];
+  createdProviderIds: string[];
+  changedRouteIds: string[];
+}
+
+export interface CodexMultiRouterGeneratedProviderSummary {
+  id: string;
+  name: string;
+  migrationGenerated: boolean;
+  sourceProviderId: string;
+}
+
+export interface CodexMultiRouterMigrationPreview {
+  schemaVersion: 2;
+  providerId: string;
+  expectedRevision: string;
+  planToken: string;
+  diff: CodexMultiRouterMigrationDiff;
+  warnings: string[];
+  generatedProviders: CodexMultiRouterGeneratedProviderSummary[];
+}
+
+export interface CodexMultiRouterMigrationApplyOutcome {
+  providerId: string;
+  revision: string;
+  createdProviderIds: string[];
+  alreadyApplied: boolean;
+}
+
+export type CodexRoutingProjectionState = "ready" | "pending" | "not_required";
+
+export interface CodexRoutingProjectionCapabilitySources {
+  contextWindow: string;
+  inputModalities: string;
+  reasoning: string;
+  codexCache: string;
+}
+
+export interface CodexRoutingProjectionRouteDiagnostic {
+  routeId: string;
+  routeLabel?: string | null;
+  targetProviderId: string;
+  targetProviderName: string;
+  visibleModel: string;
+  canonicalModel: string;
+  upstreamModel: string;
+  apiFormat: string;
+  apiFormatSource: string;
+  authOwner: string;
+  capabilitySources: CodexRoutingProjectionCapabilitySources;
+}
+
+export interface CodexRoutingProjectionStatus {
+  schemaVersion: number;
+  routerProviderId: string;
+  state: CodexRoutingProjectionState;
+  dependencyFingerprint: string;
+  generatedAt: string;
+  warnings: string[];
+  routes: CodexRoutingProjectionRouteDiagnostic[];
+  lastErrorCode?: string | null;
+  lastError?: string | null;
 }
 
 export interface OpenTerminalOptions {
@@ -149,7 +230,49 @@ export const providersApi = {
     });
   },
 
-  async delete(id: string, appId: AppId): Promise<boolean> {
+  async inspectCodexMultiRouterProjection(
+    providerId: string,
+  ): Promise<CodexRoutingProjectionStatus> {
+    return await invoke("inspect_codex_multirouter_projection", { providerId });
+  },
+
+  async inspectActiveCodexMultiRouterProjection(): Promise<CodexRoutingProjectionStatus | null> {
+    return await invoke("inspect_active_codex_multirouter_projection");
+  },
+
+  async retryCodexMultiRouterProjection(
+    providerId: string,
+  ): Promise<CodexRoutingProjectionStatus> {
+    return await invoke("retry_codex_multirouter_projection", { providerId });
+  },
+
+  async getCodexMultiRouterRevision(providerId: string): Promise<string> {
+    return await invoke("get_codex_multirouter_revision", { providerId });
+  },
+
+  async previewCodexMultiRouterMigration(
+    providerId: string,
+    expectedRevision: string,
+  ): Promise<CodexMultiRouterMigrationPreview> {
+    return await invoke("preview_codex_multirouter_migration", {
+      providerId,
+      expectedRevision,
+    });
+  },
+
+  async applyCodexMultiRouterMigration(
+    providerId: string,
+    expectedRevision: string,
+    planToken: string,
+  ): Promise<CodexMultiRouterMigrationApplyOutcome> {
+    return await invoke("apply_codex_multirouter_migration", {
+      providerId,
+      expectedRevision,
+      planToken,
+    });
+  },
+
+  async delete(id: string, appId: AppId): Promise<ProviderDeleteOutcome> {
     return await invoke("delete_provider", { id, app: appId });
   },
 
@@ -163,6 +286,14 @@ export const providersApi = {
 
   async switch(id: string, appId: AppId): Promise<SwitchResult> {
     return await invoke("switch_provider", { id, app: appId });
+  },
+
+  async forceRepairAndSwitchCodexProvider(
+    providerId: string,
+  ): Promise<CodexForceRepairOutcome> {
+    return await invoke("force_repair_and_switch_codex_provider", {
+      providerId,
+    });
   },
 
   /** 退出 Codex 接管、切回 OpenAI 官方，并把全部历史归并到 openai 桶。 */
