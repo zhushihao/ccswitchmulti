@@ -849,7 +849,11 @@ pub(crate) fn write_live_with_common_config_with_receipt(
                 &artifact.projection_settings,
             );
         }
-        return write_codex_live_snapshot(&effective_provider, Some(&provider_context));
+        return write_codex_live_snapshot_with_receipt(
+            &effective_provider,
+            Some(&provider_context),
+        )
+        .map(Some);
     }
 
     write_live_snapshot(app_type, &effective_provider).map(|_| None)

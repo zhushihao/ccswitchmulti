@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::compiler::compile_v2;
 use super::compiler::compile_v2_strict;
 use super::schema::{
     CodexModelSelection, CodexRouteAuthPolicy, CodexRouteAuthSource, CodexRoutingConfigV2,

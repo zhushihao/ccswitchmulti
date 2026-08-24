@@ -458,7 +458,7 @@ pub(crate) fn missing_codex_live_config_error() -> AppError {
     )
 }
 
-pub fn write_codex_live_atomic(
+pub(crate) fn write_codex_live_atomic(
     auth: &Value,
     config_text_opt: Option<&str>,
 ) -> Result<(), AppError> {
@@ -4010,60 +4010,6 @@ pub(crate) fn codex_provider_classification_context(
 struct RouteClassification {
     provider_kind: SubagentProviderKind,
     warning: Option<&'static str>,
-}
-
-/// 解析模型所属 route：raw settings 匹配（exact/prefix，fail-closed）失败时，
-/// 用 mode=all route 的 target provider catalog 兜底。
-///
-/// mode=all 的语义是"接住目标 provider 的全部模型"，而 raw 匹配只认
-/// match.models / matchPrefixes；无前缀的 mode=all route（如向导不识别名称的
-/// Kimi）会漏掉自己的模型，导致角色被误判 unroutable。target catalog 判断
-/// 保证 k3 → Kimi（第三方），而 qwen3.8（未勾选源）仍 fail-closed。
-fn codex_resolve_route_with_mode_all<'a>(
-    settings: &'a Value,
-    model: &str,
-    provider_models: Option<&HashMap<String, HashSet<String>>>,
-) -> Option<&'a Value> {
-    if let Some(route) = resolve_codex_primary_route_from_settings(settings, model) {
-        return Some(route);
-    }
-    let Some(provider_models) = provider_models else {
-        return None;
-    };
-    let model_key = model.trim().to_ascii_lowercase();
-    if model_key.is_empty() {
-        return None;
-    }
-    let routes = settings
-        .get("codexRouting")
-        .and_then(|routing| routing.get("routes"))
-        .and_then(Value::as_array)?;
-    for route in routes {
-        let enabled = route
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if !enabled {
-            continue;
-        }
-        if route
-            .pointer("/modelSelection/mode")
-            .and_then(Value::as_str)
-            != Some("all")
-        {
-            continue;
-        }
-        let Some(target_provider_id) = codex_route_target_provider_id_from_route(route) else {
-            continue;
-        };
-        if provider_models
-            .get(target_provider_id)
-            .is_some_and(|models| models.contains(&model_key))
-        {
-            return Some(route);
-        }
-    }
-    None
 }
 
 fn codex_subagent_route_classification_with_context(

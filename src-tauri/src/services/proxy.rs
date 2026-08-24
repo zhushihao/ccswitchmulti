@@ -15,10 +15,10 @@ use crate::services::provider::{
     build_effective_settings_with_common_config,
     build_effective_settings_with_common_config_for_backup, write_live_with_common_config,
 };
-use semver::Version;
 use crate::services::recovery_outcome::{
     record_recovery_outcome, RecoveryOutcome, RecoveryOutcomeKind,
 };
+use semver::Version;
 use serde_json::{json, Map, Value};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -31,6 +31,39 @@ const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 const PORT_OWNERSHIP_GUARD_PREFIX: &str = "PORT_OWNERSHIP_GUARD";
 /// Codex 接管时暴露给官方客户端的本地代理入口名称。
 const CODEX_LOCAL_PROXY_PROVIDER_NAME: &str = "CCSwitch MultiRouter";
+
+#[cfg(test)]
+static TEST_HOT_SWITCH_ROLLBACK_MUTATION: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_CODEX_SNAPSHOT_AUTH_AFTER_CAPTURE_MUTATION: std::sync::OnceLock<
+    std::sync::Mutex<Option<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn maybe_mutate_codex_live_before_hot_switch_rollback(path: &std::path::Path) {
+    let next = TEST_HOT_SWITCH_ROLLBACK_MUTATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock hot-switch rollback mutation")
+        .take();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated hot-switch rollback mutation");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_snapshot_auth_after_capture(path: &std::path::Path) {
+    let next = TEST_CODEX_SNAPSHOT_AUTH_AFTER_CAPTURE_MUTATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock snapshot auth after-capture mutation")
+        .take();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated snapshot auth mutation");
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PortOwnership {
@@ -2340,8 +2373,10 @@ impl ProxyService {
                     // modelCatalog 塞进 live_config，后续 codex_settings_for_model_catalog_projection
                     // 见 root 已有 modelCatalog 就不再替换——因此这里必须用含 sortIndex 排序的
                     // 投影 modelCatalog，否则 Codex 模型菜单乱序。
-                    let projected_provider =
-                        self.codex_provider_with_projected_model_catalog(codex_provider.as_ref());
+                    let projected_provider = self
+                        .codex_provider_with_projected_model_catalog(codex_provider.as_ref())
+                        .ok()
+                        .flatten();
                     Self::sync_codex_model_catalog_projection_flag(
                         &mut live_config,
                         projected_provider.as_ref(),
@@ -3491,11 +3526,12 @@ impl ProxyService {
                         .map_err(|e| format!("读取 Codex Provider 分类上下文失败: {e}"))?;
                 // schema-v2 router 必须用投影 settings（含 sortIndex 排序），否则
                 // catalog 生成链读不到 sortIndex → Codex 模型菜单乱序。
-                let settings_for_live =
-                    match self.codex_provider_with_projected_model_catalog(Some(&provider)) {
-                        Some(projected) => projected.settings_config,
-                        None => effective_settings.clone(),
-                    };
+                let settings_for_live = match self
+                    .codex_provider_with_projected_model_catalog(Some(&provider))
+                {
+                    Ok(Some(projected)) => projected.settings_config,
+                    _ => effective_settings.clone(),
+                };
                 let receipt = crate::codex_config::write_codex_provider_live_with_catalog_and_provider_context_with_receipt(
                     &settings_for_live,
                     provider.category.as_deref(),
@@ -4322,8 +4358,22 @@ impl ProxyService {
         config: &Value,
         provider: Option<&Provider>,
     ) -> Result<(), String> {
-        let projected_provider = self.codex_provider_with_projected_model_catalog(provider)?;
-        let provider = projected_provider.as_ref();
+        let Some(provider) = provider else {
+            return self.write_codex_live_for_provider(config, None);
+        };
+        self.write_codex_takeover_live_for_provider_with_receipt(config, provider)
+            .map(|_| ())
+    }
+
+    fn write_codex_takeover_live_for_provider_with_receipt(
+        &self,
+        config: &Value,
+        provider: &Provider,
+    ) -> Result<crate::codex_config::CodexProviderWriteReceipt, String> {
+        let projected_provider =
+            self.codex_provider_with_projected_model_catalog(Some(provider))?;
+        let provider_ref = projected_provider.as_ref();
+        let provider = provider_ref;
         let mut live_config = config.clone();
         if let (Some(provider), Some(root)) = (provider, live_config.as_object_mut()) {
             if let Some(model_catalog) = provider.settings_config.get("modelCatalog").cloned() {
@@ -4389,47 +4439,7 @@ impl ProxyService {
         }
 
         let provider_ref = provider_ref.ok_or_else(|| "Codex provider 不存在".to_string())?;
-        self.write_codex_live_for_provider_with_receipt(config, provider_ref)
-    }
-
-    /// 若 provider 是 schema-v2 MultiRouter，把其 settings_config 的 modelCatalog
-    /// 替换为投影产物（含 sortIndex 排序 + fingerprint）。构建失败时降级用原始配置。
-    fn codex_provider_with_projected_model_catalog(
-        &self,
-        provider: Option<&Provider>,
-    ) -> Option<Provider> {
-        let provider = provider?;
-        let is_v2_router = crate::codex_multirouter::schema::CodexRoutingDocument::parse(
-            provider
-                .settings_config
-                .get("codexRouting")
-                .unwrap_or(&serde_json::Value::Null),
-        )
-        .map(|document| {
-            matches!(
-                document,
-                crate::codex_multirouter::schema::CodexRoutingDocument::V2(_)
-            )
-        })
-        .unwrap_or(false);
-        if !is_v2_router {
-            return Some(provider.clone());
-        }
-        match crate::codex_multirouter::projection::build_projection_artifact(
-            &self.db,
-            &provider.id,
-        ) {
-            Ok(artifact) => {
-                let mut projected = provider.clone();
-                if let Some(model_catalog) =
-                    artifact.projection_settings.get("modelCatalog").cloned()
-                {
-                    projected.settings_config["modelCatalog"] = model_catalog;
-                }
-                Some(projected)
-            }
-            Err(_) => Some(provider.clone()),
-        }
+        self.write_codex_live_for_provider_with_receipt(config, &provider_ref)
     }
 
     /// V2 MultiRouter 的 live catalog 与依赖指纹必须来自当前 Provider 目录重新编译的投影。
