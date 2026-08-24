@@ -17,6 +17,34 @@ export interface RepairableCodexPlugin {
   repairAction?: "registerMarketplace" | "enableAndRegister" | "enable";
 }
 
+export type RecoveryOutcomeKind =
+  | "noPreviousRun"
+  | "uncleanExit"
+  | "confirmedCrash"
+  | "activePreviousInstance"
+  | "plannedRestartOrUpdate"
+  | "healthyBackupRestored"
+  | "livePreservedProviderRepaired"
+  | "providerOnlyRestored"
+  | "userBackupCandidateFound"
+  | "unrecoverableUserTables"
+  | "concurrentModificationDeferred"
+  | "pluginRegistrationRepairAvailable"
+  | "pluginRegistrationRepairCompleted"
+  | "pluginRegistrationRepairFailed"
+  | "portOwnedByCompatibleInstance"
+  | "portOwnedByUnknownOwner";
+
+export interface RecoveryOutcome {
+  kind: RecoveryOutcomeKind;
+  appType?: string;
+  keptFields: string[];
+  lostFields: string[];
+  nextStep?: string;
+  timestamp: string;
+  details?: string;
+}
+
 export interface ConfigTransferResult {
   success: boolean;
   message: string;
@@ -323,6 +351,11 @@ export const settingsApi = {
     pluginId: string,
   ): Promise<RepairableCodexPlugin> {
     return await invoke("repair_codex_plugin_registration", { pluginId });
+  },
+
+  /** 查询最近一次恢复结果，弥补启动阶段事件订阅的竞态。 */
+  async getLastRecoveryOutcome(): Promise<RecoveryOutcome | null> {
+    return await invoke("get_last_recovery_outcome");
   },
 };
 

@@ -1,7 +1,11 @@
 export type { AppId } from "./types";
 export { providersApi, universalProvidersApi } from "./providers";
 export { settingsApi } from "./settings";
-export type { RepairableCodexPlugin } from "./settings";
+export type {
+  RecoveryOutcome,
+  RecoveryOutcomeKind,
+  RepairableCodexPlugin,
+} from "./settings";
 export { backupsApi } from "./settings";
 export { mcpApi } from "./mcp";
 export { profilesApi } from "./profiles";
