@@ -13,9 +13,10 @@ use crate::codex_subagent_profiles::{
     ProviderKind as SubagentProviderKind, ReasoningRuntimePolicy as SubagentReasoningRuntimePolicy,
     SubagentVersion as ProfileSubagentVersion,
 };
+use crate::config::write_json_file;
 use crate::config::{
     atomic_write, delete_file, get_home_dir, path_is_within, read_json_file,
-    sanitize_provider_name, write_json_file, write_text_file,
+    sanitize_provider_name, serialize_json_file_contents, write_text_file,
 };
 use crate::error::AppError;
 use crate::model_capabilities::{image_input_capability_from_modalities, ImageInputCapability};
@@ -92,6 +93,211 @@ const CODEX_WEB_SEARCH_REJECT_MODEL_PREFIXES: &[&str] =
 const CODEX_MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.5";
 const CODEX_OPENAI_MODEL_PROVIDER_ID: &str = "openai";
 const CODEX_PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
+
+#[cfg(test)]
+static TEST_CONCURRENCY_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_PROVIDER_MERGE_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_CONFIG_TRANSFORM_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_CONFIG_TRANSFORM_AGENT_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<(PathBuf, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_PRE_WRITER_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_COMPANION_PREWRITE_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<(PathBuf, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_CONFIG_AFTER_WRITE_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_AUTH_AFTER_CAPTURE_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_AUTH_AFTER_COMMIT_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_COMPANION_AFTER_CONFIG_MUTATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<(PathBuf, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn maybe_mutate_codex_config_for_test(path: &Path) {
+    let queue =
+        TEST_CONCURRENCY_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock test concurrency mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated concurrent config");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_config_after_provider_merge_for_test(path: &Path) {
+    let queue =
+        TEST_PROVIDER_MERGE_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock provider merge test mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write provider merge concurrent config");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_config_after_transform_for_test(path: &Path) {
+    let queue =
+        TEST_CONFIG_TRANSFORM_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock config transform test mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write config transform concurrent config");
+    }
+    maybe_mutate_codex_agent_after_transform_for_test();
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_agent_after_transform_for_test() {
+    let queue = TEST_CONFIG_TRANSFORM_AGENT_MUTATIONS
+        .get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock config transform agent mutation queue")
+        .pop_front();
+    if let Some((path, contents)) = next {
+        std::fs::write(path, contents).expect("write agent transform concurrent config");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_config_before_writer_snapshot_for_test(path: &Path) {
+    let queue = TEST_PRE_WRITER_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock pre-writer mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated pre-writer config mutation");
+    }
+}
+
+/// Test-only seam used by structural concurrency regressions to place an
+/// external write immediately before a raw writer's first snapshot.
+#[cfg(test)]
+pub(crate) fn set_test_pre_writer_mutations_for_test(contents: &[&str]) {
+    let queue = TEST_PRE_WRITER_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let mut queue = queue.lock().expect("lock pre-writer mutation queue");
+    queue.clear();
+    queue.extend(contents.iter().map(|value| (*value).to_string()));
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_companion_prewrite_mutation_for_test(path: &Path, contents: &str) {
+    let queue =
+        TEST_COMPANION_PREWRITE_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let mut queue = queue
+        .lock()
+        .expect("lock companion pre-write mutation queue");
+    queue.clear();
+    queue.push_back((path.to_path_buf(), contents.to_string()));
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_config_after_write_for_test(path: &Path) {
+    let queue =
+        TEST_CONFIG_AFTER_WRITE_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock config after-write mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated after-write config mutation");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_auth_after_capture_for_test(path: &Path) {
+    let queue =
+        TEST_AUTH_AFTER_CAPTURE_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock auth after-capture mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated auth mutation after capture");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_codex_auth_after_commit_for_test(path: &Path) {
+    let queue =
+        TEST_AUTH_AFTER_COMMIT_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock auth after-commit mutation queue")
+        .pop_front();
+    if let Some(contents) = next {
+        std::fs::write(path, contents).expect("write simulated auth mutation after commit");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_companion_after_config_commit_for_test() {
+    let queue = TEST_COMPANION_AFTER_CONFIG_MUTATIONS
+        .get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let next = queue
+        .lock()
+        .expect("lock companion after-config mutation queue")
+        .pop_front();
+    if let Some((target, contents)) = next {
+        std::fs::write(target, contents).expect("write simulated after-config companion mutation");
+    }
+}
+
+#[cfg(test)]
+fn maybe_mutate_companion_before_write_for_test(path: &Path) {
+    let queue =
+        TEST_COMPANION_PREWRITE_MUTATIONS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let mut queue = queue
+        .lock()
+        .expect("lock companion pre-write mutation queue");
+    let should_apply = queue.front().is_some_and(|(target, _)| target == path);
+    if should_apply {
+        let (target, contents) = queue
+            .pop_front()
+            .expect("companion pre-write mutation queue entry");
+        std::fs::write(target, contents).expect("write simulated companion mutation");
+    }
+}
+
 const CC_SWITCH_MANAGED_AGENT_MARKER: &str =
     "# Managed by CCSwitchMulti. Do not edit this file by hand.";
 const CC_SWITCH_SUBAGENT_V2_POLICY_BEGIN: &str = "[CCSWITCHMULTI_SUBAGENT_V2_POLICY_BEGIN]";
@@ -244,10 +450,19 @@ pub fn delete_codex_provider_config(
 }
 
 /// 原子写 Codex 的 `auth.json` 与 `config.toml`，在第二步失败时回滚第一步
+pub(crate) fn missing_codex_live_config_error() -> AppError {
+    AppError::localized(
+        "provider.codex.config.missing",
+        "Codex 缺少 config.toml 配置，已停止写入以保护现有配置",
+        "Codex config.toml is missing; the write was stopped to protect the existing configuration",
+    )
+}
+
 pub fn write_codex_live_atomic(
     auth: &Value,
     config_text_opt: Option<&str>,
 ) -> Result<(), AppError> {
+    let config_text_opt = config_text_opt.ok_or_else(missing_codex_live_config_error)?;
     let auth_path = get_codex_auth_path();
     let config_path = get_codex_config_path();
 
@@ -268,10 +483,7 @@ pub fn write_codex_live_atomic(
     };
 
     // 准备写入内容
-    let cfg_text = match config_text_opt {
-        Some(s) => normalize_codex_config_text_for_live_read(s)?,
-        None => String::new(),
-    };
+    let cfg_text = normalize_codex_config_text_for_live_read(config_text_opt)?;
     if !cfg_text.trim().is_empty() {
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
@@ -280,7 +492,7 @@ pub fn write_codex_live_atomic(
     write_json_file(&auth_path, auth)?;
 
     // 第二步：写 config.toml（失败则回滚 auth.json）
-    if let Err(e) = write_text_file(&config_path, &cfg_text) {
+    if let Err(e) = write_codex_live_config_optimistic(&config_path, &cfg_text) {
         // 回滚 auth.json
         if let Some(bytes) = old_auth {
             let _ = atomic_write(&auth_path, &bytes);
@@ -291,6 +503,59 @@ pub fn write_codex_live_atomic(
     }
 
     Ok(())
+}
+
+pub(crate) fn write_codex_provider_config_reconciled(
+    auth: &Value,
+    config_text: &str,
+) -> Result<(), AppError> {
+    write_codex_live_config_reconcile(&get_codex_config_path(), |live_config| {
+        let merged = merge_codex_provider_config_texts(live_config, config_text)?;
+        prepare_codex_provider_live_config(auth, &merged)
+    })
+}
+
+pub(crate) fn write_codex_provider_auth_and_config_reconciled(
+    auth: &Value,
+    config_text: &str,
+) -> Result<(), AppError> {
+    write_codex_provider_auth_and_config_reconciled_with_receipt(auth, config_text).map(|_| ())
+}
+
+/// Receipt-bearing variant of the legacy auth+config snapshot writer.  The
+/// auth attempt is captured before the guarded config reconcile, so rollback
+/// can prove ownership of both files independently.
+pub(crate) fn write_codex_provider_auth_and_config_reconciled_with_receipt(
+    auth: &Value,
+    config_text: &str,
+) -> Result<CodexProviderWriteReceipt, AppError> {
+    let auth_path = get_codex_auth_path();
+    let auth_attempt = CodexAuthWriteAttempt::capture_and_write(&auth_path, auth)?;
+    let mut companions = CodexProjectionSideEffectsAttempt::capture()?;
+    let config_attempt = match write_codex_live_config_reconcile_with_attempt(
+        &get_codex_config_path(),
+        |live_config| {
+            let merged = merge_codex_provider_config_texts(live_config, config_text)?;
+            prepare_codex_provider_live_config(auth, &merged)
+        },
+    ) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            return Err(restore_codex_auth_after_error(
+                error,
+                Some(&auth_attempt),
+                &auth_path,
+            ));
+        }
+    };
+    companions.mark_unmodified_as_after();
+    Ok(CodexProviderWriteReceipt {
+        projection: CodexProjectionCommitReceipt {
+            config_attempt,
+            companion_attempt: companions,
+        },
+        auth_attempt: Some(auth_attempt),
+    })
 }
 
 /// 读取 `~/.codex/config.toml`，若不存在返回空字符串
@@ -490,6 +755,333 @@ pub fn read_and_validate_codex_config_text() -> Result<String, AppError> {
     normalize_codex_config_text_for_live_read(&s)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexConfigFingerprint {
+    len: u64,
+    hash: u64,
+}
+
+fn codex_bytes_fingerprint(bytes: &[u8]) -> CodexConfigFingerprint {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    CodexConfigFingerprint {
+        len: bytes.len() as u64,
+        hash: hasher.finish(),
+    }
+}
+
+/// One coherent read of the Codex live file.
+///
+/// The bytes and fingerprint intentionally come from the same `fs::read` call.  A
+/// caller must not read the text first and fingerprint it later: that creates a
+/// window in which Codex Desktop can replace the file and the writer would still
+/// believe that its candidate was based on the latest contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactCodexSnapshot {
+    pub(crate) bytes: Option<Vec<u8>>,
+    fingerprint: Option<CodexConfigFingerprint>,
+}
+
+impl ExactCodexSnapshot {
+    pub(crate) fn read(path: &Path) -> Result<Self, AppError> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(AppError::io(path, error)),
+        };
+        let fingerprint = bytes.as_deref().map(codex_bytes_fingerprint);
+        Ok(Self { bytes, fingerprint })
+    }
+
+    pub(crate) fn text(&self, path: &Path) -> Result<String, AppError> {
+        match &self.bytes {
+            Some(bytes) => String::from_utf8(bytes.clone()).map_err(|error| {
+                AppError::Message(format!("读取 Codex {} 失败: {error}", path.display()))
+            }),
+            None => Ok(String::new()),
+        }
+    }
+
+    pub(crate) fn fingerprint(&self) -> Option<CodexConfigFingerprint> {
+        self.fingerprint
+    }
+
+    pub(crate) fn from_fingerprint(fingerprint: Option<CodexConfigFingerprint>) -> Self {
+        Self {
+            bytes: None,
+            fingerprint,
+        }
+    }
+}
+
+/// The ownership proof returned by a reconciled live-file write.
+///
+/// Rollback code may restore `before` only while the file still has
+/// `after_fingerprint`.  If another process (including a different CCSM
+/// attempt) has written since this attempt, restoration is deferred and the
+/// newer bytes are preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedCodexAttempt {
+    pub(crate) before: ExactCodexSnapshot,
+    pub(crate) after_fingerprint: Option<CodexConfigFingerprint>,
+}
+
+impl CommittedCodexAttempt {
+    pub(crate) fn restore_if_unchanged(&self, path: &Path) -> Result<bool, AppError> {
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != self.after_fingerprint {
+            return Ok(false);
+        }
+
+        match &self.before.bytes {
+            Some(bytes) => atomic_write(path, bytes)?,
+            None => delete_file(path)?,
+        }
+        Ok(true)
+    }
+}
+
+/// Ownership proof for an `auth.json` write.
+///
+/// Auth is not part of the TOML reconcile loop, so it needs its own guarded
+/// capture/commit boundary.  The candidate fingerprint is calculated from the
+/// exact serialized bytes that are passed to `atomic_write`; rollback is
+/// conditional on those bytes still being present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexAuthWriteAttempt {
+    pub(crate) before: ExactCodexSnapshot,
+    /// `Some` for a file written by this attempt; `None` means the attempt
+    /// intentionally deleted auth.json.  Keeping the optional fingerprint is
+    /// what makes a missing-file after-state an ownership proof rather than a
+    /// special case that force-repair cannot roll back.
+    pub(crate) written_fingerprint: Option<CodexConfigFingerprint>,
+}
+
+impl CodexAuthWriteAttempt {
+    /// Write auth bytes only if the caller's earlier exact snapshot is still
+    /// current.  Recovery/snapshot flows capture auth before they inspect the
+    /// rest of the live state; recapturing here would incorrectly treat a new
+    /// OAuth login as this attempt's baseline and overwrite it.
+    pub(crate) fn write_if_snapshot_unchanged(
+        path: &Path,
+        before: &ExactCodexSnapshot,
+        auth: &Value,
+    ) -> Result<Self, AppError> {
+        let bytes = serialize_json_file_contents(auth)?;
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != before.fingerprint() {
+            return Err(concurrent_modification_deferred_error());
+        }
+        atomic_write(path, &bytes)?;
+        Ok(Self {
+            before: before.clone(),
+            written_fingerprint: Some(codex_bytes_fingerprint(&bytes)),
+        })
+    }
+
+    pub(crate) fn capture_and_write(path: &Path, auth: &Value) -> Result<Self, AppError> {
+        let before = ExactCodexSnapshot::read(path)?;
+        let bytes = serialize_json_file_contents(auth)?;
+
+        #[cfg(test)]
+        maybe_mutate_codex_auth_after_capture_for_test(path);
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != before.fingerprint() {
+            return Err(concurrent_modification_deferred_error());
+        }
+
+        atomic_write(path, &bytes)?;
+        #[cfg(test)]
+        maybe_mutate_codex_auth_after_commit_for_test(path);
+        Ok(Self {
+            before,
+            written_fingerprint: Some(codex_bytes_fingerprint(&bytes)),
+        })
+    }
+
+    pub(crate) fn restore_if_unchanged(&self, path: &Path) -> Result<bool, AppError> {
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != self.written_fingerprint {
+            return Ok(false);
+        }
+
+        match &self.before.bytes {
+            Some(bytes) => atomic_write(path, bytes)?,
+            None => delete_file(path)?,
+        }
+        Ok(true)
+    }
+}
+
+fn restore_codex_auth_after_error(
+    error: AppError,
+    attempt: Option<&CodexAuthWriteAttempt>,
+    path: &Path,
+) -> AppError {
+    let Some(attempt) = attempt else {
+        return error;
+    };
+    match attempt.restore_if_unchanged(path) {
+        Ok(true) => error,
+        Ok(false) => AppError::Message(format!(
+            "{error}; Codex auth.json rollback deferred because an external update was detected"
+        )),
+        Err(restore_error) => AppError::Message(format!(
+            "{error}; Codex auth.json rollback failed: {restore_error}"
+        )),
+    }
+}
+
+fn concurrent_modification_deferred_error() -> AppError {
+    AppError::localized(
+        "codex.live.concurrent_modification_deferred",
+        "Codex 配置正在被其他程序修改，已保留最新文件并暂缓写入",
+        "Codex configuration changed concurrently; the latest file was preserved and the write was deferred",
+    )
+}
+
+/// Write Codex's config with an optimistic fingerprint check.  The provider
+/// payload has already been prepared by the caller; if another process writes
+/// the file between our read and replacement, merge the requested provider
+/// fields onto that newer live text and retry a small, bounded number of times.
+fn write_codex_live_config_optimistic(
+    config_path: &Path,
+    config_text: &str,
+) -> Result<(), AppError> {
+    let mut candidate = normalize_codex_config_text_for_live_read(config_text)?;
+    const MAX_RETRIES: usize = 2;
+
+    for _attempt in 0..=MAX_RETRIES {
+        #[cfg(test)]
+        maybe_mutate_codex_config_before_writer_snapshot_for_test(config_path);
+        let before = ExactCodexSnapshot::read(config_path)?;
+
+        #[cfg(test)]
+        maybe_mutate_codex_config_for_test(config_path);
+
+        let observed = ExactCodexSnapshot::read(config_path)?;
+        if before.fingerprint() != observed.fingerprint() {
+            let latest = observed.text(config_path)?;
+            candidate = if candidate.trim().is_empty() {
+                strip_codex_provider_owned_fields_from_live(&latest)?
+            } else {
+                merge_codex_provider_config_texts(&latest, &candidate)?
+            };
+            continue;
+        }
+
+        write_text_file(config_path, &candidate)?;
+        return Ok(());
+    }
+
+    let error = concurrent_modification_deferred_error();
+    let mut outcome = crate::services::recovery_outcome::RecoveryOutcome::for_app(
+        crate::services::recovery_outcome::RecoveryOutcomeKind::ConcurrentModificationDeferred,
+        "codex",
+    );
+    outcome.next_step = Some("retryCodexConfigWrite".to_string());
+    outcome.details = Some(error.to_string());
+    if let Err(record_error) = crate::services::recovery_outcome::record_recovery_outcome(outcome) {
+        log::warn!("保存 Codex 并发写入延迟结果失败: {record_error}");
+    }
+    Err(error)
+}
+
+/// Reconcile Codex's live `config.toml` from the current bytes with an
+/// optimistic fingerprint check.
+///
+/// MCP projection is intentionally live-as-base: the caller supplies a
+/// closure that parses the currently observed text and applies only its
+/// owned changes.  The file is fingerprinted again immediately before the
+/// atomic replacement.  If Codex (or another CCSwitchMulti process) wrote the
+/// file in between, the closure is run again against the newer bytes.  After
+/// two retries the latest external bytes are left untouched and the caller
+/// receives the same deferred error used by provider writes.
+pub(crate) fn write_codex_live_config_reconcile<F>(
+    config_path: &Path,
+    reconcile: F,
+) -> Result<(), AppError>
+where
+    F: FnMut(&str) -> Result<String, AppError>,
+{
+    write_codex_live_config_reconcile_with_attempt(config_path, reconcile).map(|_| ())
+}
+
+/// Reconcile Codex live config and return the exact ownership proof for the
+/// committed attempt.  Every retry obtains one byte snapshot, transforms that
+/// snapshot, then compares a second byte snapshot immediately before commit.
+pub(crate) fn write_codex_live_config_reconcile_with_attempt<F>(
+    config_path: &Path,
+    mut reconcile: F,
+) -> Result<CommittedCodexAttempt, AppError>
+where
+    F: FnMut(&str) -> Result<String, AppError>,
+{
+    const MAX_RETRIES: usize = 2;
+
+    for _attempt in 0..=MAX_RETRIES {
+        #[cfg(test)]
+        maybe_mutate_codex_config_before_writer_snapshot_for_test(config_path);
+        let before = ExactCodexSnapshot::read(config_path)?;
+        let live = before.text(config_path)?;
+        let candidate = reconcile(&live)?;
+
+        #[cfg(test)]
+        maybe_mutate_codex_config_for_test(config_path);
+
+        let observed = ExactCodexSnapshot::read(config_path)?;
+        if before.fingerprint() != observed.fingerprint() {
+            continue;
+        }
+
+        // Avoid rewriting a byte-identical no-op only after the fingerprint
+        // check.  A concurrent write can happen while the closure is
+        // reconciling even when it ultimately returns the original text.
+        if candidate == live {
+            return Ok(CommittedCodexAttempt {
+                before,
+                after_fingerprint: observed.fingerprint(),
+            });
+        }
+
+        write_text_file(config_path, &candidate)?;
+        #[cfg(test)]
+        maybe_mutate_codex_config_after_write_for_test(config_path);
+        return Ok(CommittedCodexAttempt {
+            before,
+            after_fingerprint: Some(codex_bytes_fingerprint(candidate.as_bytes())),
+        });
+    }
+
+    let error = concurrent_modification_deferred_error();
+    let mut outcome = crate::services::recovery_outcome::RecoveryOutcome::for_app(
+        crate::services::recovery_outcome::RecoveryOutcomeKind::ConcurrentModificationDeferred,
+        "codex",
+    );
+    outcome.next_step = Some("retryCodexConfigWrite".to_string());
+    outcome.details = Some(error.to_string());
+    if let Err(record_error) = crate::services::recovery_outcome::record_recovery_outcome(outcome) {
+        log::warn!("保存 Codex MCP 并发写入延迟结果失败: {record_error}");
+    }
+    Err(error)
+}
+
+pub(crate) fn codex_provider_noop_projection_receipt(
+    config_path: &Path,
+) -> Result<CodexProjectionCommitReceipt, AppError> {
+    let before = ExactCodexSnapshot::read(config_path)?;
+    let mut companions = CodexProjectionSideEffectsAttempt::capture()?;
+    companions.mark_unmodified_as_after();
+    Ok(CodexProjectionCommitReceipt {
+        config_attempt: CommittedCodexAttempt {
+            before: before.clone(),
+            after_fingerprint: before.fingerprint(),
+        },
+        companion_attempt: companions,
+    })
+}
+
 fn active_codex_model_provider_id(doc: &DocumentMut) -> Option<String> {
     doc.get("model_provider")
         .and_then(|item| item.as_str())
@@ -511,18 +1103,18 @@ pub(crate) fn is_custom_codex_model_provider_id(id: &str) -> bool {
 /// Codex login state lives in `auth.json`; provider routing, endpoint, model,
 /// and provider-scoped bearer tokens live in `config.toml`. Provider switches
 /// should not overwrite the user's ChatGPT login cache.
-pub fn write_codex_live_config_atomic(config_text_opt: Option<&str>) -> Result<(), AppError> {
+pub(crate) fn write_codex_live_config_atomic(
+    config_text_opt: Option<&str>,
+) -> Result<(), AppError> {
+    let config_text_opt = config_text_opt.ok_or_else(missing_codex_live_config_error)?;
     let config_path = get_codex_config_path();
-    let cfg_text = match config_text_opt {
-        Some(config_text) => normalize_codex_config_text_for_live_read(config_text)?,
-        None => String::new(),
-    };
+    let cfg_text = normalize_codex_config_text_for_live_read(config_text_opt)?;
 
     if !cfg_text.trim().is_empty() {
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
 
-    write_text_file(&config_path, &cfg_text)
+    write_codex_live_config_optimistic(&config_path, &cfg_text)
 }
 
 pub fn extract_codex_auth_api_key(auth: &Value) -> Option<String> {
@@ -730,21 +1322,42 @@ pub fn codex_live_auth_is_stale_third_party_residue(live_auth: &Value) -> bool {
 pub fn clear_stale_codex_live_auth_after_official_switch(
     db_auth: &Value,
 ) -> Result<bool, AppError> {
+    Ok(clear_stale_codex_live_auth_after_official_switch_with_receipt(db_auth)?.is_some())
+}
+
+/// Delete stale third-party auth.json and return an ownership receipt for the
+/// optional-file transition.  A missing after-file (`written_fingerprint =
+/// None`) is deliberate: force-repair can restore the old auth only while the
+/// file remains absent, and will report deferred if Codex creates a new login
+/// between cleanup and rollback.
+pub(crate) fn clear_stale_codex_live_auth_after_official_switch_with_receipt(
+    db_auth: &Value,
+) -> Result<Option<CodexAuthWriteAttempt>, AppError> {
     if codex_auth_has_login_material(db_auth) {
         // A material-carrying official provider gets a full auth write;
         // nothing stale can remain.
-        return Ok(false);
+        return Ok(None);
     }
     let auth_path = get_codex_auth_path();
     if !auth_path.exists() {
-        return Ok(false);
+        return Ok(None);
     }
+    let before = ExactCodexSnapshot::read(&auth_path)?;
     let live_auth: Value = read_json_file(&auth_path)?;
+    #[cfg(test)]
+    maybe_mutate_codex_auth_after_capture_for_test(&auth_path);
+    let current = ExactCodexSnapshot::read(&auth_path)?;
+    if current.fingerprint() != before.fingerprint() {
+        return Err(concurrent_modification_deferred_error());
+    }
     if !codex_live_auth_is_stale_third_party_residue(&live_auth) {
-        return Ok(false);
+        return Ok(None);
     }
     delete_file(&auth_path)?;
-    Ok(true)
+    Ok(Some(CodexAuthWriteAttempt {
+        before,
+        written_fingerprint: None,
+    }))
 }
 
 pub fn should_restore_codex_provider_token_for_backfill(
@@ -3237,27 +3850,52 @@ fn inspect_legacy_codex_managed_agent_roles<'a>(
 /// 同步 CCSwitchMulti 托管的官方 custom agent TOML 文件。
 ///
 /// 已有用户手写同名文件不会被覆盖；这种情况下使用 `ccswitch-<role>` 作为托管角色名。
+#[cfg(test)]
 fn sync_codex_managed_agent_files(
     specs: &[CodexCatalogModelSpec],
     version: CodexSubagentVersion,
+) -> Result<(), AppError> {
+    let mut attempt = CodexProjectionSideEffectsAttempt::capture()?;
+    let result = sync_codex_managed_agent_files_with_attempt(specs, version, &mut attempt);
+    if result.is_err() {
+        let _ = attempt.restore_if_unchanged();
+    }
+    result
+}
+
+fn sync_codex_managed_agent_files_with_attempt(
+    specs: &[CodexCatalogModelSpec],
+    version: CodexSubagentVersion,
+    attempt: &mut CodexProjectionSideEffectsAttempt,
 ) -> Result<(), AppError> {
     let agents_dir = get_codex_agents_dir();
     fs::create_dir_all(&agents_dir).map_err(|e| AppError::io(&agents_dir, e))?;
 
     if version == CodexSubagentVersion::V1 {
-        return prune_stale_codex_managed_agent_files(&agents_dir, &HashSet::new());
+        return prune_stale_codex_managed_agent_files_with_attempt(
+            &agents_dir,
+            &HashSet::new(),
+            attempt,
+        );
     }
 
     let mut desired_paths = HashSet::new();
     for role in inspect_legacy_codex_managed_agent_roles(specs, &agents_dir) {
+        if role.path.exists()
+            && !codex_agent_file_is_cc_switch_managed(&role.path)
+            && !codex_agent_file_is_legacy_cc_switch_role(&role.path, role.spec)
+        {
+            continue;
+        }
         desired_paths.insert(role.path.clone());
-        write_text_file(
+        attempt.capture_path_for_managed_write(&role.path)?;
+        attempt.write_text_if_unchanged(
             &role.path,
             &render_codex_managed_agent_toml(&role.effective_role_name, role.spec),
         )?;
     }
 
-    prune_stale_codex_managed_agent_files(&agents_dir, &desired_paths)?;
+    prune_stale_codex_managed_agent_files_with_attempt(&agents_dir, &desired_paths, attempt)?;
 
     Ok(())
 }
@@ -3303,6 +3941,11 @@ impl ProviderClassificationContext {
 
     fn get(&self, provider_id: &str) -> Option<SubagentProviderKind> {
         self.provider_kinds.get(provider_id).copied()
+    }
+
+    /// mode=all 兜底匹配用的"provider → 模型名集合"映射。
+    pub(crate) fn provider_models(&self) -> &HashMap<String, HashSet<String>> {
+        &self.provider_models
     }
 }
 
@@ -3367,6 +4010,60 @@ pub(crate) fn codex_provider_classification_context(
 struct RouteClassification {
     provider_kind: SubagentProviderKind,
     warning: Option<&'static str>,
+}
+
+/// 解析模型所属 route：raw settings 匹配（exact/prefix，fail-closed）失败时，
+/// 用 mode=all route 的 target provider catalog 兜底。
+///
+/// mode=all 的语义是"接住目标 provider 的全部模型"，而 raw 匹配只认
+/// match.models / matchPrefixes；无前缀的 mode=all route（如向导不识别名称的
+/// Kimi）会漏掉自己的模型，导致角色被误判 unroutable。target catalog 判断
+/// 保证 k3 → Kimi（第三方），而 qwen3.8（未勾选源）仍 fail-closed。
+fn codex_resolve_route_with_mode_all<'a>(
+    settings: &'a Value,
+    model: &str,
+    provider_models: Option<&HashMap<String, HashSet<String>>>,
+) -> Option<&'a Value> {
+    if let Some(route) = resolve_codex_primary_route_from_settings(settings, model) {
+        return Some(route);
+    }
+    let Some(provider_models) = provider_models else {
+        return None;
+    };
+    let model_key = model.trim().to_ascii_lowercase();
+    if model_key.is_empty() {
+        return None;
+    }
+    let routes = settings
+        .get("codexRouting")
+        .and_then(|routing| routing.get("routes"))
+        .and_then(Value::as_array)?;
+    for route in routes {
+        let enabled = route
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !enabled {
+            continue;
+        }
+        if route
+            .pointer("/modelSelection/mode")
+            .and_then(Value::as_str)
+            != Some("all")
+        {
+            continue;
+        }
+        let Some(target_provider_id) = codex_route_target_provider_id_from_route(route) else {
+            continue;
+        };
+        if provider_models
+            .get(target_provider_id)
+            .is_some_and(|models| models.contains(&model_key))
+        {
+            return Some(route);
+        }
+    }
+    None
 }
 
 fn codex_subagent_route_classification_with_context(
@@ -5410,16 +6107,38 @@ fn preview_codex_subagent_profile_with_context(
     })
 }
 
+#[cfg(test)]
 fn sync_codex_managed_agent_files_with_settings(
     specs: &[CodexCatalogModelSpec],
     version: CodexSubagentVersion,
     settings: &Value,
     provider_context: Option<&ProviderClassificationContext>,
 ) -> Result<(), AppError> {
+    let mut attempt = CodexProjectionSideEffectsAttempt::capture()?;
+    let result = sync_codex_managed_agent_files_with_settings_with_attempt(
+        specs,
+        version,
+        settings,
+        provider_context,
+        &mut attempt,
+    );
+    if result.is_err() {
+        let _ = attempt.restore_if_unchanged();
+    }
+    result
+}
+
+fn sync_codex_managed_agent_files_with_settings_with_attempt(
+    specs: &[CodexCatalogModelSpec],
+    version: CodexSubagentVersion,
+    settings: &Value,
+    provider_context: Option<&ProviderClassificationContext>,
+    attempt: &mut CodexProjectionSideEffectsAttempt,
+) -> Result<(), AppError> {
     let Some(compilation) =
         compile_configured_codex_subagent_roles(settings, specs, version, provider_context)?
     else {
-        return sync_codex_managed_agent_files(specs, version);
+        return sync_codex_managed_agent_files_with_attempt(specs, version, attempt);
     };
     let agents_dir = get_codex_agents_dir();
     fs::create_dir_all(&agents_dir).map_err(|error| AppError::io(&agents_dir, error))?;
@@ -5434,9 +6153,10 @@ fn sync_codex_managed_agent_files_with_settings(
             render_generated_role_toml(&role, CC_SWITCH_MANAGED_AGENT_MARKER).map_err(|error| {
                 AppError::Message(format!("Unable to render Codex subagent role: {error:?}"))
             })?;
-        write_text_file(&path, &rendered)?;
+        attempt.capture_path_for_managed_write(&path)?;
+        attempt.write_text_if_unchanged(&path, &rendered)?;
     }
-    prune_stale_codex_managed_agent_files(&agents_dir, &desired_paths)
+    prune_stale_codex_managed_agent_files_with_attempt(&agents_dir, &desired_paths, attempt)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -5512,9 +6232,24 @@ pub(crate) fn verify_codex_subagent_role_files(
 /// 删除已经不属于当前可路由模型目录的 CCSwitchMulti 托管 agent 文件。
 ///
 /// 只清理带托管标记的文件，用户手写 role、旧版未标记文件和其它扩展 agent 都保留。
+#[cfg(test)]
 fn prune_stale_codex_managed_agent_files(
     agents_dir: &Path,
     desired_paths: &HashSet<PathBuf>,
+) -> Result<(), AppError> {
+    let mut attempt = CodexProjectionSideEffectsAttempt::capture()?;
+    let result =
+        prune_stale_codex_managed_agent_files_with_attempt(agents_dir, desired_paths, &mut attempt);
+    if result.is_err() {
+        let _ = attempt.restore_if_unchanged();
+    }
+    result
+}
+
+fn prune_stale_codex_managed_agent_files_with_attempt(
+    agents_dir: &Path,
+    desired_paths: &HashSet<PathBuf>,
+    attempt: &mut CodexProjectionSideEffectsAttempt,
 ) -> Result<(), AppError> {
     if !agents_dir.exists() {
         return Ok(());
@@ -5528,7 +6263,7 @@ fn prune_stale_codex_managed_agent_files(
         if desired_paths.contains(&path) || !codex_agent_file_is_cc_switch_managed(&path) {
             continue;
         }
-        delete_file(&path)?;
+        attempt.delete_if_unchanged(&path)?;
     }
     Ok(())
 }
@@ -5774,7 +6509,20 @@ fn enrich_codex_catalog_with_official_metadata(catalog: &Value) -> Result<Value,
 ///
 /// 这个函数解决运行中的 Codex 热切到 custom MultiRouter 后候选模型不刷新的问题：
 /// custom provider 不会主动请求 `/models`，但会接受 fresh `models_cache.json`。
+#[cfg(test)]
 fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(), AppError> {
+    let mut attempt = CodexProjectionSideEffectsAttempt::capture()?;
+    let result = sync_codex_models_cache_with_cc_switch_catalog_with_attempt(catalog, &mut attempt);
+    if result.is_err() {
+        let _ = attempt.restore_if_unchanged();
+    }
+    result
+}
+
+fn sync_codex_models_cache_with_cc_switch_catalog_with_attempt(
+    catalog: &Value,
+    side_effects: &mut CodexProjectionSideEffectsAttempt,
+) -> Result<(), AppError> {
     let Some(models) = catalog.get("models").and_then(|models| models.as_array()) else {
         return Ok(());
     };
@@ -5784,20 +6532,29 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
 
     let cache_path = get_codex_models_cache_path();
     let backup_path = get_codex_models_cache_backup_path();
-    let existing_cache = read_json_file_if_exists(&cache_path)?;
+    let existing_cache = side_effects
+        .read_bytes_if_unchanged(&cache_path)?
+        .map(|bytes| {
+            serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+                AppError::Message(format!(
+                    "解析 Codex models_cache.json 失败 ({}): {error}",
+                    cache_path.display()
+                ))
+            })
+        })
+        .transpose()?;
     // 官方同 slug 元数据优先来自接管前 backup；backup 为空时使用 Codex 自带
     // bundled 官方目录，因此新模型不会被旧缓存/空 backup 卡住。
     let official_models = codex_official_models_cache().unwrap_or_default();
-    let client_version = existing_cache
-        .as_ref()
-        .and_then(|cache| cache.get("client_version"))
-        .and_then(|version| version.as_str())
-        .map(ToString::to_string);
-
     // Codex 0.140+ 的 custom provider 不会主动请求 /models，只会读取新鲜 cache。
     // 因此这里复用已有 client_version 写入同格式 cache，让模型菜单立刻看到
     // cc-switch 生成的完整 catalog，同时用 etag 标记所有权便于恢复 official。
-    let Some(client_version) = client_version else {
+    let has_client_version = existing_cache
+        .as_ref()
+        .and_then(|cache| cache.get("client_version"))
+        .and_then(Value::as_str)
+        .is_some_and(|version| !version.trim().is_empty());
+    if !has_client_version {
         log::warn!(
             "skip Codex models_cache sync: existing cache has no client_version, path={}",
             cache_path.display()
@@ -5807,20 +6564,30 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
 
     if let Some(cache) = existing_cache.as_ref() {
         if codex_models_cache_is_cc_switch_owned(cache) {
-            let backup_models_empty = read_json_file_if_exists(&backup_path)?
+            let backup_models_empty = side_effects
+                .read_bytes_if_unchanged(&backup_path)?
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                 .and_then(|backup| backup.get("models").cloned())
                 .and_then(|models| models.as_array().cloned())
                 .is_none_or(|models| models.is_empty());
             if backup_models_empty && !official_models.is_empty() {
                 let mut restored = cache.clone();
                 restored["models"] = Value::Array(official_models.clone());
-                write_json_file(&backup_path, &restored)?;
+                side_effects.write_json_if_unchanged(&backup_path, &restored)?;
             }
         } else if !backup_path.exists() {
             if let Some(parent) = backup_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
             }
-            fs::copy(&cache_path, &backup_path).map_err(|e| AppError::io(&backup_path, e))?;
+            let cache_bytes = side_effects
+                .read_bytes_if_unchanged(&cache_path)?
+                .ok_or_else(|| {
+                    AppError::io(
+                        &cache_path,
+                        std::io::Error::from(std::io::ErrorKind::NotFound),
+                    )
+                })?;
+            side_effects.write_bytes_if_unchanged(&backup_path, &cache_bytes)?;
         }
     }
 
@@ -5849,45 +6616,99 @@ fn sync_codex_models_cache_with_cc_switch_catalog(catalog: &Value) -> Result<(),
         }
     }
 
-    // 以现有缓存对象为底稿还能保留新版 App 可能新增的顶层元数据；这里只覆盖
-    // CCSM 必须维护的刷新时间、所有权标记、客户端版本和合并后的模型数组。
-    let mut cache = existing_cache.unwrap_or_else(|| json!({}));
-    if !cache.is_object() {
-        cache = json!({});
+    // Re-read the cache for every optimistic attempt.  Codex Desktop and
+    // another CCSwitchMulti process may update unknown top-level metadata at
+    // any time; rebuilding from the first snapshot would erase those fields.
+    // The compare immediately before replacement makes the write conditional
+    // on the exact bytes we transformed.
+    const MAX_RETRIES: usize = 2;
+    for _attempt in 0..=MAX_RETRIES {
+        let before = ExactCodexSnapshot::read(&cache_path)?;
+        let mut cache = match before.bytes.as_deref() {
+            Some(bytes) => serde_json::from_slice::<Value>(bytes).map_err(|error| {
+                AppError::Message(format!(
+                    "解析 Codex models_cache.json 失败 ({}): {error}",
+                    cache_path.display()
+                ))
+            })?,
+            None => json!({}),
+        };
+        if !cache.is_object() {
+            cache = json!({});
+        }
+        let Some(client_version) = cache
+            .get("client_version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+            .map(ToString::to_string)
+        else {
+            log::warn!(
+                "skip Codex models_cache sync: latest cache has no client_version, path={}",
+                cache_path.display()
+            );
+            return Ok(());
+        };
+
+        // 以当前缓存对象为底稿还能保留新版 App 可能新增的顶层元数据；这里只覆盖
+        // CCSM 必须维护的刷新时间、所有权标记、客户端版本和合并后的模型数组。
+        let cache_object = cache
+            .as_object_mut()
+            .expect("cache was normalized to a JSON object");
+        cache_object.insert(
+            "fetched_at".to_string(),
+            Value::String(current_utc_rfc3339_nanos()),
+        );
+        cache_object.insert(
+            "etag".to_string(),
+            Value::String(CC_SWITCH_CODEX_MODELS_CACHE_ETAG.to_string()),
+        );
+        cache_object.insert("client_version".to_string(), Value::String(client_version));
+        cache_object.insert("models".to_string(), Value::Array(merged_models.clone()));
+
+        #[cfg(test)]
+        maybe_mutate_companion_before_write_for_test(&cache_path);
+        let observed = ExactCodexSnapshot::read(&cache_path)?;
+        if observed.fingerprint() != before.fingerprint() {
+            continue;
+        }
+        side_effects.write_json_if_unchanged(&cache_path, &cache)?;
+        return Ok(());
     }
-    let cache_object = cache
-        .as_object_mut()
-        .expect("cache was normalized to a JSON object");
-    cache_object.insert(
-        "fetched_at".to_string(),
-        Value::String(current_utc_rfc3339_nanos()),
+
+    let error = concurrent_modification_deferred_error();
+    let mut outcome = crate::services::recovery_outcome::RecoveryOutcome::for_app(
+        crate::services::recovery_outcome::RecoveryOutcomeKind::ConcurrentModificationDeferred,
+        "codex",
     );
-    cache_object.insert(
-        "etag".to_string(),
-        Value::String(CC_SWITCH_CODEX_MODELS_CACHE_ETAG.to_string()),
-    );
-    cache_object.insert("client_version".to_string(), Value::String(client_version));
-    cache_object.insert("models".to_string(), Value::Array(merged_models));
-    write_json_file(&cache_path, &cache)
+    outcome.next_step = Some("retryCodexModelsCacheSync".to_string());
+    outcome.details = Some(error.to_string());
+    if let Err(record_error) = crate::services::recovery_outcome::record_recovery_outcome(outcome) {
+        log::warn!("保存 Codex models cache 并发写入延迟结果失败: {record_error}");
+    }
+    Err(error)
 }
 
 /// 在退出 MultiRouter 或清空模型目录时恢复 Codex 原始模型缓存。
-fn restore_codex_models_cache_if_cc_switch_owned() -> Result<(), AppError> {
+fn restore_codex_models_cache_if_cc_switch_owned_with_attempt(
+    side_effects: &mut CodexProjectionSideEffectsAttempt,
+) -> Result<(), AppError> {
     let cache_path = get_codex_models_cache_path();
     let backup_path = get_codex_models_cache_backup_path();
-    let Some(cache) = read_json_file_if_exists(&cache_path)? else {
+    let Some(cache_bytes) = side_effects.read_bytes_if_unchanged(&cache_path)? else {
         return Ok(());
     };
+    let cache: Value =
+        serde_json::from_slice(&cache_bytes).map_err(|error| AppError::json(&cache_path, error))?;
     if !codex_models_cache_is_cc_switch_owned(&cache) {
         return Ok(());
     }
 
-    if backup_path.exists() {
-        let backup = fs::read(&backup_path).map_err(|e| AppError::io(&backup_path, e))?;
-        atomic_write(&cache_path, &backup)?;
-        delete_file(&backup_path).ok();
+    if let Some(backup) = side_effects.read_bytes_if_unchanged(&backup_path)? {
+        side_effects.write_bytes_if_unchanged(&cache_path, &backup)?;
+        side_effects.delete_if_unchanged(&backup_path)?;
     } else {
-        delete_file(&cache_path).ok();
+        side_effects.delete_if_unchanged(&cache_path)?;
     }
     Ok(())
 }
@@ -5902,26 +6723,30 @@ pub(crate) fn prepare_codex_config_text_with_model_catalog_without_provider_cont
     prepare_codex_config_text_with_model_catalog_impl(settings, config_text, profile, None)
 }
 
-pub(crate) fn prepare_codex_config_text_with_model_catalog_and_provider_context(
-    settings: &Value,
-    config_text: &str,
-    profile: CodexCatalogToolProfile,
-    provider_context: &ProviderClassificationContext,
-) -> Result<String, AppError> {
-    prepare_codex_config_text_with_model_catalog_impl(
-        settings,
-        config_text,
-        profile,
-        Some(provider_context),
-    )
-}
-
 fn prepare_codex_config_text_with_model_catalog_impl(
     settings: &Value,
     config_text: &str,
     profile: CodexCatalogToolProfile,
     provider_context: Option<&ProviderClassificationContext>,
 ) -> Result<String, AppError> {
+    let plan = build_codex_projection_plan(settings, config_text, profile, provider_context)?;
+    let mut side_effects = CodexProjectionSideEffectsAttempt::capture()?;
+    if let Err(error) = commit_codex_projection_plan(&plan, &mut side_effects) {
+        let _ = side_effects.restore_if_unchanged();
+        return Err(error);
+    }
+    Ok(plan.config_text)
+}
+
+/// Pure projection planning.  This function only reads the current inputs and
+/// returns target bytes; callers commit the companion files after the guarded
+/// `config.toml` write succeeds.
+pub(crate) fn build_codex_projection_plan(
+    settings: &Value,
+    config_text: &str,
+    profile: CodexCatalogToolProfile,
+    provider_context: Option<&ProviderClassificationContext>,
+) -> Result<CodexProjectionPlan, AppError> {
     let catalog_path = get_codex_model_catalog_path();
     let specs = codex_catalog_model_specs(settings, config_text);
 
@@ -5975,30 +6800,456 @@ fn prepare_codex_config_text_with_model_catalog_impl(
             codex_subagent_version(settings),
             provider_context,
         )?;
-        write_json_file(&catalog_path, &catalog)?;
-        sync_codex_models_cache_with_cc_switch_catalog(&catalog)?;
-        sync_codex_managed_agent_files_with_settings(
-            &specs,
-            codex_subagent_version(settings),
-            settings,
-            provider_context,
-        )?;
-        Ok(config_text)
+        Ok(CodexProjectionPlan {
+            config_text,
+            catalog: Some(catalog),
+            specs,
+            version: codex_subagent_version(settings),
+            settings: settings.clone(),
+            provider_context: provider_context.cloned(),
+        })
     } else {
-        restore_codex_models_cache_if_cc_switch_owned()?;
-        prune_stale_codex_managed_agent_files(&get_codex_agents_dir(), &HashSet::new())?;
         let config_text = set_codex_model_catalog_projection_fields(config_text, None, None, None)?;
         let config_text = set_codex_native_web_search_field(
             &config_text,
             profile == CodexCatalogToolProfile::Anthropic,
         )?;
-        project_codex_subagent_v2_parent_instructions(
+        let config_text = project_codex_subagent_v2_parent_instructions(
             settings,
             &config_text,
             &[],
             codex_subagent_version(settings),
             provider_context,
-        )
+        )?;
+        Ok(CodexProjectionPlan {
+            config_text,
+            catalog: None,
+            specs,
+            version: codex_subagent_version(settings),
+            settings: settings.clone(),
+            provider_context: provider_context.cloned(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodexProjectionPlan {
+    pub(crate) config_text: String,
+    catalog: Option<Value>,
+    specs: Vec<CodexCatalogModelSpec>,
+    version: CodexSubagentVersion,
+    settings: Value,
+    provider_context: Option<ProviderClassificationContext>,
+}
+
+fn commit_codex_projection_plan(
+    plan: &CodexProjectionPlan,
+    side_effects: &mut CodexProjectionSideEffectsAttempt,
+) -> Result<(), AppError> {
+    if let Some(catalog) = &plan.catalog {
+        side_effects.write_json_if_unchanged(&get_codex_model_catalog_path(), catalog)?;
+        sync_codex_models_cache_with_cc_switch_catalog_with_attempt(catalog, side_effects)?;
+        sync_codex_managed_agent_files_with_settings_with_attempt(
+            &plan.specs,
+            plan.version,
+            &plan.settings,
+            plan.provider_context.as_ref(),
+            side_effects,
+        )?;
+    } else {
+        restore_codex_models_cache_if_cc_switch_owned_with_attempt(side_effects)?;
+        prune_stale_codex_managed_agent_files_with_attempt(
+            &get_codex_agents_dir(),
+            &HashSet::new(),
+            side_effects,
+        )?;
+    }
+    Ok(())
+}
+
+/// Commit a projection plan only after the live config reconcile succeeds.
+///
+/// The builder is rerun for every current-live retry.  Companion files are
+/// therefore derived from the same winning attempt as `config.toml`, and a
+/// partial companion commit can be compensated only while each file still has
+/// this attempt's after-fingerprint.
+#[derive(Debug, Clone)]
+pub(crate) struct CodexProjectionCommitReceipt {
+    pub(crate) config_attempt: CommittedCodexAttempt,
+    pub(crate) companion_attempt: CodexProjectionSideEffectsAttempt,
+}
+
+pub(crate) fn write_codex_projection_plan_reconciled<F>(
+    config_path: &Path,
+    mut build: F,
+) -> Result<CodexProjectionCommitReceipt, AppError>
+where
+    F: FnMut(&str) -> Result<CodexProjectionPlan, AppError>,
+{
+    // Capture every companion before the guarded config write.  The config
+    // attempt may succeed while a later catalog/cache/agent write fails; in
+    // that case rollback is allowed to restore only bytes that this attempt
+    // still owns.  Capturing after the config write would lose the original
+    // snapshot and could restore a user's concurrent edit.
+    let mut side_effects = CodexProjectionSideEffectsAttempt::capture()?;
+    let latest_plan = std::cell::RefCell::new(None::<CodexProjectionPlan>);
+    let config_attempt = write_codex_live_config_reconcile_with_attempt(config_path, |live| {
+        let plan = build(live)?;
+        let config_text = plan.config_text.clone();
+        *latest_plan.borrow_mut() = Some(plan);
+        #[cfg(test)]
+        maybe_mutate_codex_config_after_transform_for_test(config_path);
+        Ok(config_text)
+    })?;
+
+    #[cfg(test)]
+    maybe_mutate_companion_after_config_commit_for_test();
+
+    let plan = latest_plan
+        .into_inner()
+        .ok_or_else(|| AppError::Message("Codex projection plan was not produced".to_string()))?;
+    if let Err(error) = commit_codex_projection_plan(&plan, &mut side_effects) {
+        let restore_error = side_effects.restore_if_unchanged().err();
+        let config_restored = config_attempt
+            .restore_if_unchanged(config_path)
+            .unwrap_or(false);
+        if let Some(restore_error) = restore_error {
+            log::warn!("回滚 Codex projection 副作用失败: {restore_error}");
+        }
+        if !config_restored {
+            log::warn!(
+                "Codex projection 副作用提交失败后 config.toml 已发生外部变化，延迟全文回滚"
+            );
+        }
+        return Err(error);
+    }
+    Ok(CodexProjectionCommitReceipt {
+        config_attempt,
+        companion_attempt: side_effects,
+    })
+}
+
+/// Side effects produced while preparing a MultiRouter projection.  The
+/// config writer may defer after a concurrent live-file change, in which case
+/// these generated files must not claim a projection that never reached
+/// `config.toml`.
+#[derive(Debug, Clone)]
+struct AttemptOwnedFile {
+    path: PathBuf,
+    before: ExactCodexSnapshot,
+    after_fingerprint: Option<CodexConfigFingerprint>,
+    committed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodexProjectionSideEffectsAttempt {
+    files: Vec<AttemptOwnedFile>,
+}
+
+/// Snapshot of every Codex projection companion that existed at one switch
+/// boundary.  Unlike a plain `CodexProjectionSideEffectsAttempt`, this type is
+/// intentionally a before/after boundary: a provider switch can touch a
+/// catalog, cache, backup, or managed agent through a proxy helper that does
+/// not expose its inner writer receipt.  Force-repair uses the pair to restore
+/// only bytes that still equal the switch attempt's final snapshot.
+#[derive(Debug, Clone)]
+pub(crate) struct CodexProjectionSnapshot {
+    files: Vec<(PathBuf, ExactCodexSnapshot)>,
+}
+
+impl CodexProjectionSnapshot {
+    pub(crate) fn capture() -> Result<Self, AppError> {
+        let attempt = CodexProjectionSideEffectsAttempt::capture()?;
+        Ok(Self {
+            files: attempt
+                .files
+                .into_iter()
+                .map(|file| (file.path, file.before))
+                .collect(),
+        })
+    }
+
+    pub(crate) fn restore_if_unchanged(&self, after: &Self) -> Result<bool, AppError> {
+        let mut restored_all = true;
+        let mut paths = self
+            .files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        paths.extend(after.files.iter().map(|(path, _)| path.clone()));
+
+        for path in paths {
+            let before = self
+                .files
+                .iter()
+                .find(|(candidate, _)| candidate == &path)
+                .map(|(_, snapshot)| snapshot);
+            let after = after
+                .files
+                .iter()
+                .find(|(candidate, _)| candidate == &path)
+                .map(|(_, snapshot)| snapshot);
+            let Some(after) = after else {
+                restored_all = false;
+                continue;
+            };
+            let current = ExactCodexSnapshot::read(&path)?;
+            if current.fingerprint() != after.fingerprint() {
+                restored_all = false;
+                log::warn!(
+                    "跳过恢复被外部修改的 Codex switch projection 文件: {}",
+                    path.display()
+                );
+                continue;
+            }
+            match before.and_then(|snapshot| snapshot.bytes.as_deref()) {
+                Some(bytes) => atomic_write(&path, bytes)?,
+                None => delete_file(&path)?,
+            }
+        }
+        Ok(restored_all)
+    }
+
+    pub(crate) fn overlay_attempt_after(
+        &self,
+        attempts: &[&CodexProjectionSideEffectsAttempt],
+    ) -> Self {
+        let mut files = self.files.clone();
+        for attempt in attempts {
+            for (path, snapshot) in attempt.after_snapshot().files {
+                if let Some((_, existing)) =
+                    files.iter_mut().find(|(candidate, _)| candidate == &path)
+                {
+                    *existing = snapshot;
+                } else {
+                    files.push((path, snapshot));
+                }
+            }
+        }
+        Self { files }
+    }
+}
+
+impl CodexProjectionSideEffectsAttempt {
+    pub(crate) fn capture() -> Result<Self, AppError> {
+        let paths = [
+            get_codex_model_catalog_path(),
+            get_codex_models_cache_path(),
+            get_codex_models_cache_backup_path(),
+        ];
+        let mut files = paths
+            .into_iter()
+            .map(|path| {
+                // A malformed path (for example a directory where Codex
+                // expects `cc-switch-model-catalog.json`) must reach the
+                // actual projection write so callers report that write
+                // failure.  Snapshot capture itself is best-effort for such
+                // non-regular entries; there is no byte ownership to restore.
+                let before = match ExactCodexSnapshot::read(&path) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        log::warn!(
+                            "无法读取 Codex projection companion，继续让提交阶段报告错误: {}: {error}",
+                            path.display()
+                        );
+                        ExactCodexSnapshot {
+                            bytes: None,
+                            fingerprint: None,
+                        }
+                    }
+                };
+                Ok(AttemptOwnedFile {
+                    path,
+                    before,
+                    after_fingerprint: None,
+                    committed: false,
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let agents_dir = get_codex_agents_dir();
+        if agents_dir.exists() {
+            fs::read_dir(&agents_dir)
+                .map_err(|error| AppError::io(&agents_dir, error))?
+                .map(|entry| {
+                    let entry = entry.map_err(|error| AppError::io(&agents_dir, error))?;
+                    let path = entry.path();
+                    // User-authored role files participate in name collision checks, but they
+                    // are never projection side effects.  Capturing them here would let a
+                    // failed reconcile write an old user snapshot over a concurrent edit.
+                    if !path.is_file() || !codex_agent_file_is_cc_switch_managed(&path) {
+                        return Ok(None);
+                    }
+                    let before = ExactCodexSnapshot::read(&path)?;
+                    Ok(Some(AttemptOwnedFile {
+                        path,
+                        before,
+                        after_fingerprint: None,
+                        committed: false,
+                    }))
+                })
+                .collect::<Result<Vec<_>, AppError>>()?
+                .into_iter()
+                .flatten()
+                .for_each(|file| files.push(file));
+        }
+        Ok(Self { files })
+    }
+
+    fn capture_path_for_managed_write(&mut self, path: &Path) -> Result<(), AppError> {
+        if self.files.iter().any(|file| file.path == path) {
+            return Ok(());
+        }
+        let before = ExactCodexSnapshot::read(path)?;
+        self.files.push(AttemptOwnedFile {
+            path: path.to_path_buf(),
+            before,
+            after_fingerprint: None,
+            committed: false,
+        });
+        Ok(())
+    }
+
+    fn expected_fingerprint(file: &AttemptOwnedFile) -> Option<CodexConfigFingerprint> {
+        file.after_fingerprint.or(file.before.fingerprint())
+    }
+
+    fn committed_after_fingerprint(file: &AttemptOwnedFile) -> Option<CodexConfigFingerprint> {
+        if file.committed {
+            file.after_fingerprint
+        } else {
+            file.before.fingerprint()
+        }
+    }
+
+    /// Mark captured files that this operation did not touch as its
+    /// after-state.  Config-only writers still need a complete typed receipt;
+    /// using the before fingerprint here records an intentional no-op instead
+    /// of leaving the after fingerprint as `None` (which would incorrectly
+    /// look like a deletion during rollback).
+    pub(crate) fn mark_unmodified_as_after(&mut self) {
+        for file in &mut self.files {
+            if file.after_fingerprint.is_none() {
+                file.after_fingerprint = file.before.fingerprint();
+            }
+        }
+    }
+
+    /// Build a lightweight after snapshot from the fingerprints recorded by
+    /// this attempt.  The bytes are deliberately omitted: rollback only needs
+    /// the candidate fingerprint to prove ownership, while the before bytes
+    /// remain in the outer switch snapshot.
+    pub(crate) fn after_snapshot(&self) -> CodexProjectionSnapshot {
+        CodexProjectionSnapshot {
+            files: self
+                .files
+                .iter()
+                .map(|file| {
+                    (
+                        file.path.clone(),
+                        ExactCodexSnapshot::from_fingerprint(Self::committed_after_fingerprint(
+                            file,
+                        )),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn read_bytes_if_unchanged(&self, path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+        let file = self
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                AppError::Message(format!(
+                    "Codex projection path was not captured before read: {}",
+                    path.display()
+                ))
+            })?;
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != Self::expected_fingerprint(file) {
+            return Err(concurrent_modification_deferred_error());
+        }
+        Ok(current.bytes)
+    }
+
+    fn write_bytes_if_unchanged(&mut self, path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+        let file = self
+            .files
+            .iter_mut()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                AppError::Message(format!(
+                    "Codex projection path was not captured before commit: {}",
+                    path.display()
+                ))
+            })?;
+        #[cfg(test)]
+        maybe_mutate_companion_before_write_for_test(path);
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != Self::expected_fingerprint(file) {
+            return Err(concurrent_modification_deferred_error());
+        }
+        atomic_write(path, bytes)?;
+        file.after_fingerprint = Some(codex_bytes_fingerprint(bytes));
+        file.committed = true;
+        Ok(())
+    }
+
+    fn write_text_if_unchanged(&mut self, path: &Path, text: &str) -> Result<(), AppError> {
+        self.write_bytes_if_unchanged(path, text.as_bytes())
+    }
+
+    fn write_json_if_unchanged<T: Serialize>(
+        &mut self,
+        path: &Path,
+        value: &T,
+    ) -> Result<(), AppError> {
+        let bytes = serialize_json_file_contents(value)?;
+        self.write_bytes_if_unchanged(path, &bytes)
+    }
+
+    fn delete_if_unchanged(&mut self, path: &Path) -> Result<(), AppError> {
+        let file = self
+            .files
+            .iter_mut()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                AppError::Message(format!(
+                    "Codex projection path was not captured before delete: {}",
+                    path.display()
+                ))
+            })?;
+        #[cfg(test)]
+        maybe_mutate_companion_before_write_for_test(path);
+        let current = ExactCodexSnapshot::read(path)?;
+        if current.fingerprint() != Self::expected_fingerprint(file) {
+            return Err(concurrent_modification_deferred_error());
+        }
+        delete_file(path)?;
+        file.after_fingerprint = None;
+        file.committed = true;
+        Ok(())
+    }
+
+    pub(crate) fn restore_if_unchanged(&self) -> Result<bool, AppError> {
+        let mut restored_all = true;
+        for file in &self.files {
+            let current = ExactCodexSnapshot::read(&file.path)?;
+            if current.fingerprint() != file.after_fingerprint {
+                restored_all = false;
+                log::warn!(
+                    "跳过恢复被外部修改的 Codex projection 文件: {}",
+                    file.path.display()
+                );
+                continue;
+            }
+            match &file.before.bytes {
+                Some(bytes) => atomic_write(&file.path, bytes)?,
+                None => delete_file(&file.path)?,
+            }
+        }
+        Ok(restored_all)
     }
 }
 
@@ -6018,13 +7269,15 @@ pub(crate) fn publish_codex_multirouter_projection(
                 "Codex MultiRouter projection dependency fingerprint is missing".to_string(),
             )
         })?;
-    let live_config = read_codex_config_text()?;
-    let prepared = prepare_codex_config_text_with_model_catalog_without_provider_context(
-        projection_settings,
-        &live_config,
-        CodexCatalogToolProfile::NativeResponses,
-    )?;
-    write_codex_live_config_atomic(Some(&prepared))?;
+    let config_path = get_codex_config_path();
+    write_codex_projection_plan_reconciled(&config_path, |live_config| {
+        build_codex_projection_plan(
+            projection_settings,
+            live_config,
+            CodexCatalogToolProfile::NativeResponses,
+            None,
+        )
+    })?;
 
     read_back_codex_multirouter_projection(projection_settings)
 }
@@ -6316,36 +7569,11 @@ fn build_simplified_catalog_from_texts(config_text: &str, catalog_text: &str) ->
 ///   (inline DB SSOT) }`. Here the pointer/catalog file must be (re)generated
 ///   from the inline `modelCatalog`, or the mapping is lost on restore.
 ///
-/// Gating on the presence of the inline `modelCatalog` key routes each shape
-/// correctly; an empty inline catalog still projects (and so correctly drops a
-/// now-stale pointer), while an absent key leaves the text untouched. This is
-/// **orthogonal to auth** — a provider-rebuilt backup can pair an inline
-/// `modelCatalog` with empty `auth.json` (the API key living in the config's
-/// `experimental_bearer_token`), so the caller must decide config projection
-/// independently of whether it writes or deletes `auth.json`.
-pub(crate) fn prepare_codex_live_config_text_with_optional_catalog_and_provider_context(
-    settings: &Value,
-    config_text: &str,
-    profile: CodexCatalogToolProfile,
-    provider_context: &ProviderClassificationContext,
-) -> Result<String, AppError> {
-    if settings.get("modelCatalog").is_some() {
-        prepare_codex_config_text_with_model_catalog_and_provider_context(
-            settings,
-            config_text,
-            profile,
-            provider_context,
-        )
-    } else {
-        Ok(config_text.to_string())
-    }
-}
-
 /// Prepare a deleted-provider backup when its target Provider record can no longer be loaded.
 ///
 /// This boundary is intentionally narrow: classification can only use the route's inline auth,
 /// and any target Provider id therefore emits the controlled inline-fallback warning. Ordinary
-/// activation/takeover paths must use the context-aware prepare function above.
+/// activation/takeover paths use the context-aware projection writer directly.
 pub(crate) fn prepare_codex_live_config_text_for_verbatim_restore_without_provider_context(
     settings: &Value,
     config_text: &str,
@@ -6663,9 +7891,13 @@ pub fn remove_codex_multirouter_proxy_route(config_text: &str) -> Result<String,
 
 /// 将当前 `config.toml` 原子切回 Codex 内建 `openai` provider。
 pub fn force_codex_builtin_openai_live_provider() -> Result<(), AppError> {
-    let live = read_codex_config_text()?;
-    let config = force_builtin_openai_provider_in_config_text(&live)?;
-    write_codex_live_config_atomic(Some(&config))
+    let config_path = get_codex_config_path();
+    write_codex_live_config_reconcile(&config_path, |live_config| {
+        let config = force_builtin_openai_provider_in_config_text(live_config)?;
+        #[cfg(test)]
+        maybe_mutate_codex_config_after_transform_for_test(&config_path);
+        Ok(config)
+    })
 }
 
 /// 将待切换 provider 的 Codex 配置叠加到当前 live `config.toml`。
@@ -6683,11 +7915,17 @@ pub(crate) fn merge_codex_provider_config_texts(
     let provider_config_text = normalize_codex_config_text_for_live_read(provider_config_text)?;
 
     if provider_config_text.trim().is_empty() {
-        return strip_codex_provider_owned_fields_from_live(&live_config_text);
+        let merged = strip_codex_provider_owned_fields_from_live(&live_config_text)?;
+        #[cfg(test)]
+        maybe_mutate_codex_config_after_provider_merge_for_test(&get_codex_config_path());
+        return Ok(merged);
     }
 
     if live_config_text.trim().is_empty() {
-        return Ok(provider_config_text);
+        let merged = provider_config_text.to_string();
+        #[cfg(test)]
+        maybe_mutate_codex_config_after_provider_merge_for_test(&get_codex_config_path());
+        return Ok(merged);
     }
 
     let mut live_doc = live_config_text
@@ -6750,13 +7988,88 @@ pub(crate) fn merge_codex_provider_config_texts(
         }
     }
 
-    Ok(live_doc.to_string())
+    let merged = live_doc.to_string();
+    #[cfg(test)]
+    maybe_mutate_codex_config_after_provider_merge_for_test(&get_codex_config_path());
+    Ok(merged)
 }
 
-/// 读取当前 live 配置，并把 provider 配置叠加进去。
-pub(crate) fn merge_codex_provider_config_with_live(config_text: &str) -> Result<String, AppError> {
-    let live_config = read_codex_config_text()?;
-    merge_codex_provider_config_texts(&live_config, config_text)
+pub(crate) fn strip_codex_provider_mcp_tables(config_text: &str) -> Result<String, AppError> {
+    if config_text.trim().is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut doc = config_text.parse::<DocumentMut>().map_err(|error| {
+        AppError::Message(format!("Invalid provider Codex config.toml: {error}"))
+    })?;
+    doc.as_table_mut().remove("mcp_servers");
+    if let Some(mcp) = doc.get_mut("mcp").and_then(Item::as_table_like_mut) {
+        mcp.remove("servers");
+        if mcp.is_empty() {
+            doc.as_table_mut().remove("mcp");
+        }
+    }
+    Ok(doc.to_string())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodexProviderWriteReceipt {
+    pub(crate) projection: CodexProjectionCommitReceipt,
+    pub(crate) auth_attempt: Option<CodexAuthWriteAttempt>,
+}
+
+pub(crate) fn write_codex_provider_live_with_catalog_and_provider_context_with_receipt(
+    settings: &Value,
+    category: Option<&str>,
+    auth: &Value,
+    config_text: Option<&str>,
+    profile: CodexCatalogToolProfile,
+    provider_context: &ProviderClassificationContext,
+) -> Result<CodexProviderWriteReceipt, AppError> {
+    let config_text = config_text.ok_or_else(missing_codex_live_config_error)?;
+    let should_write_auth = category == Some("official")
+        && codex_auth_has_login_material(auth)
+        && !should_preserve_live_codex_oauth_for_official_switch(auth);
+    let auth_path = get_codex_auth_path();
+    let auth_attempt = if should_write_auth {
+        Some(CodexAuthWriteAttempt::capture_and_write(&auth_path, auth)?)
+    } else {
+        None
+    };
+
+    let result = write_codex_projection_plan_reconciled(&get_codex_config_path(), |live_config| {
+        // Start from the newest live bytes, then overlay only provider-owned
+        // fields.  This keeps user tables (including MCP) intact when Codex
+        // Desktop edits config.toml between the caller's read and commit.
+        // Merge first so a provider snapshot whose only content was a stale
+        // MCP table can still inherit the live document before its bearer
+        // token is applied.  The effective-settings builder has already
+        // stripped snapshot MCP tables; applying the token after the merge
+        // also handles an otherwise-empty provider config safely.
+        let merged =
+            merge_codex_provider_config_texts(live_config, config_text).map_err(|error| {
+                AppError::McpValidation(format!("解析当前 Codex config.toml 失败: {error}"))
+            })?;
+        let merged = prepare_codex_provider_live_config(auth, &merged)?;
+        let mut plan =
+            build_codex_projection_plan(settings, &merged, profile, Some(provider_context))?;
+        if category == Some("official") && crate::settings::unify_codex_session_history() {
+            plan.config_text = inject_codex_unified_session_bucket(&plan.config_text)?;
+        }
+        Ok(plan)
+    });
+
+    match result {
+        Ok(projection) => Ok(CodexProviderWriteReceipt {
+            projection,
+            auth_attempt,
+        }),
+        Err(error) => Err(restore_codex_auth_after_error(
+            error,
+            auth_attempt.as_ref(),
+            &auth_path,
+        )),
+    }
 }
 
 pub(crate) fn write_codex_provider_live_with_catalog_and_provider_context(
@@ -6767,34 +8080,76 @@ pub(crate) fn write_codex_provider_live_with_catalog_and_provider_context(
     profile: CodexCatalogToolProfile,
     provider_context: &ProviderClassificationContext,
 ) -> Result<(), AppError> {
-    let prepared_config = config_text
-        .map(|text| {
-            prepare_codex_config_text_with_model_catalog_and_provider_context(
-                settings,
-                text,
-                profile,
-                provider_context,
-            )
-        })
-        .transpose()?;
-    write_codex_live_for_provider(category, auth, prepared_config.as_deref())
+    write_codex_provider_live_with_catalog_and_provider_context_with_receipt(
+        settings,
+        category,
+        auth,
+        config_text,
+        profile,
+        provider_context,
+    )
+    .map(|_| ())
 }
 
-pub(crate) fn write_codex_provider_live_with_catalog_without_provider_context(
+pub(crate) fn write_codex_provider_live_with_catalog_without_provider_context_with_receipt(
     settings: &Value,
-    category: Option<&str>,
+    _category: Option<&str>,
     auth: &Value,
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
-) -> Result<(), AppError> {
-    let prepared_config = config_text
-        .map(|text| {
-            prepare_codex_config_text_with_model_catalog_without_provider_context(
-                settings, text, profile,
-            )
-        })
-        .transpose()?;
-    write_codex_live_for_provider(category, auth, prepared_config.as_deref())
+) -> Result<CodexProviderWriteReceipt, AppError> {
+    let config_text = config_text.ok_or_else(missing_codex_live_config_error)?;
+    let projection =
+        write_codex_projection_plan_reconciled(&get_codex_config_path(), |live_config| {
+            let merged =
+                merge_codex_provider_config_texts(live_config, config_text).map_err(|error| {
+                    AppError::McpValidation(format!("解析当前 Codex config.toml 失败: {error}"))
+                })?;
+            let merged = prepare_codex_provider_live_config(auth, &merged)?;
+            build_codex_projection_plan(settings, &merged, profile, None)
+        })?;
+    Ok(CodexProviderWriteReceipt {
+        projection,
+        auth_attempt: None,
+    })
+}
+
+pub(crate) fn write_codex_snapshot_projection_without_provider_context_with_provider_receipt(
+    settings: &Value,
+    auth: Option<&Value>,
+    config_text: &str,
+    write_auth: bool,
+    profile: CodexCatalogToolProfile,
+) -> Result<CodexProviderWriteReceipt, AppError> {
+    let auth_path = get_codex_auth_path();
+    let auth_attempt = if write_auth {
+        auth.map(|value| CodexAuthWriteAttempt::capture_and_write(&auth_path, value))
+            .transpose()?
+    } else {
+        None
+    };
+    let result = write_codex_projection_plan_reconciled(&get_codex_config_path(), |live_config| {
+        let merged =
+            merge_codex_provider_config_texts(live_config, config_text).map_err(|error| {
+                AppError::McpValidation(format!("解析当前 Codex config.toml 失败: {error}"))
+            })?;
+        let merged = match auth {
+            Some(auth) => prepare_codex_provider_live_config(auth, &merged)?,
+            None => merged,
+        };
+        build_codex_projection_plan(settings, &merged, profile, None)
+    });
+    match result {
+        Ok(projection) => Ok(CodexProviderWriteReceipt {
+            projection,
+            auth_attempt,
+        }),
+        Err(error) => Err(restore_codex_auth_after_error(
+            error,
+            auth_attempt.as_ref(),
+            &auth_path,
+        )),
+    }
 }
 
 /// 只按 provider 配置刷新 Codex `config.toml`，显式保留当前 `auth.json`。
@@ -6803,38 +8158,39 @@ pub(crate) fn write_codex_provider_live_with_catalog_without_provider_context(
 /// 才是当前用户真实登录态，而 DB 里的 official provider 可能只是早期导入的旧
 /// OAuth 快照。该函数仍会走 model catalog 投影、统一会话路由注入和 live 配置
 /// 合并，但最终只写 `config.toml`，避免把旧快照覆盖到 `auth.json`。
-pub(crate) fn write_codex_provider_config_only_with_catalog_and_provider_context(
+pub(crate) fn write_codex_provider_config_only_with_catalog_and_provider_context_with_receipt(
     settings: &Value,
     category: Option<&str>,
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
     provider_context: &ProviderClassificationContext,
-) -> Result<(), AppError> {
-    let prepared_config = config_text
-        .map(|text| {
-            prepare_codex_config_text_with_model_catalog_and_provider_context(
-                settings,
-                text,
-                profile,
-                provider_context,
-            )
-        })
-        .transpose()?;
-    let unified_official_config =
+) -> Result<CodexProjectionCommitReceipt, AppError> {
+    let Some(config_text) = config_text else {
+        // A config-only write is also used to leave local takeover.  This is
+        // an explicit cleanup operation: preserve the current live user tables
+        // while removing only provider-owned fields.  It is deliberately
+        // separate from `None` at the normal writer boundary, where `None`
+        // means the caller forgot the required provider payload.
+        let mut companions = CodexProjectionSideEffectsAttempt::capture()?;
+        let config_attempt = write_codex_live_config_reconcile_with_attempt(
+            &get_codex_config_path(),
+            |live_config| strip_codex_provider_owned_fields_from_live(live_config),
+        )?;
+        companions.mark_unmodified_as_after();
+        return Ok(CodexProjectionCommitReceipt {
+            config_attempt,
+            companion_attempt: companions,
+        });
+    };
+    write_codex_projection_plan_reconciled(&get_codex_config_path(), |live_config| {
+        let merged = merge_codex_provider_config_texts(live_config, config_text)?;
+        let mut plan =
+            build_codex_projection_plan(settings, &merged, profile, Some(provider_context))?;
         if category == Some("official") && crate::settings::unify_codex_session_history() {
-            Some(inject_codex_unified_session_bucket(
-                prepared_config.as_deref().unwrap_or(""),
-            )?)
-        } else {
-            None
-        };
-    let config_text = unified_official_config
-        .as_deref()
-        .or(prepared_config.as_deref())
-        .unwrap_or("");
-    let merged_config = merge_codex_provider_config_with_live(config_text)?;
-
-    write_codex_live_config_atomic(Some(&merged_config))
+            plan.config_text = inject_codex_unified_session_bucket(&plan.config_text)?;
+        }
+        Ok(plan)
+    })
 }
 
 /// Extract a provider-scoped `experimental_bearer_token` from Codex `config.toml`.
@@ -7394,29 +8750,22 @@ pub fn write_codex_live_for_provider(
     auth: &Value,
     config_text: Option<&str>,
 ) -> Result<(), AppError> {
+    let config_text = config_text.ok_or_else(missing_codex_live_config_error)?;
     let unified_official_config =
         if category == Some("official") && crate::settings::unify_codex_session_history() {
-            Some(inject_codex_unified_session_bucket(
-                config_text.unwrap_or(""),
-            )?)
+            Some(inject_codex_unified_session_bucket(config_text)?)
         } else {
             None
         };
-    let config_text = unified_official_config.as_deref().or(config_text);
+    let config_text = unified_official_config.as_deref().unwrap_or(config_text);
 
     let should_write_auth = category == Some("official")
         && codex_auth_has_login_material(auth)
         && !should_preserve_live_codex_oauth_for_official_switch(auth);
-    let merged_config = config_text
-        .map(merge_codex_provider_config_with_live)
-        .transpose()?;
-
     if should_write_auth {
-        write_codex_live_atomic(auth, merged_config.as_deref())
+        write_codex_provider_auth_and_config_reconciled(auth, config_text)
     } else {
-        let live_config =
-            prepare_codex_provider_live_config(auth, merged_config.as_deref().unwrap_or(""))?;
-        write_codex_live_config_atomic(Some(&live_config))
+        write_codex_provider_config_reconciled(auth, config_text)
     }
 }
 
@@ -10532,6 +11881,79 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn provider_projection_cache_does_not_overwrite_external_update_before_companion_write() {
+        let _guard = TestHomeGuard::new();
+        seed_codex_models_cache(json!([{"slug": "gpt-5.4"}]));
+        let config_path = get_codex_config_path();
+        let original_config = "model = \"private-model\"\n";
+        std::fs::write(&config_path, original_config).expect("seed config");
+        let settings = json!({
+            "modelCatalog": { "models": [{
+                "model": "private-model",
+                "displayName": "Private model",
+                "contextWindow": 128000
+            }]}
+        });
+        let cache_path = get_codex_models_cache_path();
+        set_test_companion_prewrite_mutation_for_test(
+            &cache_path,
+            "{\"external_metadata\":\"keep\",\"client_version\":\"0.140.0\"}",
+        );
+        let error = prepare_codex_config_text_with_model_catalog_without_provider_context(
+            &settings,
+            original_config,
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect_err("external cache change must defer projection");
+        assert!(
+            error.to_string().contains("concurrent") || error.to_string().contains("并发"),
+            "unexpected error: {error:?}"
+        );
+        let cache: Value = read_json_file(&cache_path).expect("read cache after projection");
+        assert_eq!(
+            cache.get("external_metadata").and_then(Value::as_str),
+            Some("keep"),
+            "projection cache commit must not overwrite a newer external cache update"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config after deferred projection"),
+            original_config,
+            "config commit must roll back while the attempt still owns the live bytes"
+        );
+    }
+
+    #[test]
+    fn raw_codex_fulltext_writer_is_not_reexported_to_application_callers() {
+        let lib_source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
+        )
+        .expect("read crate lib source");
+        assert!(
+            !lib_source.contains("write_codex_live_atomic"),
+            "raw Codex fulltext writer must not remain in the public application re-export"
+        );
+    }
+
+    #[test]
+    fn raw_codex_fulltext_writers_are_not_public_module_api() {
+        let codex_source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codex_config.rs"),
+        )
+        .expect("read Codex config source");
+        let raw_auth_signature = ["pub", " fn write_codex_live_atomic"].concat();
+        let raw_config_signature = ["pub", " fn write_codex_live_config_atomic"].concat();
+        assert!(
+            !codex_source.contains(&raw_auth_signature),
+            "raw Codex auth+config writer must stay crate-private"
+        );
+        assert!(
+            !codex_source.contains(&raw_config_signature),
+            "raw Codex config writer must stay crate-private"
+        );
+    }
+
+    #[test]
     fn force_builtin_openai_preserves_global_config_and_removes_provider_fields() {
         let live = r#"model = "third-party-model"
 model_provider = "custom"
@@ -10617,6 +12039,110 @@ trust_level = "trusted"
                 None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
             }
         }
+    }
+
+    #[cfg(test)]
+    fn set_test_concurrency_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_CONCURRENCY_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue.lock().expect("lock test mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+    }
+
+    #[cfg(test)]
+    fn set_test_config_after_write_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_CONFIG_AFTER_WRITE_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock config after-write mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+    }
+
+    #[cfg(test)]
+    fn set_test_auth_after_capture_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_AUTH_AFTER_CAPTURE_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock auth after-capture mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+    }
+
+    #[cfg(test)]
+    fn set_test_auth_after_commit_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_AUTH_AFTER_COMMIT_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue.lock().expect("lock auth after-commit mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+    }
+
+    #[cfg(test)]
+    fn set_test_companion_after_config_mutation_for_test(path: &Path, contents: &str) {
+        let queue = super::TEST_COMPANION_AFTER_CONFIG_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock companion after-config mutation queue");
+        queue.clear();
+        queue.push_back((path.to_path_buf(), contents.to_string()));
+    }
+
+    #[cfg(test)]
+    fn set_test_companion_prewrite_mutations_for_test<const N: usize>(entries: [(&Path, &str); N]) {
+        let queue = super::TEST_COMPANION_PREWRITE_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock companion pre-write mutation queue");
+        queue.clear();
+        queue.extend(
+            entries
+                .into_iter()
+                .map(|(path, contents)| (path.to_path_buf(), contents.to_string())),
+        );
+    }
+
+    #[cfg(test)]
+    fn set_test_provider_merge_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_PROVIDER_MERGE_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock provider merge test mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+    }
+
+    #[cfg(test)]
+    fn set_test_config_transform_mutations<const N: usize>(contents: [&str; N]) {
+        let queue = super::TEST_CONFIG_TRANSFORM_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock config transform test mutation queue");
+        queue.clear();
+        queue.extend(contents.into_iter().map(ToString::to_string));
+        super::TEST_CONFIG_TRANSFORM_AGENT_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()))
+            .lock()
+            .expect("lock config transform agent mutation queue")
+            .clear();
+    }
+
+    #[cfg(test)]
+    fn set_test_config_transform_agent_mutation(path: &Path, contents: &str) {
+        let queue = super::TEST_CONFIG_TRANSFORM_AGENT_MUTATIONS
+            .get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let mut queue = queue
+            .lock()
+            .expect("lock config transform agent mutation queue");
+        queue.clear();
+        queue.push_back((path.to_path_buf(), contents.to_string()));
     }
 
     /// 写入一份带官方 client_version 的模型缓存，模拟 Codex 已经启动过的环境。
@@ -11264,6 +12790,35 @@ experimental_bearer_token = "stale-table-key"
     }
 
     #[test]
+    #[serial_test::serial]
+    fn clear_stale_auth_defers_when_external_update_occurs_after_capture() {
+        let _guard = TestHomeGuard::new();
+        let auth_path = get_codex_auth_path();
+        std::fs::create_dir_all(auth_path.parent().expect("auth parent"))
+            .expect("create Codex directory");
+        write_json_file(&auth_path, &json!({ "OPENAI_API_KEY": "stale-key" }))
+            .expect("seed stale auth");
+        let external_oauth =
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"external-access"}}"#;
+        set_test_auth_after_capture_mutations([external_oauth]);
+
+        let error = clear_stale_codex_live_auth_after_official_switch(&json!({}))
+            .expect_err("auth cleanup must defer after an external update");
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("并发")
+                || error_text.contains("concurrent")
+                || error_text.contains("deferred"),
+            "auth cleanup race must report deferred ownership: {error_text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&auth_path).expect("read external auth"),
+            external_oauth,
+            "auth cleanup must preserve the external OAuth update"
+        );
+    }
+
+    #[test]
     fn prepare_provider_live_config_does_not_create_incomplete_provider_table() {
         let input = r#"model_provider = "vendor_x"
 model = "gpt-5"
@@ -11301,6 +12856,15 @@ memories = true
 
 [desktop]
 show-context-window-usage = true
+
+[plugins."sdd@personal"]
+enabled = true
+
+[marketplaces.personal]
+source = "local"
+
+[custom_user_table]
+value = "live-user-value"
 
 [memories]
 generate_memories = true
@@ -11385,6 +12949,32 @@ experimental_bearer_token = "provider-token"
         );
         assert_eq!(
             parsed
+                .get("plugins")
+                .and_then(|value| value.get("sdd@personal"))
+                .and_then(|value| value.get("enabled"))
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "live plugin enablement must survive provider merge"
+        );
+        assert_eq!(
+            parsed
+                .get("marketplaces")
+                .and_then(|value| value.get("personal"))
+                .and_then(|value| value.get("source"))
+                .and_then(|value| value.as_str()),
+            Some("local"),
+            "marketplace registration must survive provider merge"
+        );
+        assert_eq!(
+            parsed
+                .get("custom_user_table")
+                .and_then(|value| value.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("live-user-value"),
+            "unknown user tables must survive provider merge"
+        );
+        assert_eq!(
+            parsed
                 .get("memories")
                 .and_then(|value| value.get("use_memories"))
                 .and_then(|value| value.as_bool()),
@@ -11464,6 +13054,448 @@ wire_api = "responses"
                 .and_then(|value| value.as_integer()),
             Some(240_000),
             "single-model providers must keep an explicit user compaction override"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_atomic_rejects_missing_config_without_touching_files() {
+        let _guard = TestHomeGuard::new();
+        let auth_path = get_codex_auth_path();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let old_auth = br#"{"OPENAI_API_KEY":"sk-old"}"#;
+        let old_config = b"[desktop]\nenabled-reasoning-efforts = [\"max\"]\n";
+        std::fs::write(&auth_path, old_auth).expect("seed auth");
+        std::fs::write(&config_path, old_config).expect("seed config");
+
+        let error = write_codex_live_atomic(&json!({"OPENAI_API_KEY": "sk-new"}), None)
+            .expect_err("missing config must fail closed");
+        assert!(error.to_string().contains("config"));
+        assert_eq!(std::fs::read(&auth_path).expect("read auth"), old_auth);
+        assert_eq!(
+            std::fs::read(&config_path).expect("read config"),
+            old_config
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_atomic_persists_auth_and_config() {
+        let _guard = TestHomeGuard::new();
+        let auth = json!({"OPENAI_API_KEY": "dev-key"});
+        let config_text = "[mcp_servers.echo]\ncommand = \"echo\"\n";
+
+        write_codex_live_atomic(&auth, Some(config_text)).expect("atomic write should succeed");
+
+        let stored_auth: Value = read_json_file(&get_codex_auth_path()).expect("read auth");
+        assert_eq!(stored_auth, auth);
+        assert!(read_codex_config_text()
+            .expect("read config")
+            .contains("mcp_servers.echo"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_atomic_rolls_back_auth_when_config_write_fails() {
+        let _guard = TestHomeGuard::new();
+        let auth_path = get_codex_auth_path();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&auth_path, br#"{"OPENAI_API_KEY":"legacy"}"#).expect("seed auth");
+        std::fs::create_dir_all(&config_path).expect("create blocking config directory");
+
+        let error = write_codex_live_atomic(
+            &json!({"OPENAI_API_KEY": "new-key"}),
+            Some("[mcp_servers.sample]\ncommand = \"noop\"\n"),
+        )
+        .expect_err("config write should fail when target is directory");
+        assert!(error.to_string().contains("config") || error.to_string().contains("配置"));
+        assert!(std::fs::read_to_string(&auth_path)
+            .expect("read existing auth")
+            .contains("legacy"));
+        assert!(std::fs::metadata(&config_path)
+            .expect("config path metadata")
+            .is_dir());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_config_atomic_rejects_missing_config_without_touching_file() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let old_config = b"[desktop]\nenabled-reasoning-efforts = [\"max\"]\n";
+        std::fs::write(&config_path, old_config).expect("seed config");
+
+        let error =
+            write_codex_live_config_atomic(None).expect_err("missing config must fail closed");
+        assert!(error.to_string().contains("config"));
+        assert_eq!(
+            std::fs::read(&config_path).expect("read config"),
+            old_config
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_for_provider_rejects_missing_config_without_touching_live() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let old_config = r#"model = "gpt-5"
+model_provider = "custom"
+base_url = "https://example.invalid/v1"
+
+[desktop]
+enabled-reasoning-efforts = ["low", "medium", "high", "xhigh", "ultra", "max"]
+
+[plugins."sdd@personal"]
+enabled = true
+
+[projects."C:\\repo"]
+trust_level = "trusted"
+
+[marketplaces.personal]
+source = "local"
+
+[custom_user_table]
+value = "keep"
+"#;
+        std::fs::write(&config_path, old_config).expect("seed config");
+
+        let error = write_codex_live_for_provider(Some("third_party"), &json!({}), None)
+            .expect_err("missing config must fail closed");
+        assert!(error.to_string().contains("config"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config"),
+            old_config
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_config_atomic_rechecks_fingerprint_before_replace() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&config_path, "[desktop]\nold = true\n").expect("seed config");
+        set_test_concurrency_mutations(["[desktop]\nexternal = true\n"]);
+
+        write_codex_live_config_atomic(Some("model = \"gpt-5.6\"\n[desktop]\nprovider = true\n"))
+            .expect("writer should retry against the externally changed file");
+
+        let restored = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(restored.contains("external = true"));
+        assert!(restored.contains("model = \"gpt-5.6\""));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_for_provider_preserves_change_after_provider_merge_before_writer_entry() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(
+            &config_path,
+            "[desktop]\nold = true\n\n[custom_user_table]\nvalue = \"old\"\n",
+        )
+        .expect("seed config");
+        set_test_provider_merge_mutations([
+            "[desktop]\nexternal = true\n\n[plugins.\"sdd@personal\"]\nenabled = true\n\n[custom_user_table]\nvalue = \"external\"\n",
+        ]);
+
+        write_codex_live_for_provider(
+            Some("third_party"),
+            &json!({}),
+            Some("model = \"gpt-5.6\"\n"),
+        )
+        .expect("provider write should preserve the external change");
+
+        let restored = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(restored.contains("external = true"));
+        assert!(restored.contains("[plugins.\"sdd@personal\"]"));
+        assert!(restored.contains("model = \"gpt-5.6\""));
+        assert!(restored.contains("value = \"external\""));
+        assert!(!restored.contains("old = true"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_config_atomic_defers_after_bounded_retries() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&config_path, "[desktop]\nold = true\n").expect("seed config");
+        let external_versions = [
+            "[desktop]\none = true\n",
+            "[desktop]\ntwo = true\n",
+            "[desktop]\nthree = true\n",
+        ];
+        set_test_concurrency_mutations(external_versions);
+
+        let error = write_codex_live_config_atomic(Some("model = \"gpt-5.6\"\n"))
+            .expect_err("writer must stop after bounded concurrent modifications");
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("concurrent")
+                || error.to_string().contains("并发")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read final external config"),
+            external_versions[2]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_config_reconcile_retries_against_external_mcp_change() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&config_path, "[desktop]\nold = true\n").expect("seed config");
+        set_test_concurrency_mutations(["[desktop]\nexternal = true\n"]);
+
+        write_codex_live_config_reconcile(&config_path, |base| {
+            let mut doc = if base.trim().is_empty() {
+                DocumentMut::new()
+            } else {
+                base.parse::<DocumentMut>().expect("parse live config")
+            };
+            doc["mcp_servers"]["managed"]["command"] = toml_edit::value("from-db");
+            Ok(doc.to_string())
+        })
+        .expect("reconcile should retry");
+
+        let restored = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(restored.contains("external = true"));
+        let parsed: toml::Value = restored.parse().expect("parse reconciled config");
+        assert_eq!(
+            parsed
+                .get("mcp_servers")
+                .and_then(|value| value.get("managed"))
+                .and_then(|value| value.get("command"))
+                .and_then(|value| value.as_str()),
+            Some("from-db")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn committed_attempt_does_not_claim_external_write_after_replace_before_receipt() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let before = "[desktop]\nbefore = true\n";
+        let external_after_replace = "[desktop]\nexternal = \"third\"\n";
+        std::fs::write(&config_path, before).expect("seed config");
+        set_test_config_after_write_mutations([external_after_replace]);
+
+        let attempt = write_codex_live_config_reconcile_with_attempt(&config_path, |_| {
+            Ok("[desktop]\ncandidate = true\n".to_string())
+        })
+        .expect("candidate write should succeed");
+
+        let restored = attempt
+            .restore_if_unchanged(&config_path)
+            .expect("conditional restore should complete");
+        assert!(
+            !restored,
+            "an external write after replacement must invalidate this attempt receipt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config"),
+            external_after_replace,
+            "rollback must preserve the external third version"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_codex_live_config_reconcile_defers_after_bounded_retries() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&config_path, "[desktop]\nold = true\n").expect("seed config");
+        let external_versions = [
+            "[desktop]\none = true\n",
+            "[desktop]\ntwo = true\n",
+            "[desktop]\nthree = true\n",
+        ];
+        set_test_concurrency_mutations(external_versions);
+
+        let error = write_codex_live_config_reconcile(&config_path, |base| {
+            let mut doc = if base.trim().is_empty() {
+                DocumentMut::new()
+            } else {
+                base.parse::<DocumentMut>().expect("parse live config")
+            };
+            doc["mcp_servers"]["managed"]["command"] = toml_edit::value("from-db");
+            Ok(doc.to_string())
+        })
+        .expect_err("reconcile must defer after bounded conflicts");
+        assert!(error.to_string().contains("concurrent") || error.to_string().contains("并发"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read final external config"),
+            external_versions[2]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_write_defers_after_bounded_merge_conflicts_and_rolls_back_auth() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        let auth_path = get_codex_auth_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(&config_path, "[desktop]\nold = true\n").expect("seed config");
+        let old_auth = json!({"OPENAI_API_KEY": "old-key"});
+        write_json_file(&auth_path, &old_auth).expect("seed auth");
+        let old_auth_bytes = std::fs::read(&auth_path).expect("read old auth");
+        let external_versions = [
+            "[desktop]\none = true\n",
+            "[desktop]\ntwo = true\n",
+            "[desktop]\nthree = true\n",
+        ];
+        set_test_provider_merge_mutations(external_versions);
+
+        let error = write_codex_live_for_provider(
+            Some("official"),
+            &json!({"OPENAI_API_KEY": "new-key"}),
+            Some("model = \"gpt-5.6\"\n"),
+        )
+        .expect_err("provider write must defer after bounded merge conflicts");
+        assert!(error.to_string().contains("concurrent") || error.to_string().contains("并发"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read final external config"),
+            external_versions[2]
+        );
+        assert_eq!(
+            std::fs::read(&auth_path).expect("read rolled-back auth"),
+            old_auth_bytes,
+            "auth.json must roll back when the reconciled config write is deferred"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_auth_commit_defers_when_external_update_occurs_after_capture() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        let auth_path = get_codex_auth_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let old_config = "model_provider = \"custom\"\nmodel = \"gpt-5.6\"\n";
+        std::fs::write(&config_path, old_config).expect("seed config");
+        write_json_file(&auth_path, &json!({"OPENAI_API_KEY": "old-key"})).expect("seed auth");
+        set_test_auth_after_capture_mutations([r#"{"OPENAI_API_KEY":"external-after-capture"}"#]);
+
+        let error = write_codex_live_for_provider(
+            Some("official"),
+            &json!({"OPENAI_API_KEY": "new-key"}),
+            Some("model_provider = \"custom\"\nmodel = \"gpt-5.6\"\n"),
+        )
+        .expect_err("auth commit must defer after an external update between capture and commit");
+
+        assert!(
+            error.to_string().contains("concurrent")
+                || error.to_string().contains("并发")
+                || error.to_string().contains("deferred")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&auth_path).expect("read external auth"),
+            r#"{"OPENAI_API_KEY":"external-after-capture"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read unchanged config"),
+            old_config,
+            "deferred auth commit must not alter the live config"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_auth_rollback_preserves_external_update_after_commit() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        let auth_path = get_codex_auth_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let invalid_live = "[desktop\ninvalid = true\n";
+        std::fs::write(&config_path, invalid_live).expect("seed invalid config");
+        write_json_file(&auth_path, &json!({"OPENAI_API_KEY": "old-key"})).expect("seed auth");
+        set_test_auth_after_commit_mutations([r#"{"OPENAI_API_KEY":"external-after-commit"}"#]);
+
+        let error = write_codex_live_for_provider(
+            Some("official"),
+            &json!({"OPENAI_API_KEY": "new-key"}),
+            Some("model_provider = \"custom\"\nmodel = \"gpt-5.6\"\n"),
+        )
+        .expect_err("invalid live TOML must trigger auth rollback");
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("deferred")
+                || error_text.contains("并发")
+                || error_text.contains("恢复未完成"),
+            "rollback error must report a deferred/partial restore: {error_text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&auth_path).expect("read external auth"),
+            r#"{"OPENAI_API_KEY":"external-after-commit"}"#,
+            "rollback must preserve the external auth update"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read unchanged invalid config"),
+            invalid_live
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_write_rejects_invalid_live_toml_without_touching_config_or_auth() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        let auth_path = get_codex_auth_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        let invalid_live = "[desktop\ninvalid = true\n";
+        std::fs::write(&config_path, invalid_live).expect("seed invalid config");
+        let old_auth = json!({"OPENAI_API_KEY": "old-key"});
+        write_json_file(&auth_path, &old_auth).expect("seed auth");
+        let old_auth_bytes = std::fs::read(&auth_path).expect("read old auth");
+
+        let error = write_codex_live_for_provider(
+            Some("official"),
+            &json!({"OPENAI_API_KEY": "new-key"}),
+            Some("model = \"gpt-5.6\"\n"),
+        )
+        .expect_err("invalid live config must fail closed");
+        assert!(
+            error.to_string().contains("TOML")
+                || error.to_string().contains("toml")
+                || error.to_string().contains("配置")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read unchanged invalid config"),
+            invalid_live
+        );
+        assert_eq!(
+            std::fs::read(&auth_path).expect("read rolled-back auth"),
+            old_auth_bytes,
+            "auth.json must roll back when provider reconciliation rejects live TOML"
         );
     }
 
@@ -16092,6 +18124,70 @@ model_catalog_json = "cc-switch-model-catalog.json"
             .filter_map(|model| model.get("slug").and_then(|slug| slug.as_str()))
             .collect::<Vec<_>>();
         assert_eq!(slugs, vec!["gpt-5.5"]);
+    }
+
+    #[test]
+    #[serial]
+    fn force_builtin_openai_preserves_change_after_transform_before_writer_entry() {
+        let _guard = TestHomeGuard::new();
+        let config_path = get_codex_config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create codex dir");
+        std::fs::write(
+            &config_path,
+            r#"model = "gpt-5.6"
+model_provider = "custom"
+base_url = "http://127.0.0.1:15721/v1"
+
+[model_providers.custom]
+name = "CCSwitchMulti"
+base_url = "http://127.0.0.1:15721/v1"
+
+[desktop]
+old = true
+
+[plugins."sdd@personal"]
+enabled = false
+
+[mcp_servers.user]
+command = "user-server"
+
+[custom_user_table]
+value = "old"
+"#,
+        )
+        .expect("seed config");
+        set_test_config_transform_mutations([r#"model = "gpt-5.6"
+model_provider = "custom"
+base_url = "http://127.0.0.1:15721/v1"
+
+[model_providers.custom]
+name = "CCSwitchMulti"
+base_url = "http://127.0.0.1:15721/v1"
+
+[desktop]
+external = true
+
+[plugins."sdd@personal"]
+enabled = true
+
+[mcp_servers.user]
+command = "user-server-external"
+
+[custom_user_table]
+value = "external"
+"#]);
+
+        force_codex_builtin_openai_live_provider()
+            .expect("force builtin provider should preserve external update");
+
+        let restored = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(restored.contains("model_provider = \"openai\""));
+        assert!(restored.contains("external = true"));
+        assert!(restored.contains("[plugins.\"sdd@personal\"]"));
+        assert!(restored.contains("command = \"user-server-external\""));
+        assert!(restored.contains("value = \"external\""));
+        assert!(!restored.contains("127.0.0.1:15721"));
     }
 
     #[test]
