@@ -37,6 +37,16 @@ export interface RecoveryOutcome {
   acknowledgedAt?: string;
 }
 
+export interface RepairableCodexPlugin {
+  id: string;
+  name: string;
+  version: string;
+  manifestPath: string;
+  sourcePath: string;
+  marketplacePath: string;
+  repairAction?: "registerMarketplace" | "enableAndRegister" | "enable";
+}
+
 export interface ConfigTransferResult {
   success: boolean;
   message: string;
@@ -344,6 +354,16 @@ export const settingsApi = {
     ids: string[],
   ): Promise<number> {
     return await invoke("acknowledge_recovery_outcomes", { generation, ids });
+  },
+
+  async detectCodexPluginRegistration(): Promise<RepairableCodexPlugin[]> {
+    return await invoke("detect_codex_plugin_registration");
+  },
+
+  async repairCodexPluginRegistration(
+    pluginId: string,
+  ): Promise<RepairableCodexPlugin> {
+    return await invoke("repair_codex_plugin_registration", { pluginId });
   },
 };
 
