@@ -2,11 +2,11 @@
 
 mod auth;
 mod balance;
+mod codex_plugin;
 mod codex_oauth;
 mod coding_plan;
 mod config;
 mod copilot;
-mod codex_plugin;
 mod deeplink;
 mod env;
 mod failover;
@@ -42,11 +42,11 @@ mod workspace;
 
 pub use auth::*;
 pub use balance::*;
+pub use codex_plugin::*;
 pub use codex_oauth::*;
 pub use coding_plan::*;
 pub use config::*;
 pub use copilot::*;
-pub use codex_plugin::*;
 pub use deeplink::*;
 pub use env::*;
 pub use failover::*;
