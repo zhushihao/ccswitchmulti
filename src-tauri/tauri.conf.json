@@ -67,7 +67,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFFRjYwQUIyRkRBRDUyNEUKUldST1VxMzlzZ3IycmlGQzBEeThsWGs4UkFUS0JnVWRQcEZoVnNzbSsrbDNoZGh2UkVHZkNTbTgK",
       "endpoints": [
-        "https://github.com/BigStrongSun/ccswitchmulti/releases/latest/download/latest.json"
+        "https://github.com/zhushihao/ccswitchmulti/releases/latest/download/latest.json"
       ]
     }
   }
